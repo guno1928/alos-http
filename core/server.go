@@ -259,7 +259,6 @@ func (s *Server) ListenAndServeTLS() error {
 		s.acme.Start()
 	}
 
-	s.startRPSMonitor()
 	s.Router.Build()
 	s.computeFastDispatch()
 
@@ -313,7 +312,6 @@ func (s *Server) ListenAndServeTLS() error {
 //	s.Router.GET("/", handler)
 //	log.Fatal(s.ListenAndServe())
 func (s *Server) ListenAndServe() error {
-	s.startRPSMonitor()
 	s.Router.Build()
 	s.computeFastDispatch()
 
