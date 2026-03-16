@@ -40,6 +40,10 @@ If you want API documentation after publishing, the package docs will be availab
 
 https://alos.gg/aloshttpdocs/getting-started
 
+If you want to see benchmarks, go to:
+
+https://alos.gg/aloshttpdocs/benchmarks
+
 ## Quick Start
 
 ```go
