@@ -1,7 +1,6 @@
 # ALOS HTTP
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/guno1928/alos-http/core.svg)](https://pkg.go.dev/github.com/guno1928/alos-http/core)
-[![Go Report Card](https://goreportcard.com/badge/github.com/guno1928/alos-http)](https://goreportcard.com/report/github.com/guno1928/alos-http)
+WE only just released we may have bugs etc just make a github issue if you find anything!
 
 ALOS HTTP is a low-level Go web framework and application server built around a custom networking stack, first-class TLS handling, HTTP/1.1 and HTTP/2 support, reverse proxying, rate limiting, streaming, ACME automation, and a fast radix router.
 
