@@ -56,10 +56,13 @@ In practice that means ALOS HTTP can lean harder into Linux-native networking pa
 
 ## Benchmarks
 
+If you want to see full benchmarks, go to:
+
+https://alos.gg/aloshttpdocs/benchmarks
+
 There are two benchmark views worth looking at:
 
 - the published side-by-side framework comparison page
-- the newer ALOS-only Linux Docker and hot-path benchmark artifacts in this repo
 
 Published HTTPS HTTP/1.1 framework comparison:
 
@@ -109,9 +112,7 @@ If you want API documentation after publishing, the package docs will be availab
 
 https://alos.gg/aloshttpdocs/getting-started
 
-If you want to see benchmarks, go to:
 
-https://alos.gg/aloshttpdocs/benchmarks
 
 ## Quick Start
 
