@@ -66,7 +66,7 @@ Published HTTPS HTTP/1.1 framework comparison:
 | Framework | 500-conn throughput | 30-conn avg latency | 500-conn transfer/sec |
 | --- | --- | --- | --- |
 | ALOS HTTP | `240,707 req/s` | `88.11us` | `31.91 MB/s` |
-| Actix Web | `165,165 req/s` | `272.33us` | `19.37 MB/s` |
+| Actix Web (RUST framework) | `165,165 req/s` | `272.33us` | `19.37 MB/s` |
 | Fiber v3 | `144,342 req/s` | `265.23us` | `16.93 MB/s` |
 | Gin | `113,220 req/s` | `440.28us` | `14.90 MB/s` |
 | Iris | `111,138 req/s` | `480.58us` | `14.73 MB/s` |
@@ -77,7 +77,7 @@ Published throughput across connection levels:
 | Framework | 30 conn | 500 conn | 5,000 conn | 8,000 conn |
 | --- | --- | --- | --- | --- |
 | ALOS HTTP | `165,573` | `240,707` | `220,624` | `194,726` |
-| Actix Web | `156,699` | `165,165` | `157,741` | `111,811` |
+| Actix Web (RUST framework) | `156,699` | `165,165` | `157,741` | `111,811` |
 | Fiber v3 | `133,460` | `144,342` | `124,626` | `109,951` |
 | Gin | `104,843` | `113,220` | `97,740` | `87,691` |
 | Iris | `106,822` | `111,138` | `81,381` | `80,326` |
