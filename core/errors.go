@@ -17,6 +17,7 @@ var (
 	ErrNoExtensions           = &staticError{"no extensions"}
 	ErrExtsTruncated          = &staticError{"extensions truncated"}
 	ErrNoX25519               = &staticError{"no x25519 key_share"}
+	ErrBadKeyShare            = &staticError{"bad x25519 key_share"}
 	ErrAllZeroInner           = &staticError{"all-zero inner plaintext"}
 	ErrSigVerifyFailed        = &staticError{"signature self-verification failed"}
 	ErrH2BadPreface           = &staticError{"invalid h2 preface"}
@@ -39,4 +40,5 @@ var (
 	ErrRateLimit              = &staticError{"rate limit exceeded"}
 	ErrTooManyHeaders         = &staticError{"too many headers"}
 	ErrHpackTableSizeExceeded = &staticError{"hpack: dynamic table size exceeds protocol limit"}
+	ErrWebSocketProtocol      = &staticError{"websocket protocol error"}
 )

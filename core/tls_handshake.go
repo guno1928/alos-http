@@ -9,9 +9,7 @@ import (
 )
 
 func TLSExtract(h func() hash.Hash, salt, ikm []byte) []byte {
-	mac := hmac.New(h, salt)
-	mac.Write(ikm)
-	return mac.Sum(nil)
+	return TLSExtractTo(h, salt, ikm, nil)
 }
 
 var hkdfExpandOneByte = [1]byte{0x01}
@@ -61,36 +59,60 @@ func HSWrap(msgType byte, body []byte) []byte {
 }
 
 func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) []byte {
-	bp := MediumBufPool.Get().(*[]byte)
-	b := (*bp)[:0]
+	const versionExtLen = 6
+	const keyShareEntryHeaderLen = 4
 
-	b = append(b, 0x03, 0x03)
-	b = append(b, random...)
-	b = append(b, byte(len(sessionID)))
-	b = append(b, sessionID...)
-	b = append(b, byte(suiteID>>8), byte(suiteID))
-	b = append(b, 0x00)
+	sidLen := len(sessionID)
+	pubLen := len(pubKey)
+	keyShareExtDataLen := keyShareEntryHeaderLen + pubLen
+	keyShareExtLen := 4 + keyShareExtDataLen
+	extsLen := versionExtLen + keyShareExtLen
+	bodyLen := 40 + sidLen + extsLen
 
-	var exts []byte
-	exts = append(exts, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04)
+	out := make([]byte, 4+bodyLen)
+	out[0] = 0x02
+	out[1] = byte(bodyLen >> 16)
+	out[2] = byte(bodyLen >> 8)
+	out[3] = byte(bodyLen)
 
-	ksEntry := make([]byte, 4+len(pubKey))
-	ksEntry[0] = 0x00
-	ksEntry[1] = 0x1d
-	ksEntry[2] = 0x00
-	ksEntry[3] = 0x20
-	copy(ksEntry[4:], pubKey)
-	exts = append(exts, 0x00, 0x33)
-	exts = append(exts, byte(len(ksEntry)>>8), byte(len(ksEntry)))
-	exts = append(exts, ksEntry...)
+	off := 4
+	out[off] = 0x03
+	out[off+1] = 0x03
+	off += 2
+	copy(out[off:], random)
+	off += len(random)
+	out[off] = byte(sidLen)
+	off++
+	copy(out[off:], sessionID)
+	off += sidLen
+	out[off] = byte(suiteID >> 8)
+	out[off+1] = byte(suiteID)
+	out[off+2] = 0x00
+	off += 3
 
-	b = append(b, byte(len(exts)>>8), byte(len(exts)))
-	b = append(b, exts...)
+	out[off] = byte(extsLen >> 8)
+	out[off+1] = byte(extsLen)
+	off += 2
 
-	result := HSWrap(0x02, b)
-	*bp = b[:0]
-	MediumBufPool.Put(bp)
-	return result
+	out[off] = 0x00
+	out[off+1] = 0x2b
+	out[off+2] = 0x00
+	out[off+3] = 0x02
+	out[off+4] = 0x03
+	out[off+5] = 0x04
+	off += versionExtLen
+
+	out[off] = 0x00
+	out[off+1] = 0x33
+	out[off+2] = byte(keyShareExtDataLen >> 8)
+	out[off+3] = byte(keyShareExtDataLen)
+	out[off+4] = 0x00
+	out[off+5] = 0x1d
+	out[off+6] = byte(pubLen >> 8)
+	out[off+7] = byte(pubLen)
+	off += 8
+	copy(out[off:], pubKey)
+	return out
 }
 
 func BuildALPNExtension(proto string) []byte {
@@ -152,18 +174,25 @@ func BuildCertificate(chain [][]byte) []byte {
 }
 
 func BuildCertificateVerify(sig []byte) []byte {
-	body := make([]byte, 4+len(sig))
-	body[0] = 0x04
-	body[1] = 0x03
-	sigLen := uint16(len(sig))
-	body[2] = byte(sigLen >> 8)
-	body[3] = byte(sigLen)
-	copy(body[4:], sig)
-	return HSWrap(0x0f, body)
+	return appendCertificateVerify(nil, sig)
 }
 
 func BuildFinished(verifyData []byte) []byte {
-	return HSWrap(0x14, verifyData)
+	return appendFinished(nil, verifyData)
+}
+
+func appendCertificateVerify(dst, sig []byte) []byte {
+	sigLen := len(sig)
+	bodyLen := 4 + sigLen
+	dst = append(dst, 0x0f, byte(bodyLen>>16), byte(bodyLen>>8), byte(bodyLen))
+	dst = append(dst, 0x04, 0x03, byte(sigLen>>8), byte(sigLen))
+	return append(dst, sig...)
+}
+
+func appendFinished(dst, verifyData []byte) []byte {
+	bodyLen := len(verifyData)
+	dst = append(dst, 0x14, byte(bodyLen>>16), byte(bodyLen>>8), byte(bodyLen))
+	return append(dst, verifyData...)
 }
 
 var cvPrefix = func() [64]byte {
@@ -188,9 +217,6 @@ func SignCertificateVerify(priv *ecdsa.PrivateKey, transcriptHash []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	if !ecdsa.VerifyASN1(&priv.PublicKey, digest[:], sig) {
-		return nil, ErrSigVerifyFailed
-	}
 	return sig, nil
 }
 
@@ -208,6 +234,15 @@ type ParsedClientHello struct {
 	ALPNProtos        []string
 	ServerName        string
 	SupportedVersions []uint16
+
+	sessionIDBuf          [32]byte
+	x25519PubKeyBuf       [32]byte
+	cipherSuitesSmall     [64]uint16
+	supportedVersSmall    [8]uint16
+	alpnProtosSmall       [4]string
+	cipherSuitesOverflow  []uint16
+	supportedVersOverflow []uint16
+	alpnProtosOverflow    []string
 }
 
 func (ch *ParsedClientHello) SupportsTLS13() bool {
@@ -219,61 +254,104 @@ func (ch *ParsedClientHello) SupportsTLS13() bool {
 	return false
 }
 
-func ParseClientHello(data []byte) (*ParsedClientHello, error) {
+func (ch *ParsedClientHello) Reset() {
+	ch.SessionID = nil
+	ch.CipherSuites = nil
+	ch.X25519PubKey = nil
+	ch.ALPNProtos = nil
+	ch.ServerName = ""
+	ch.SupportedVersions = nil
+	ch.cipherSuitesOverflow = nil
+	ch.supportedVersOverflow = nil
+	ch.alpnProtosOverflow = nil
+}
+
+func (ch *ParsedClientHello) cipherSuitesDst(count int) []uint16 {
+	if count <= len(ch.cipherSuitesSmall) {
+		return ch.cipherSuitesSmall[:count]
+	}
+	if cap(ch.cipherSuitesOverflow) < count {
+		ch.cipherSuitesOverflow = make([]uint16, count)
+	}
+	return ch.cipherSuitesOverflow[:count]
+}
+
+func (ch *ParsedClientHello) supportedVersionsDst(count int) []uint16 {
+	if count <= len(ch.supportedVersSmall) {
+		return ch.supportedVersSmall[:count]
+	}
+	if cap(ch.supportedVersOverflow) < count {
+		ch.supportedVersOverflow = make([]uint16, count)
+	}
+	return ch.supportedVersOverflow[:count]
+}
+
+func (ch *ParsedClientHello) alpnDst(count int) []string {
+	if count <= len(ch.alpnProtosSmall) {
+		return ch.alpnProtosSmall[:count]
+	}
+	if cap(ch.alpnProtosOverflow) < count {
+		ch.alpnProtosOverflow = make([]string, count)
+	}
+	return ch.alpnProtosOverflow[:count]
+}
+
+func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	if len(data) < 6 || data[0] != 0x01 {
-		return nil, ErrNotClientHello
+		return ErrNotClientHello
 	}
 	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 	if len(data) < 4+msgLen {
-		return nil, ErrTruncated
+		return ErrTruncated
 	}
 	ch := data[4 : 4+msgLen]
 	if len(ch) < 35 {
-		return nil, ErrBodyTooShort
+		return ErrBodyTooShort
 	}
 
-	result := &ParsedClientHello{}
+	result.Reset()
 	pos := 34
 
 	if pos >= len(ch) {
-		return nil, ErrNoSessionID
+		return ErrNoSessionID
 	}
 	sidLen := int(ch[pos])
 	pos++
 	if pos+sidLen > len(ch) {
-		return nil, ErrSessionIDTruncated
+		return ErrSessionIDTruncated
 	}
-	result.SessionID = make([]byte, sidLen)
-	copy(result.SessionID, ch[pos:pos+sidLen])
+	copy(result.sessionIDBuf[:], ch[pos:pos+sidLen])
+	result.SessionID = result.sessionIDBuf[:sidLen]
 	pos += sidLen
 
 	if pos+2 > len(ch) {
-		return nil, ErrNoCipherSuites
+		return ErrNoCipherSuites
 	}
 	csLen := int(ch[pos])<<8 | int(ch[pos+1])
 	pos += 2
 	if pos+csLen > len(ch) || csLen%2 != 0 {
-		return nil, ErrBadCSLen
+		return ErrBadCSLen
 	}
-	result.CipherSuites = make([]uint16, 0, csLen/2)
-	for i := 0; i < csLen; i += 2 {
-		result.CipherSuites = append(result.CipherSuites, uint16(ch[pos+i])<<8|uint16(ch[pos+i+1]))
+	suites := result.cipherSuitesDst(csLen / 2)
+	for i, j := 0, 0; i < csLen; i, j = i+2, j+1 {
+		suites[j] = uint16(ch[pos+i])<<8 | uint16(ch[pos+i+1])
 	}
+	result.CipherSuites = suites
 	pos += csLen
 
 	if pos >= len(ch) {
-		return nil, ErrNoCompression
+		return ErrNoCompression
 	}
 	compLen := int(ch[pos])
 	pos += 1 + compLen
 
 	if pos+2 > len(ch) {
-		return nil, ErrNoExtensions
+		return ErrNoExtensions
 	}
 	extTotalLen := int(ch[pos])<<8 | int(ch[pos+1])
 	pos += 2
 	if pos+extTotalLen > len(ch) {
-		return nil, ErrExtsTruncated
+		return ErrExtsTruncated
 	}
 	exts := ch[pos : pos+extTotalLen]
 
@@ -293,16 +371,16 @@ func ParseClientHello(data []byte) (*ParsedClientHello, error) {
 		case 0x0000:
 			result.ServerName = parseSNI(extData)
 		case 0x0010:
-			result.ALPNProtos = parseALPN(extData)
+			result.ALPNProtos = parseALPN(result, extData)
 		case 0x002b:
-			result.SupportedVersions = parseSupportedVersions(extData)
+			result.SupportedVersions = parseSupportedVersions(result, extData)
 		case 0x0033:
-			result.X25519PubKey = findX25519KeyShare(extData)
+			result.X25519PubKey = findX25519KeyShare(result, extData)
 		}
 		i += extLen
 	}
 
-	return result, nil
+	return nil
 }
 
 func parseSNI(data []byte) string {
@@ -325,14 +403,14 @@ func parseSNI(data []byte) string {
 			break
 		}
 		if nameType == 0x00 {
-			return string(list[i : i+nameLen])
+			return UnsafeString(list[i : i+nameLen])
 		}
 		i += nameLen
 	}
 	return ""
 }
 
-func parseSupportedVersions(data []byte) []uint16 {
+func parseSupportedVersions(ch *ParsedClientHello, data []byte) []uint16 {
 	if len(data) < 1 {
 		return nil
 	}
@@ -340,14 +418,14 @@ func parseSupportedVersions(data []byte) []uint16 {
 	if listLen%2 != 0 || len(data) < 1+listLen {
 		return nil
 	}
-	versions := make([]uint16, 0, listLen/2)
-	for i := 1; i < 1+listLen; i += 2 {
-		versions = append(versions, uint16(data[i])<<8|uint16(data[i+1]))
+	versions := ch.supportedVersionsDst(listLen / 2)
+	for i, j := 1, 0; i < 1+listLen; i, j = i+2, j+1 {
+		versions[j] = uint16(data[i])<<8 | uint16(data[i+1])
 	}
 	return versions
 }
 
-func parseALPN(data []byte) []string {
+func parseALPN(ch *ParsedClientHello, data []byte) []string {
 	if len(data) < 2 {
 		return nil
 	}
@@ -356,20 +434,33 @@ func parseALPN(data []byte) []string {
 		return nil
 	}
 	list := data[2 : 2+listLen]
-	protos := make([]string, 0, 4)
+	count := 0
 	for i := 0; i < len(list); {
+		if i >= len(list) {
+			break
+		}
 		pLen := int(list[i])
 		i++
 		if i+pLen > len(list) {
 			break
 		}
-		protos = append(protos, string(list[i:i+pLen]))
+		count++
+		i += pLen
+	}
+	if count == 0 {
+		return nil
+	}
+	protos := ch.alpnDst(count)
+	for i, j := 0, 0; i < len(list) && j < count; j++ {
+		pLen := int(list[i])
+		i++
+		protos[j] = UnsafeString(list[i : i+pLen])
 		i += pLen
 	}
 	return protos
 }
 
-func findX25519KeyShare(data []byte) []byte {
+func findX25519KeyShare(ch *ParsedClientHello, data []byte) []byte {
 	if len(data) < 2 {
 		return nil
 	}
@@ -388,9 +479,8 @@ func findX25519KeyShare(data []byte) []byte {
 			break
 		}
 		if group == 0x001d && kLen == 32 {
-			pub := make([]byte, 32)
-			copy(pub, entries[j+4:j+4+32])
-			return pub
+			copy(ch.x25519PubKeyBuf[:], entries[j+4:j+4+32])
+			return ch.x25519PubKeyBuf[:]
 		}
 		j += 4 + kLen
 	}

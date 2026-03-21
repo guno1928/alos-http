@@ -426,7 +426,8 @@ func NewProxyEngine() *ProxyEngine {
 //	    Backends: []core.BackendConfig{{Addr: "10.0.0.10:8080"}},
 //	})
 func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
-	if strings.TrimSpace(cfg.Domain) == "" {
+	cfg.Domain = normalizeCertDomain(cfg.Domain)
+	if cfg.Domain == "" {
 		log.Printf("[PROXY] AddDomain rejected: empty domain name")
 		return
 	}
@@ -487,6 +488,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 // checkers and connection pools. No-op if the domain doesn't exist. Safe to
 // call at runtime.
 func (pe *ProxyEngine) RemoveDomain(domain string) {
+	domain = normalizeCertDomain(domain)
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
@@ -517,7 +519,7 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 
 func (pe *ProxyEngine) Lookup(host string) *domainState {
 	snap := pe.snapshot.Load()
-	return snap.domains[host]
+	return snap.domains[normalizeCertDomain(host)]
 }
 
 // Stop shuts down all health checkers and closes all idle backend connections

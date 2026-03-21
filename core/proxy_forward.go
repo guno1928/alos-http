@@ -36,6 +36,7 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 	}
 
 	clientIP := extractIP(req.RemoteAddr)
+	baseHeaders := append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 
 	tried := uint64(0)
 	maxRetries := ds.config.MaxRetries
@@ -59,6 +60,8 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 		}
 
 		b := ds.backends[idx]
+		attemptReq := *req
+		attemptReq.Headers = append(make([][2]string, 0, len(baseHeaders)), baseHeaders...)
 
 		hostOverride := ds.config.HostHeader
 		if pe.OnRequest != nil {
@@ -66,16 +69,17 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 				Domain:     ds.config.Domain,
 				Backend:    b.Addr,
 				ClientAddr: req.RemoteAddr,
-				Method:     req.Method,
-				Path:       req.Path,
-				Headers:    req.Headers,
+				Method:     attemptReq.Method,
+				Path:       attemptReq.Path,
+				Headers:    attemptReq.Headers,
 				Host:       hostOverride,
 			}
 			if !pe.OnRequest(pr) {
 				resp.Status(502).String("Request blocked by interceptor")
 				return true
 			}
-			req.Headers = pr.Headers
+			attemptReq.Path = pr.Path
+			attemptReq.Headers = pr.Headers
 			hostOverride = pr.Host
 		}
 
@@ -83,7 +87,7 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 		cfgCopy.HostHeader = hostOverride
 
 		b.ActiveConns.Add(1)
-		err := pe.forwardRequest(req, resp, b, &cfgCopy)
+		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy)
 		b.ActiveConns.Add(-1)
 
 		if err == nil {
@@ -125,7 +129,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := buildProxyRequest((*bp)[:0], req, b.Addr, cfg)
-	_, err = pc.conn.Write(buf)
+	err = writeFull(pc.conn, buf)
 	*bp = buf[:0]
 	LargeBufPool.Put(bp)
 	if err != nil {
@@ -282,7 +286,12 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 	sw.Close()
 	resp.SetStreamer(sw)
 	pc.conn.Close()
-	return err
+	if err != nil {
+		Dbg("[PROXY] streaming response aborted after headers for %s %s via %s: %v", req.Method, req.Path, b.Addr, err)
+	}
+	// Headers are already on the wire at this point, so retrying another
+	// backend would corrupt the client response stream.
+	return nil
 }
 
 func streamFixed(br io.Reader, sw StreamWriter, buf []byte, total int64) error {
@@ -642,7 +651,7 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := buildProxyRequest((*bp)[:0], req, b.Addr, cfg)
-	_, err = backendConn.Write(buf)
+	err = writeFull(backendConn, buf)
 	*bp = buf[:0]
 	LargeBufPool.Put(bp)
 	if err != nil {
@@ -684,7 +693,7 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 		}
 	}
 
-	if _, err := clientConn.Write(upgradeBuf); err != nil {
+	if err := writeFull(clientConn, upgradeBuf); err != nil {
 		*rbp = upgradeBuf[:0]
 		SmallBufPool.Put(rbp)
 		backendConn.Close()
@@ -729,6 +738,18 @@ func isHopByHop(name string) bool {
 func extractIP(addr string) string {
 	if addr == "" {
 		return ""
+	}
+	if addr[0] == '[' {
+		end := -1
+		for i := 1; i < len(addr); i++ {
+			if addr[i] == ']' {
+				end = i
+				break
+			}
+		}
+		if end > 1 {
+			return addr[1:end]
+		}
 	}
 	if addr[len(addr)-1] >= '0' && addr[len(addr)-1] <= '9' {
 		for i := len(addr) - 1; i >= 0; i-- {

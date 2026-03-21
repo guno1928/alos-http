@@ -82,6 +82,11 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		resp.Status(400).String("missing Sec-WebSocket-Key")
 		return nil
 	}
+	decodedKey, err := base64.StdEncoding.DecodeString(wsKey)
+	if err != nil || len(decodedKey) != 16 {
+		resp.Status(400).String("invalid Sec-WebSocket-Key")
+		return nil
+	}
 
 	connHdr := req.Header("connection")
 	if !containsTokenFold(connHdr, "upgrade") {
@@ -114,7 +119,7 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 	b = append(b, acceptKey...)
 	b = append(b, "\r\n\r\n"...)
 
-	if _, err := conn.Write(b); err != nil {
+	if err := writeFull(conn, b); err != nil {
 		conn.Close()
 		return nil
 	}
@@ -136,8 +141,27 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 		return 0, nil, err
 	}
 
+	if header[0]&0x70 != 0 {
+		ws.Close()
+		return 0, nil, ErrWebSocketProtocol
+	}
+	fin := header[0]&0x80 != 0
 	opcode := header[0] & 0x0F
 	masked := header[1]&0x80 != 0
+	if !fin || opcode == wsOpContinuation {
+		ws.Close()
+		return 0, nil, ErrWebSocketProtocol
+	}
+	switch opcode {
+	case wsOpText, wsOpBinary, wsOpClose, wsOpPing, wsOpPong:
+	default:
+		ws.Close()
+		return 0, nil, ErrWebSocketProtocol
+	}
+	if !masked {
+		ws.Close()
+		return 0, nil, ErrWebSocketProtocol
+	}
 	payloadLen := int64(header[1] & 0x7F)
 
 	switch payloadLen {
@@ -233,7 +257,7 @@ func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
 	buf := (*bp)[:0]
 	buf = append(buf, header[:n]...)
 	buf = append(buf, data...)
-	_, err := ws.conn.Write(buf)
+	err := writeFull(ws.conn, buf)
 	*bp = buf[:0]
 	MediumBufPool.Put(bp)
 	return err

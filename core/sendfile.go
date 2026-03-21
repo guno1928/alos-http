@@ -140,7 +140,12 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 		r.Status(500).String("internal error")
 		return err
 	}
-	if !strings.HasPrefix(absResolved, cwd+string(filepath.Separator)) && absResolved != cwd {
+	relPath, err := filepath.Rel(cwd, absResolved)
+	if err != nil {
+		r.Status(403).String("forbidden")
+		return err
+	}
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
 		r.Status(403).String("forbidden")
 		return os.ErrPermission
 	}

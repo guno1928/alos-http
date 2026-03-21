@@ -21,8 +21,10 @@ type H2StreamWriter struct {
 }
 
 type WriteRequest struct {
-	Data []byte
-	Done chan error
+	Data        []byte
+	Done        chan error
+	releaseBuf  *[]byte
+	releasePool uint8
 }
 
 func (w *H2StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
@@ -259,7 +261,7 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 	buf = append(buf, "Connection: keep-alive\r\n"...)
 	buf = append(buf, '\r', '\n')
 
-	_, err := w.conn.Write(buf)
+	err := writeFull(w.conn, buf)
 	*bp = buf[:0]
 	LargeBufPool.Put(bp)
 	return err
@@ -286,7 +288,7 @@ func (w *PlainH1StreamWriter) WriteChunk(data []byte) error {
 	buf = append(buf, data...)
 	buf = append(buf, '\r', '\n')
 
-	_, err := w.conn.Write(buf)
+	err := writeFull(w.conn, buf)
 	*bp = buf[:0]
 	MediumBufPool.Put(bp)
 	return err
@@ -297,6 +299,5 @@ func (w *PlainH1StreamWriter) Flush() error {
 }
 
 func (w *PlainH1StreamWriter) Close() error {
-	_, err := w.conn.Write([]byte("0\r\n\r\n"))
-	return err
+	return writeFull(w.conn, []byte("0\r\n\r\n"))
 }

@@ -130,23 +130,46 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config        Config
-	Router        *Router
-	CORS          *CORSEngine
-	RateLimit     *RateLimitEngine
-	certStore     *CertStore
-	fallbackTLS   atomic.Pointer[tls.Config]
-	proxy         atomic.Pointer[ProxyEngine]
-	httpRouter    *HTTPRouter
-	acme          *acmeIntegration
-	listeners     []net.Listener
-	done          chan struct{}
-	activeConns   sync.WaitGroup
-	shutdownOnce  sync.Once
-	connLimiter   *ConnectionLimiter
-	globalLimiter *GlobalLimiter
-	activeReqs    atomic.Int64
-	fastDispatch  atomic.Bool
+	config         Config
+	Router         *Router
+	CORS           *CORSEngine
+	RateLimit      *RateLimitEngine
+	certStore      *CertStore
+	fallbackTLS    atomic.Pointer[tls.Config]
+	proxy          atomic.Pointer[ProxyEngine]
+	httpRouter     *HTTPRouter
+	acme           *acmeIntegration
+	listeners      []net.Listener
+	done           chan struct{}
+	tlsRuntimeOnce sync.Once
+	x25519Pool     *x25519KeyPool
+	activeConns    sync.WaitGroup
+	shutdownOnce   sync.Once
+	connLimiter    *ConnectionLimiter
+	globalLimiter  *GlobalLimiter
+	activeReqs     atomic.Int64
+	fastDispatch   atomic.Bool
+	plainRootFast  plainRootFastResponse
+	h2RootFast     h2RootFastResponse
+}
+
+type plainRootFastResponse struct {
+	enabled         bool
+	getKeepAlive    []byte
+	getClose        []byte
+	getKeepAliveTLS []byte
+	getCloseTLS     []byte
+}
+
+type h2RootFastResponse struct {
+	enabled       bool
+	headerPayload []byte
+	body          []byte
+	framed        []byte
+	dataFrameOff  int
+	tlsInner      []byte
+	headerIDOff   int
+	dataIDOff     int
 }
 
 // New creates a Server with the given Config. When called without
@@ -221,6 +244,12 @@ func NewServer(addr string) *Server {
 	return New(Config{Addr: addr})
 }
 
+func (s *Server) ensureTLSRuntime() {
+	s.tlsRuntimeOnce.Do(func() {
+		s.x25519Pool = newX25519KeyPool(x25519KeyPoolSize(s.config))
+	})
+}
+
 func (s *Server) SetDebug(on bool) {
 	s.debug.Store(on)
 	SetDebugFlag(on)
@@ -248,6 +277,8 @@ func (s *Server) IsDebug() bool {
 //
 //	log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ListenAndServeTLS() error {
+	maybeRaiseProcessFileLimit()
+	logIOUringStartupProbe()
 	if err := s.loadCerts(); err != nil {
 		return err
 	}
@@ -266,6 +297,7 @@ func (s *Server) ListenAndServeTLS() error {
 	if numListeners <= 0 {
 		numListeners = 1
 	}
+	numListeners = ioUringListenerCount(numListeners)
 
 	listeners, err := createListeners(s.config.Addr, numListeners)
 	if err != nil {
@@ -293,6 +325,12 @@ func (s *Server) ListenAndServeTLS() error {
 	}
 
 	errCh := make(chan error, len(listeners))
+	if started, err := s.tryServeWithIOUringTLSWorkers(listeners); started || err != nil {
+		return err
+	}
+	if started, err := s.tryServeWithIOUring(listeners, false); started || err != nil {
+		return err
+	}
 	for _, ln := range listeners {
 		go s.acceptLoop(ln, errCh)
 	}
@@ -312,6 +350,8 @@ func (s *Server) ListenAndServeTLS() error {
 //	s.Router.GET("/", handler)
 //	log.Fatal(s.ListenAndServe())
 func (s *Server) ListenAndServe() error {
+	maybeRaiseProcessFileLimit()
+	logIOUringStartupProbe()
 	s.Router.Build()
 	s.computeFastDispatch()
 
@@ -324,6 +364,7 @@ func (s *Server) ListenAndServe() error {
 	if numListeners <= 0 {
 		numListeners = 1
 	}
+	numListeners = ioUringListenerCount(numListeners)
 
 	listeners, err := createListeners(addr, numListeners)
 	if err != nil {
@@ -340,6 +381,12 @@ func (s *Server) ListenAndServe() error {
 	log.Printf("Listening on http://%s (%d listener(s))", addr, len(listeners))
 
 	errCh := make(chan error, len(listeners))
+	if started, err := s.tryServeWithIOUringPlainWorkers(listeners); started || err != nil {
+		return err
+	}
+	if started, err := s.tryServeWithIOUring(listeners, true); started || err != nil {
+		return err
+	}
 	for _, ln := range listeners {
 		go s.acceptLoopPlain(ln, errCh)
 	}
@@ -376,6 +423,7 @@ func (s *Server) acceptLoopPlain(ln net.Listener, errCh chan<- error) {
 }
 
 func (s *Server) handlePlainConn(conn net.Conn) {
+	prepareAcceptedConn(conn)
 	Stats.ActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	Stats.H1Conns.Add(1)
@@ -402,6 +450,21 @@ func (s *Server) serveTLSConn(conn net.Conn) {
 	var hdrBuf [5]byte
 	s.handleConn(conn, hdrBuf[:])
 	s.activeConns.Done()
+}
+
+func (s *Server) serveTLSConnWithPrefix(conn net.Conn, prefix []byte) {
+	addr := ""
+	if remote := conn.RemoteAddr(); remote != nil {
+		addr = remote.String()
+	}
+	s.serveTLSFallbackWithPrefix(conn, prefix, addr)
+	s.activeConns.Done()
+}
+
+func (s *Server) serveH2SharedConn(conn net.Conn, reader, writer *TrafficAEAD) {
+	defer conn.Close()
+	var hdrBuf [5]byte
+	s.ServeH2(conn, reader, writer, hdrBuf[:])
 }
 
 func (s *Server) servePlainConn(conn net.Conn) {
@@ -550,6 +613,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-waitDone:
+		if s.x25519Pool != nil {
+			s.x25519Pool.Close()
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -557,6 +623,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(conn net.Conn, hdrBuf []byte) {
+	prepareAcceptedConn(conn)
 	Stats.ActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	logReqs := s.logRequests.Load()
@@ -589,8 +656,8 @@ func (s *Server) handleConn(conn net.Conn, hdrBuf []byte) {
 		return
 	}
 
-	ch, err := ParseClientHello(chRaw)
-	if err != nil {
+	var ch ParsedClientHello
+	if err := ParseClientHello(chRaw, &ch); err != nil {
 		s.connLog("[%s] parse ClientHello: %v", addr, err)
 		ReleaseRecordBuf(chBP)
 		return
@@ -606,7 +673,7 @@ func (s *Server) handleConn(conn net.Conn, hdrBuf []byte) {
 	}
 
 	if ch.SupportsTLS13() && certEntry.PrivKey != nil && ch.X25519PubKey != nil {
-		s.handleTLS13(conn, hdrBuf, ch, chRaw, chBP, certEntry, addr)
+		s.handleTLS13(conn, hdrBuf, &ch, chRaw, chBP, certEntry, addr)
 	} else {
 		s.handleTLSFallback(conn, hdrBuf, chRaw, chBP, addr)
 	}
@@ -614,6 +681,7 @@ func (s *Server) handleConn(conn net.Conn, hdrBuf []byte) {
 
 func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello, chRaw []byte, chBP *[]byte, certEntry *CertEntry, addr string) {
 	defer ReleaseRecordBuf(chBP)
+	s.ensureTLSRuntime()
 
 	cs := NegotiateSuite(ch.CipherSuites)
 	if cs == nil {
@@ -628,24 +696,26 @@ func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello
 	transcript := cs.HashFn()
 	transcript.Write(chRaw)
 
-	var serverPriv [32]byte
-	if _, err := rand.Read(serverPriv[:]); err != nil {
-		s.connLog("[%s] rand.Read server private key: %v", addr, err)
+	serverKey, err := s.x25519Pool.Get()
+	if err != nil {
+		s.connLog("[%s] generate server key share: %v", addr, err)
 		return
 	}
 	defer func() {
-		for i := range serverPriv {
-			serverPriv[i] = 0
-		}
+		serverKey.zero()
 	}()
-	serverPub, err := curve25519.X25519(serverPriv[:], curve25519.Basepoint)
-	if err != nil {
-		s.connLog("[%s] x25519 public: %v", addr, err)
-		return
+
+	var shared [32]byte
+	curve25519.ScalarMult(&shared, &serverKey.priv, &ch.x25519PubKeyBuf)
+	allZero := true
+	for _, b := range shared {
+		if b != 0 {
+			allZero = false
+			break
+		}
 	}
-	shared, err := curve25519.X25519(serverPriv[:], ch.X25519PubKey)
-	if err != nil {
-		s.connLog("[%s] x25519 shared: %v", addr, err)
+	if allZero {
+		s.connLog("[%s] x25519 shared: %v", addr, ErrBadKeyShare)
 		return
 	}
 	defer func() {
@@ -653,93 +723,97 @@ func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello
 			shared[i] = 0
 		}
 	}()
-	DbgHex("Shared secret", shared)
+	DbgHex("Shared secret", shared[:])
 
 	var srvRandom [32]byte
 	if _, err := rand.Read(srvRandom[:]); err != nil {
 		s.connLog("[%s] rand.Read server random: %v", addr, err)
 		return
 	}
-	shMsg := BuildServerHello(srvRandom[:], ch.SessionID, cs.ID, serverPub)
+	shMsg := BuildServerHello(srvRandom[:], ch.SessionID, cs.ID, serverKey.pub[:])
 	transcript.Write(shMsg)
 
-	h := cs.HashFn
-	hLen := cs.HashLen
-	var zeroIKM [48]byte
-	zeroSlice := zeroIKM[:hLen]
-	emptyH := EmptyTranscriptHash(h)
-
-	earlySecret := TLSExtract(h, zeroSlice, zeroSlice)
-	derivedFromEarly := TLSDeriveSecret(h, hLen, earlySecret, "derived", emptyH)
-	handshakeSecret := TLSExtract(h, derivedFromEarly, shared)
-
-	hsHash := transcript.Sum(nil)
+	var handshakeSecretBuf [64]byte
+	handshakeSecret := TLSExtractTo(cs.HashFn, cs.derivedFromEarly, shared[:], handshakeSecretBuf[:0])
+	var hsHashBuf [64]byte
+	hsHash := transcript.Sum(hsHashBuf[:0])
 	DbgHex("Transcript hash (CH+SH)", hsHash)
-	clientHSSecret := TLSDeriveSecret(h, hLen, handshakeSecret, "c hs traffic", hsHash)
-	serverHSSecret := TLSDeriveSecret(h, hLen, handshakeSecret, "s hs traffic", hsHash)
+	var clientHSSecretBuf [64]byte
+	clientHSSecret := cs.DeriveSecretTo(&cs.labelClientHSTraffic, handshakeSecret, hsHash, clientHSSecretBuf[:0])
+	var serverHSSecretBuf [64]byte
+	serverHSSecret := cs.DeriveSecretTo(&cs.labelServerHSTraffic, handshakeSecret, hsHash, serverHSSecretBuf[:0])
 
-	serverHSWriter, err := NewTrafficAEAD(h, serverHSSecret, cs)
+	serverHSWriter, err := NewTrafficAEAD(cs.HashFn, serverHSSecret, cs)
 	if err != nil {
 		s.connLog("[%s] server HS AEAD: %v", addr, err)
 		return
 	}
 	Dbg("[%s] Handshake keys derived", addr)
 
-	ee := certEntry.CachedEE(selectedALPN)
-	DbgHex("EncryptedExtensions", ee)
-	certMsg := certEntry.cachedCertMsg
-	transcript.Write(ee)
-	transcript.Write(certMsg)
+	eeCert := certEntry.CachedEECert(selectedALPN)
+	DbgHex("EncryptedExtensions+Certificate", eeCert)
+	transcript.Write(eeCert)
 
-	sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(nil))
+	var cvHashBuf [64]byte
+	sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(cvHashBuf[:0]))
 	if err != nil {
 		s.connLog("[%s] sign CertificateVerify: %v", addr, err)
 		return
 	}
-	cv := BuildCertificateVerify(sig)
-	transcript.Write(cv)
-
-	srvVerifyData := ComputeFinished(h, hLen, serverHSSecret, transcript.Sum(nil))
-	fin := BuildFinished(srvVerifyData)
-	transcript.Write(fin)
 
 	bp := LargeBufPool.Get().(*[]byte)
 	inner := (*bp)[:0]
-	inner = append(inner, ee...)
-	inner = append(inner, certMsg...)
-	inner = append(inner, cv...)
-	inner = append(inner, fin...)
-	inner = append(inner, 0x16)
+	inner = append(inner, eeCert...)
+	cvStart := len(inner)
+	inner = appendCertificateVerify(inner, sig)
+	cv := inner[cvStart:]
+	transcript.Write(cv)
 
-	ciphertext := serverHSWriter.EncryptAppend(nil, inner)
-	*bp = inner[:0]
-	LargeBufPool.Put(bp)
+	var finHashBuf [64]byte
+	var srvVerifyBuf [64]byte
+	srvVerifyData := cs.ComputeFinishedTo(serverHSSecret, transcript.Sum(finHashBuf[:0]), srvVerifyBuf[:0])
+	finStart := len(inner)
+	inner = appendFinished(inner, srvVerifyData)
+	fin := inner[finStart:]
+	transcript.Write(fin)
+	inner = append(inner, 0x16)
 
 	flightBP := LargeBufPool.Get().(*[]byte)
 	flight := (*flightBP)[:0]
 	flight = AppendRecord(flight, 0x16, shMsg)
 	flight = AppendRecord(flight, 0x14, []byte{0x01})
-	flight = AppendRecord(flight, 0x17, ciphertext)
-	if _, err := conn.Write(flight); err != nil {
+	ciphertextLen := len(inner) + serverHSWriter.Overhead()
+	flight = append(flight, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
+	flight = serverHSWriter.EncryptAppend(flight, inner)
+	if err := writeFull(conn, flight); err != nil {
+		*bp = inner[:0]
+		LargeBufPool.Put(bp)
 		*flightBP = flight[:0]
 		LargeBufPool.Put(flightBP)
 		s.connLog("[%s] write handshake flight: %v", addr, err)
 		return
 	}
+	*bp = inner[:0]
+	LargeBufPool.Put(bp)
 	*flightBP = flight[:0]
 	LargeBufPool.Put(flightBP)
 	Dbg("[%s] Encrypted handshake flight sent (ALPN=%s)", addr, selectedALPN)
 
-	derivedFromHS := TLSDeriveSecret(h, hLen, handshakeSecret, "derived", emptyH)
-	masterSecret := TLSExtract(h, derivedFromHS, zeroSlice)
-	appHash := transcript.Sum(nil)
+	var derivedFromHSBuf [64]byte
+	derivedFromHS := cs.DeriveSecretTo(&cs.labelDerived, handshakeSecret, cs.emptyTranscriptHash, derivedFromHSBuf[:0])
+	var masterSecretBuf [64]byte
+	masterSecret := TLSExtractTo(cs.HashFn, derivedFromHS, cs.zeroHashInput, masterSecretBuf[:0])
+	var appHashBuf [64]byte
+	appHash := transcript.Sum(appHashBuf[:0])
 	DbgHex("Transcript hash (CH..sFin)", appHash)
 
-	clientAppSecret := TLSDeriveSecret(h, hLen, masterSecret, "c ap traffic", appHash)
-	serverAppSecret := TLSDeriveSecret(h, hLen, masterSecret, "s ap traffic", appHash)
+	var clientAppSecretBuf [64]byte
+	clientAppSecret := cs.DeriveSecretTo(&cs.labelClientAppTraffic, masterSecret, appHash, clientAppSecretBuf[:0])
+	var serverAppSecretBuf [64]byte
+	serverAppSecret := cs.DeriveSecretTo(&cs.labelServerAppTraffic, masterSecret, appHash, serverAppSecretBuf[:0])
 	Dbg("[%s] Application keys derived", addr)
 
-	clientHSReader, err := NewTrafficAEAD(h, clientHSSecret, cs)
+	clientHSReader, err := NewTrafficAEAD(cs.HashFn, clientHSSecret, cs)
 	if err != nil {
 		s.connLog("[%s] client HS AEAD: %v", addr, err)
 		return
@@ -795,7 +869,8 @@ func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello
 		return
 	}
 	clientVerify := finContent[4:]
-	expectedVerify := ComputeFinished(h, hLen, clientHSSecret, appHash)
+	var expectedVerifyBuf [64]byte
+	expectedVerify := cs.ComputeFinishedTo(clientHSSecret, appHash, expectedVerifyBuf[:0])
 	if !hmac.Equal(clientVerify, expectedVerify) {
 		s.connLog("[%s] client Finished verification FAILED", addr)
 		ReleaseRecordBuf(finBP)
@@ -804,12 +879,12 @@ func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello
 	ReleaseRecordBuf(finBP)
 	Dbg("[%s] TLS 1.3 handshake complete!", addr)
 
-	clientAppReader, err := NewTrafficAEAD(h, clientAppSecret, cs)
+	clientAppReader, err := NewTrafficAEAD(cs.HashFn, clientAppSecret, cs)
 	if err != nil {
 		s.connLog("[%s] client app AEAD: %v", addr, err)
 		return
 	}
-	serverAppWriter, err := NewTrafficAEAD(h, serverAppSecret, cs)
+	serverAppWriter, err := NewTrafficAEAD(cs.HashFn, serverAppSecret, cs)
 	if err != nil {
 		s.connLog("[%s] server app AEAD: %v", addr, err)
 		return
@@ -841,9 +916,13 @@ func (s *Server) handleTLSFallback(conn net.Conn, hdrBuf []byte, chRaw []byte, c
 	copy(fullRecord[5:], chRaw)
 	ReleaseRecordBuf(chBP)
 
+	s.serveTLSFallbackWithPrefix(conn, fullRecord, addr)
+}
+
+func (s *Server) serveTLSFallbackWithPrefix(conn net.Conn, prefix []byte, addr string) {
 	pc := &prefixConn{
 		Conn:   conn,
-		reader: io.MultiReader(bytes.NewReader(fullRecord), conn),
+		reader: io.MultiReader(bytes.NewReader(prefix), conn),
 	}
 
 	tlsCfg := s.fallbackTLS.Load()
@@ -942,6 +1021,141 @@ func (s *Server) computeFastDispatch() {
 		fast = false
 	}
 	s.fastDispatch.Store(fast)
+	s.computePlainRootFastResponse(fast)
+	s.computeH2RootFastResponse(fast)
+}
+
+func (s *Server) computePlainRootFastResponse(fast bool) {
+	s.plainRootFast = plainRootFastResponse{}
+	if !fast || len(s.Router.globalMiddleware) != 0 {
+		return
+	}
+	handler := s.lookupStaticHandler(methodGET, "/")
+	if handler == nil {
+		return
+	}
+	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1"}
+	resp := Response{
+		StatusCode: 200,
+		Headers:    make([][2]string, 0, 8),
+		body:       make([]byte, 0, 4096),
+	}
+	handler(&req, &resp)
+	if req.hijacked || resp.IsStreamed() {
+		return
+	}
+	if s.config.MaxWriteSize > 0 && int64(resp.BodyLen()) > s.config.MaxWriteSize {
+		return
+	}
+	keepAlive := appendPlainResponseMode(&resp, make([]byte, 0, resp.BodyLen()+128), true, true)
+	closeResp := appendPlainResponseMode(&resp, make([]byte, 0, len(keepAlive)), false, true)
+	if len(keepAlive) == 0 || len(closeResp) == 0 {
+		return
+	}
+	keepAliveTLS := make([]byte, len(keepAlive)+1)
+	copy(keepAliveTLS, keepAlive)
+	keepAliveTLS[len(keepAlive)] = 0x17
+	closeTLS := make([]byte, len(closeResp)+1)
+	copy(closeTLS, closeResp)
+	closeTLS[len(closeResp)] = 0x17
+	s.plainRootFast = plainRootFastResponse{
+		enabled:         true,
+		getKeepAlive:    keepAlive,
+		getClose:        closeResp,
+		getKeepAliveTLS: keepAliveTLS,
+		getCloseTLS:     closeTLS,
+	}
+}
+
+func (s *Server) computeH2RootFastResponse(fast bool) {
+	s.h2RootFast = h2RootFastResponse{}
+	if !fast || len(s.Router.globalMiddleware) != 0 {
+		return
+	}
+	handler := s.lookupStaticHandler(methodGET, "/")
+	if handler == nil {
+		return
+	}
+	req := Request{Method: "GET", Path: "/", Proto: "HTTP/2"}
+	resp := Response{
+		StatusCode: 200,
+		Headers:    make([][2]string, 0, 8),
+		body:       make([]byte, 0, 4096),
+	}
+	handler(&req, &resp)
+	if req.hijacked || resp.IsStreamed() {
+		return
+	}
+	if s.config.MaxWriteSize > 0 && int64(resp.BodyLen()) > s.config.MaxWriteSize {
+		return
+	}
+
+	enc := HpackEncoder{}
+	headerPayload := make([]byte, 0, resp.BodyLen()+128)
+	enc.Reset(headerPayload)
+	enc.EncodeStatus(resp.StatusCode)
+	if resp.ContentType != "" {
+		enc.EncodeHeader("content-type", resp.ContentType)
+	}
+	var clBuf [20]byte
+	clStr := appendUint(clBuf[:0], int64(resp.BodyLen()))
+	enc.EncodeHeader("content-length", UnsafeString(clStr))
+	for i := range resp.Headers {
+		enc.EncodeHeader(resp.Headers[i][0], resp.Headers[i][1])
+	}
+	enc.EncodeHeader("server", "ALOS")
+
+	body := append([]byte(nil), resp.bodyBytesUnsafe()...)
+	fastResp := h2RootFastResponse{
+		enabled:       true,
+		headerPayload: append([]byte(nil), enc.Buf...),
+		body:          body,
+	}
+	if len(body) <= int(H2DefaultMaxFrameSize) {
+		framed := make([]byte, 0, len(fastResp.headerPayload)+len(body)+18)
+		if len(body) == 0 {
+			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 0, fastResp.headerPayload)
+			fastResp.dataFrameOff = -1
+		} else {
+			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders, 0, fastResp.headerPayload)
+			fastResp.dataFrameOff = len(framed)
+			framed = appendH2Frame(framed, H2FrameData, H2FlagEndStream, 0, body)
+		}
+		fastResp.framed = framed
+		if len(framed)+1 <= MaxRecordPayload {
+			fastResp.tlsInner = make([]byte, len(framed)+1)
+			copy(fastResp.tlsInner, framed)
+			fastResp.tlsInner[len(framed)] = 0x17
+			fastResp.headerIDOff = 5
+			fastResp.dataIDOff = -1
+			if fastResp.dataFrameOff >= 0 {
+				fastResp.dataIDOff = fastResp.dataFrameOff + 5
+			}
+		}
+	}
+	s.h2RootFast = fastResp
+}
+
+func (s *Server) lookupStaticHandler(methodIdx int, path string) HandlerFunc {
+	if methodIdx < 0 || methodIdx >= len(s.Router.staticPaths) {
+		return nil
+	}
+	paths := s.Router.staticPaths[methodIdx]
+	if len(paths) == 0 {
+		return nil
+	}
+	hashes := s.Router.staticHashes[methodIdx]
+	handlers := s.Router.staticHandlers[methodIdx]
+	mask := s.Router.staticMask[methodIdx]
+	h := pathQuickHash(path)
+	idx := h & mask
+	for hashes[idx] != 0 {
+		if hashes[idx] == h && paths[idx] == path {
+			return handlers[idx]
+		}
+		idx = (idx + 1) & mask
+	}
+	return nil
 }
 
 func tlsAlertName(desc byte) string {

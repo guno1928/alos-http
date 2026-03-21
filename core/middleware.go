@@ -364,7 +364,7 @@ func Compress(cfg CompressConfig) MiddlewareFunc {
 				return
 			}
 
-			body := resp.GetBody()
+			body := resp.bodyBytesUnsafe()
 			bp := LargeBufPool.Get().(*[]byte)
 			buf := (*bp)[:0]
 
@@ -460,10 +460,25 @@ func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			done := make(chan struct{}, 1)
+			tmpReq := *req
+			if len(req.Headers) > 0 {
+				tmpReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
+			} else {
+				tmpReq.Headers = nil
+			}
+			if len(req.Body) > 0 {
+				tmpReq.Body = append([]byte(nil), req.Body...)
+			} else {
+				tmpReq.Body = nil
+			}
+			tmpReq.StreamWriter = nil
+			tmpReq.conn = nil
+			tmpReq.tlsReader = nil
+			tmpReq.tlsWriter = nil
+			tmpReq.hdrBuf = nil
 			tmpResp := ResponsePool.Get().(*Response)
 			tmpResp.Reset()
-			tmpResp.SetSW(resp.sw)
-			tmpResp.lazyReq = resp.lazyReq
+			tmpResp.lazyReq = &tmpReq
 
 			var mu sync.Mutex
 			timedOut := false
@@ -475,7 +490,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					}
 					done <- struct{}{}
 				}()
-				next(req, tmpResp)
+				next(&tmpReq, tmpResp)
 			}()
 			timer := time.NewTimer(d)
 			defer timer.Stop()
@@ -499,6 +514,11 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				mu.Lock()
 				timedOut = true
 				mu.Unlock()
+				go func() {
+					<-done
+					tmpResp.Reset()
+					ResponsePool.Put(tmpResp)
+				}()
 				resp.Status(504).String("Gateway Timeout")
 			}
 		}
@@ -643,6 +663,7 @@ func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 	if realm == "" {
 		realm = "Restricted"
 	}
+	realm = sanitizeAuthRealm(realm)
 	challenge := "Basic realm=\"" + realm + "\""
 
 	return func(next HandlerFunc) HandlerFunc {
@@ -691,6 +712,18 @@ func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 			next(req, resp)
 		}
 	}
+}
+
+func sanitizeAuthRealm(s string) string {
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' || c == '\\' || c == '\r' || c == '\n' || c < 0x20 {
+			continue
+		}
+		b = append(b, c)
+	}
+	return string(b)
 }
 
 // If returns middleware that conditionally applies inner only when

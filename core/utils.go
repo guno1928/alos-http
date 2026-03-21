@@ -77,10 +77,19 @@ func dialTCP4Direct(addr string, timeout time.Duration) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+	prepareAcceptedConn(conn)
+	wrapped, err := wrapConnectedConnWithIOUring(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
 	}
-	return conn, nil
+	return wrapped, nil
+}
+
+func prepareAcceptedConn(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 }
 
 var asciiLower [256]byte

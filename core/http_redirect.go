@@ -121,6 +121,9 @@ func (hr *HTTPRouter) match(path string) *httpRouteEntry {
 
 func (s *Server) startHTTPRedirect() {
 	addr := s.config.HTTPAddr
+	if addr == "-" || addr == "off" || addr == "disable" {
+		return
+	}
 	if addr == "" {
 		addr = defaultHTTPAddr(s.config.Addr)
 	}
@@ -188,12 +191,12 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 	host, path := extractHostPath(buf)
 
 	if !ValidateHost(host) {
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_ = writeFull(conn, []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
 	for i := 0; i < len(path); i++ {
 		if path[i] == '\r' || path[i] == '\n' {
-			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			_ = writeFull(conn, []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 			return
 		}
 	}
@@ -223,7 +226,7 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 			resp, ok := s.acme.HandleHTTP01(path)
 			if ok {
 				log.Printf("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
-				conn.Write(buildACMEResponse(resp))
+				_ = writeFull(conn, buildACMEResponse(resp))
 				return
 			}
 			log.Printf("[HTTP] ACME challenge NOT FOUND in handler: %s", path)
@@ -231,7 +234,7 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 			log.Printf("[HTTP] ACME challenge request but ACME not enabled: %s", path)
 		}
 
-		conn.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_ = writeFull(conn, []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
 
@@ -248,14 +251,14 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 	}
 
 	resp := buildRedirectResponse(location)
-	conn.Write(resp)
+	_ = writeFull(conn, resp)
 }
 
 func (s *Server) proxyHTTPRoute(clientConn net.Conn, rawReq []byte, route *httpRouteEntry, host, path string) {
 	backendConn, err := DialTCP4(route.addr, 5*time.Second)
 	if err != nil {
 		log.Printf("[HTTP-ROUTE] failed to connect to %s for %s: %v", route.addr, path, err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_ = writeFull(clientConn, []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
 	defer backendConn.Close()
@@ -265,10 +268,10 @@ func (s *Server) proxyHTTPRoute(clientConn net.Conn, rawReq []byte, route *httpR
 	}
 
 	backendConn.SetWriteDeadline(timeNow().Add(10 * time.Second))
-	_, err = backendConn.Write(rawReq)
+	err = writeFull(backendConn, rawReq)
 	if err != nil {
 		log.Printf("[HTTP-ROUTE] write to %s failed: %v", route.addr, err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_ = writeFull(clientConn, []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
 
@@ -278,7 +281,9 @@ func (s *Server) proxyHTTPRoute(clientConn net.Conn, rawReq []byte, route *httpR
 	for {
 		n, rerr := backendConn.Read(readBuf)
 		if n > 0 {
-			clientConn.Write(readBuf[:n])
+			if err := writeFull(clientConn, readBuf[:n]); err != nil {
+				break
+			}
 		}
 		if rerr != nil {
 			break
@@ -424,7 +429,7 @@ func defaultHTTPAddr(httpsAddr string) string {
 	case "8443":
 		return host + ":8080"
 	default:
-		return host + ":80"
+		return "-"
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -46,10 +47,13 @@ type CertEntry struct {
 	TLSCert  tls.Certificate
 	Source   CertSource
 
-	cachedCertMsg []byte
-	cachedEEH1    []byte
-	cachedEEH2    []byte
-	cachedEEEmpty []byte
+	cachedCertMsg     []byte
+	cachedEEH1        []byte
+	cachedEEH2        []byte
+	cachedEEEmpty     []byte
+	cachedEECertH1    []byte
+	cachedEECertH2    []byte
+	cachedEECertEmpty []byte
 }
 
 type CertInfo struct {
@@ -74,8 +78,15 @@ func NewCertStore() *CertStore {
 	return cs
 }
 
+func normalizeCertDomain(domain string) string {
+	domain = strings.TrimSpace(domain)
+	domain = strings.TrimSuffix(domain, ".")
+	return strings.ToLower(domain)
+}
+
 func (cs *CertStore) Lookup(serverName string) *CertEntry {
 	snap := cs.snapshot.Load()
+	serverName = normalizeCertDomain(serverName)
 	if serverName != "" {
 		if entry, ok := snap.byDomain[serverName]; ok {
 			return entry
@@ -93,6 +104,11 @@ func (entry *CertEntry) initCachedHandshake() {
 		entry.cachedEEH2 = BuildEncryptedExtensions("h2")
 		entry.cachedEEEmpty = BuildEncryptedExtensions("")
 	}
+	if entry.cachedEECertH1 == nil {
+		entry.cachedEECertH1 = append(append(make([]byte, 0, len(entry.cachedEEH1)+len(entry.cachedCertMsg)), entry.cachedEEH1...), entry.cachedCertMsg...)
+		entry.cachedEECertH2 = append(append(make([]byte, 0, len(entry.cachedEEH2)+len(entry.cachedCertMsg)), entry.cachedEEH2...), entry.cachedCertMsg...)
+		entry.cachedEECertEmpty = append(append(make([]byte, 0, len(entry.cachedEEEmpty)+len(entry.cachedCertMsg)), entry.cachedEEEmpty...), entry.cachedCertMsg...)
+	}
 }
 
 func (entry *CertEntry) CachedEE(alpn string) []byte {
@@ -106,7 +122,19 @@ func (entry *CertEntry) CachedEE(alpn string) []byte {
 	}
 }
 
+func (entry *CertEntry) CachedEECert(alpn string) []byte {
+	switch alpn {
+	case "h2":
+		return entry.cachedEECertH2
+	case "http/1.1":
+		return entry.cachedEECertH1
+	default:
+		return entry.cachedEECertEmpty
+	}
+}
+
 func (cs *CertStore) AddCert(entry *CertEntry) {
+	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
 	cs.mu.Lock()
 	old := cs.snapshot.Load()
@@ -124,6 +152,7 @@ func (cs *CertStore) AddCert(entry *CertEntry) {
 }
 
 func (cs *CertStore) RemoveCert(domain string) {
+	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
 	old := cs.snapshot.Load()
 	newMap := make(map[string]*CertEntry, len(old.byDomain))
@@ -145,6 +174,7 @@ func (cs *CertStore) RemoveCert(domain string) {
 }
 
 func (cs *CertStore) SetDefault(domain string) {
+	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
 	old := cs.snapshot.Load()
 	entry, ok := old.byDomain[domain]
@@ -167,6 +197,7 @@ func (cs *CertStore) ListCerts() []CertInfo {
 }
 
 func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSource) (*CertEntry, error) {
+	domain = normalizeCertDomain(domain)
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
@@ -203,6 +234,7 @@ func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSourc
 }
 
 func NewCertEntryFromDER(domain string, certDER []byte, privKey *ecdsa.PrivateKey, source CertSource) *CertEntry {
+	domain = normalizeCertDomain(domain)
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyBytes, err := x509.MarshalECPrivateKey(privKey)
 	if err != nil {

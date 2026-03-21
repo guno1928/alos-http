@@ -36,6 +36,8 @@ type Response struct {
 	StatusCode  int
 	Headers     [][2]string
 	body        []byte
+	bodyString  string
+	bodyIsText  bool
 	ContentType string
 	streamer    StreamWriter
 	streamed    bool
@@ -47,6 +49,8 @@ func (r *Response) Reset() {
 	r.StatusCode = 200
 	r.Headers = r.Headers[:0]
 	r.body = r.body[:0]
+	r.bodyString = ""
+	r.bodyIsText = false
 	r.ContentType = ""
 	r.streamer = nil
 	r.streamed = false
@@ -58,6 +62,8 @@ func (r *Response) resetFastH1() {
 	r.StatusCode = 200
 	r.Headers = r.Headers[:0]
 	r.body = r.body[:0]
+	r.bodyString = ""
+	r.bodyIsText = false
 	r.ContentType = ""
 	r.streamed = false
 }
@@ -132,7 +138,9 @@ func (r *Response) SetHeaderUnsafe(name, value string) *Response {
 //	resp.String("pong")
 func (r *Response) String(s string) *Response {
 	r.ContentType = "text/plain; charset=utf-8"
-	r.body = append(r.body[:0], s...)
+	r.body = r.body[:0]
+	r.bodyString = s
+	r.bodyIsText = true
 	return r
 }
 
@@ -141,7 +149,9 @@ func (r *Response) String(s string) *Response {
 //	resp.Status(200).HTML("<h1>Welcome</h1>")
 func (r *Response) HTML(s string) *Response {
 	r.ContentType = "text/html; charset=utf-8"
-	r.body = append(r.body[:0], s...)
+	r.body = r.body[:0]
+	r.bodyString = s
+	r.bodyIsText = true
 	return r
 }
 
@@ -151,6 +161,8 @@ func (r *Response) HTML(s string) *Response {
 func (r *Response) Bytes(b []byte) *Response {
 	r.ContentType = "application/octet-stream"
 	r.body = append(r.body[:0], b...)
+	r.bodyString = ""
+	r.bodyIsText = false
 	return r
 }
 
@@ -161,6 +173,8 @@ func (r *Response) Bytes(b []byte) *Response {
 func (r *Response) JSON(jsonBytes []byte) *Response {
 	r.ContentType = "application/json; charset=utf-8"
 	r.body = append(r.body[:0], jsonBytes...)
+	r.bodyString = ""
+	r.bodyIsText = false
 	return r
 }
 
@@ -169,7 +183,9 @@ func (r *Response) JSON(jsonBytes []byte) *Response {
 //	resp.Status(200).JSONString(`{"ok":true}`)
 func (r *Response) JSONString(s string) *Response {
 	r.ContentType = "application/json; charset=utf-8"
-	r.body = append(r.body[:0], s...)
+	r.body = r.body[:0]
+	r.bodyString = s
+	r.bodyIsText = true
 	return r
 }
 
@@ -190,6 +206,8 @@ func (r *Response) JSONMarshal(v any) error {
 	}
 	r.ContentType = "application/json; charset=utf-8"
 	r.body = append(r.body[:0], data...)
+	r.bodyString = ""
+	r.bodyIsText = false
 	return nil
 }
 
@@ -199,16 +217,38 @@ func (r *Response) JSONMarshal(v any) error {
 //	resp.SetBody([]byte("<ok/>"))
 func (r *Response) SetBody(b []byte) {
 	r.body = append(r.body[:0], b...)
+	r.bodyString = ""
+	r.bodyIsText = false
+}
+
+func (r *Response) bodyBytesUnsafe() []byte {
+	if r.bodyIsText {
+		return UnsafeBytes(r.bodyString)
+	}
+	return r.body
+}
+
+func (r *Response) appendBody(dst []byte) []byte {
+	if r.bodyIsText {
+		return append(dst, r.bodyString...)
+	}
+	return append(dst, r.body...)
 }
 
 // GetBody returns the current in-memory response body.
 //
 //	body := resp.GetBody()
 func (r *Response) GetBody() []byte {
+	if r.bodyIsText {
+		return append(r.body[:0], r.bodyString...)
+	}
 	return r.body
 }
 
 func (r *Response) BodyLen() int {
+	if r.bodyIsText {
+		return len(r.bodyString)
+	}
 	return len(r.body)
 }
 

@@ -114,7 +114,7 @@ func (hc *healthChecker) checkHTTP(b *backend) bool {
 	buf = append(buf, b.Addr...)
 	buf = append(buf, "\r\nConnection: close\r\n\r\n"...)
 
-	_, err = conn.Write(buf)
+	err = writeFull(conn, buf)
 	*bp = buf[:0]
 	SmallBufPool.Put(bp)
 	if err != nil {

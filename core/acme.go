@@ -84,6 +84,10 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = "/etc/letsencrypt"
 	}
+	directoryURL := acme.LetsEncryptURL
+	if cfg.ACMENode != "" {
+		directoryURL = cfg.ACMENode
+	}
 
 	for _, sub := range []string{"live", "archive", "renewal"} {
 		dir := filepath.Join(cfg.CacheDir, sub)
@@ -114,12 +118,12 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 		stop:         make(chan struct{}),
 		client: &acme.Client{
 			Key:          key,
-			DirectoryURL: acme.LetsEncryptURL,
+			DirectoryURL: directoryURL,
 		},
 	}
 
 	acmePrintf("[ACME] account email: %s", cfg.Email)
-	acmePrintf("[ACME] LE directory: %s", acme.LetsEncryptURL)
+	acmePrintf("[ACME] LE directory: %s", directoryURL)
 	ai.refreshLocalIPs()
 	return ai
 }
@@ -552,8 +556,12 @@ func (ai *acmeIntegration) obtain(domain string) error {
 
 	archiveCert := filepath.Join(archiveDir, "fullchain1.pem")
 	archiveKey := filepath.Join(archiveDir, "privkey1.pem")
-	os.WriteFile(archiveCert, certBuf, 0644)
-	os.WriteFile(archiveKey, keyPEM, 0600)
+	if err := os.WriteFile(archiveCert, certBuf, 0644); err != nil {
+		acmePrintf("[ACME] WARNING: failed to save archived cert to %s: %v", archiveCert, err)
+	}
+	if err := os.WriteFile(archiveKey, keyPEM, 0600); err != nil {
+		acmePrintf("[ACME] WARNING: failed to save archived key to %s: %v", archiveKey, err)
+	}
 
 	certPath := filepath.Join(liveDir, "fullchain.pem")
 	keyPath := filepath.Join(liveDir, "privkey.pem")
@@ -588,20 +596,27 @@ func (ai *acmeIntegration) obtain(domain string) error {
 			chainPEMData = append(chainPEMData, encoded...)
 		}
 	}
-	os.WriteFile(certOnlyPath, leafPEM, 0644)
-	os.WriteFile(chainPath, chainPEMData, 0644)
+	if err := os.WriteFile(certOnlyPath, leafPEM, 0644); err != nil {
+		acmePrintf("[ACME] WARNING: failed to save leaf cert to %s: %v", certOnlyPath, err)
+	}
+	if err := os.WriteFile(chainPath, chainPEMData, 0644); err != nil {
+		acmePrintf("[ACME] WARNING: failed to save chain cert to %s: %v", chainPath, err)
+	}
 
 	renewalConf := filepath.Join(ai.cacheDir, "renewal", domain+".conf")
 	renewalData := "# ALOS auto-generated renewal config\n" +
 		"[renewalparams]\n" +
 		"account = alos-managed\n" +
 		"authenticator = http-01\n" +
-		"server = https://acme-v02.api.letsencrypt.org/directory\n" +
+		"server = " + ai.client.DirectoryURL + "\n" +
 		"\n[[ webroot ]]\n" +
 		"[[webroot_map]]\n" +
 		domain + " = " + ai.challengeDir + "\n"
-	os.WriteFile(renewalConf, []byte(renewalData), 0644)
-	acmePrintf("[ACME] wrote renewal config to %s", renewalConf)
+	if err := os.WriteFile(renewalConf, []byte(renewalData), 0644); err != nil {
+		acmePrintf("[ACME] WARNING: failed to write renewal config to %s: %v", renewalConf, err)
+	} else {
+		acmePrintf("[ACME] wrote renewal config to %s", renewalConf)
+	}
 
 	leaf, _ := x509.ParseCertificate(der[0])
 	if leaf != nil {
@@ -615,7 +630,9 @@ func (ai *acmeIntegration) obtain(domain string) error {
 func (ai *acmeIntegration) cleanupChallenge(domain, token string) {
 	ai.challenges.Delete(domain)
 	tokenFile := filepath.Join(ai.challengeDir, token)
-	os.Remove(tokenFile)
+	if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
+		acmePrintf("[ACME] WARNING: failed to remove challenge file %s: %v", tokenFile, err)
+	}
 }
 
 func (ai *acmeIntegration) renewAll() {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"log"
 	"sync"
 
 	"github.com/bytedance/sonic"
@@ -21,7 +22,13 @@ func AcquireJSON() *JSON {
 }
 
 func (j *JSON) Marshal(v any) []byte {
-	j.Buf, _ = sonic.Marshal(v)
+	data, err := sonic.Marshal(v)
+	if err != nil {
+		log.Printf("[JSON] marshal failed: %v", err)
+		j.Buf = append(j.Buf[:0], "null"...)
+		return j.Buf
+	}
+	j.Buf = append(j.Buf[:0], data...)
 	return j.Buf
 }
 

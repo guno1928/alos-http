@@ -12,22 +12,60 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 	remoteAddr := conn.RemoteAddr().String()
 	idleTimeout := s.config.IdleTimeout
 	fastDispatch := s.fastDispatch.Load()
+	fastRoot := s.plainRootFast.enabled
 	overhead := writer.Overhead()
 	maxWrite := s.config.MaxWriteSize
+	maxRead := s.config.MaxReadSize
+	if maxRead <= 0 {
+		maxRead = 2 << 20
+	}
 
-	var req Request
-	req.Headers = make([][2]string, 0, 16)
-	req.Body = make([]byte, 0, 1024)
+	req := RequestPool.Get().(*Request)
+	req.Reset()
 	req.Proto = "HTTP/1.1"
-	var resp Response
-	resp.Headers = make([][2]string, 0, 8)
-	resp.body = make([]byte, 0, 4096)
+	defer func() {
+		req.Reset()
+		RequestPool.Put(req)
+	}()
 
-	recBuf := make([]byte, 0, MaxRecordSize+5)
-	innerBuf := make([]byte, 0, MaxRecordPayload)
-	outBuf := make([]byte, 0, MaxRecordPayload+256)
+	resp := ResponsePool.Get().(*Response)
+	resp.Reset()
+	defer func() {
+		resp.Reset()
+		ResponsePool.Put(resp)
+	}()
+
+	recBP := RecordBufPool.Get().(*[]byte)
+	recBuf := (*recBP)[:0]
+	defer func() {
+		*recBP = recBuf[:0]
+		RecordBufPool.Put(recBP)
+	}()
+
+	innerBP := LargeBufPool.Get().(*[]byte)
+	innerBuf := (*innerBP)[:0]
+	defer func() {
+		*innerBP = innerBuf[:0]
+		LargeBufPool.Put(innerBP)
+	}()
+
+	outBP := LargeBufPool.Get().(*[]byte)
+	outBuf := (*outBP)[:0]
+	defer func() {
+		*outBP = outBuf[:0]
+		LargeBufPool.Put(outBP)
+	}()
+
+	appBP := LargeBufPool.Get().(*[]byte)
+	appBuf := (*appBP)[:0]
+	defer func() {
+		*appBP = appBuf[:0]
+		LargeBufPool.Put(appBP)
+	}()
 
 	var localReqs uint64
+	var err error
+	var ok bool
 	defer func() {
 		if localReqs > 0 {
 			Stats.TotalReqs.Add(localReqs)
@@ -35,7 +73,132 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 	}()
 
 	for {
-		if bc.br.Buffered() == 0 && idleTimeout > 0 {
+		for {
+			if len(appBuf) == 0 {
+				break
+			}
+
+			if fastRoot {
+				if payload, consumed, closeConn, ok := s.matchPlainRootFastRequest(appBuf); ok {
+					localReqs++
+					if localReqs&63 == 0 {
+						Stats.TotalReqs.Add(64)
+						localReqs = 0
+					}
+					if outBuf, err = encryptInnerPayloadFast(conn, writer, payload, overhead, outBuf); err != nil {
+						return
+					}
+					if closeConn {
+						SendCloseNotify(conn, writer)
+						return
+					}
+					if consumed == len(appBuf) {
+						appBuf = appBuf[:0]
+					} else {
+						appBuf = appBuf[consumed:]
+					}
+					continue
+				}
+			}
+
+			req.resetFastH1()
+			headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok := ParseH1RequestHead(appBuf, req)
+			if !ok {
+				break
+			}
+
+			consumed := headerEnd
+			if badTransferEncoding {
+				resp.Reset()
+				resp.Status(400).String("Bad Request")
+				if innerBuf, outBuf, err = writeH1ResponseFast(conn, writer, resp, overhead, innerBuf, outBuf); err != nil {
+					return
+				}
+				return
+			}
+			if hasContentLength {
+				if contentLength < 0 {
+					return
+				}
+				if s.config.MaxBodySize > 0 && int64(contentLength) > s.config.MaxBodySize {
+					resp.Reset()
+					resp.Status(413).String("Payload Too Large")
+					if innerBuf, outBuf, err = writeH1ResponseFast(conn, writer, resp, overhead, innerBuf, outBuf); err != nil {
+						return
+					}
+					return
+				}
+				bodyEnd := headerEnd + contentLength
+				if len(appBuf) < bodyEnd {
+					break
+				}
+				req.Body = appBuf[headerEnd:bodyEnd]
+				consumed = bodyEnd
+			} else {
+				req.Body = req.Body[:0]
+			}
+
+			localReqs++
+			if localReqs&63 == 0 {
+				Stats.TotalReqs.Add(64)
+				localReqs = 0
+			}
+
+			if debugFlag.Load() {
+				Dbg("H1 request: %s %s", req.Method, req.Path)
+			}
+
+			resp.resetFastH1()
+			req.StreamWriter = nil
+			req.RemoteAddr = remoteAddr
+			req.conn = conn
+			req.server = s
+			req.tlsReader = reader
+			req.tlsWriter = writer
+			req.hdrBuf = hdrBuf
+			req.Host = req.cachedHost
+			resp.SetSW(nil)
+			resp.lazyReq = req
+
+			if fastDispatch {
+				handler := s.Router.Lookup(req.Method, req.Path, req)
+				handler(req, resp)
+				if maxWrite > 0 && int64(resp.BodyLen()) > maxWrite {
+					resp.resetFastH1()
+					resp.Status(500).String("Response Too Large")
+				}
+			} else {
+				s.dispatch(req, resp)
+			}
+
+			if req.hijacked {
+				return
+			}
+
+			if resp.IsStreamed() {
+				if sw := req.StreamWriter; sw != nil {
+					if h1sw, ok := sw.(*H1StreamWriter); ok {
+						H1StreamWriterPool.Put(h1sw)
+					}
+				}
+			} else {
+				if innerBuf, outBuf, err = writeH1ResponseFast(conn, writer, resp, overhead, innerBuf, outBuf); err != nil {
+					return
+				}
+			}
+
+			if consumed == len(appBuf) {
+				appBuf = appBuf[:0]
+			} else {
+				appBuf = appBuf[consumed:]
+			}
+			if closeConn {
+				SendCloseNotify(conn, writer)
+				return
+			}
+		}
+
+		if bc.br.Buffered() == 0 && len(appBuf) == 0 && idleTimeout > 0 {
 			conn.SetDeadline(timeNow().Add(idleTimeout))
 		}
 
@@ -70,152 +233,72 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 		if err != nil {
 			return
 		}
-
 		appContent, appCT, err := StripInnerPlaintext(appPt)
 		if err != nil {
 			return
 		}
-
 		if appCT == 0x15 {
 			return
 		}
-		if appCT != 0x17 {
+		if appCT != 0x17 || len(appContent) == 0 {
 			continue
 		}
 
-		localReqs++
-		if localReqs&63 == 0 {
-			Stats.TotalReqs.Add(64)
-			localReqs = 0
-		}
-
-		req.resetFastH1()
-
-		bodyStart := ParseH1Request(appContent, &req)
-		if debugFlag.Load() {
-			Dbg("H1 request: %s %s", req.Method, req.Path)
-		}
-
-		if req.cachedTE != "" {
-			resp.Reset()
-			resp.Status(400).String("Bad Request")
-			innerBuf, outBuf = writeH1ResponseFast(conn, writer, &resp, overhead, innerBuf, outBuf)
+		appBuf, ok = growPlainReadBuffer(appBuf, len(appContent), int(maxRead))
+		if !ok {
 			return
 		}
-
-		clStr := req.cachedCL
-		if clStr != "" {
-			cl, ok := parseUint(clStr)
-			if !ok {
-				return
-			}
-			if bodyStart < 0 {
-				bodyStart = len(appContent)
-			}
-			initialBody := appContent[bodyStart:]
-			if len(initialBody) > cl {
-				return
-			}
-			req.Body = append(req.Body[:0], initialBody...)
-			for len(req.Body) < cl {
-				_, nextRec, nextBP, err := ReadRecordSkipCCS(bc, hdrBuf)
-				if err != nil {
-					return
-				}
-				nextPt, err := reader.Decrypt(nextRec)
-				if err != nil {
-					ReleaseRecordBuf(nextBP)
-					return
-				}
-				nextContent, nextCT, err := StripInnerPlaintext(nextPt)
-				if err != nil || nextCT != 0x17 {
-					ReleaseRecordBuf(nextBP)
-					break
-				}
-				req.Body = append(req.Body, nextContent...)
-				if s.config.MaxBodySize > 0 && int64(len(req.Body)) > s.config.MaxBodySize {
-					ReleaseRecordBuf(nextBP)
-					break
-				}
-				ReleaseRecordBuf(nextBP)
-			}
-			if s.config.MaxBodySize > 0 && int64(len(req.Body)) > s.config.MaxBodySize {
-				resp.Reset()
-				resp.Status(413).String("Payload Too Large")
-				innerBuf, outBuf = writeH1ResponseFast(conn, writer, &resp, overhead, innerBuf, outBuf)
-				return
-			}
-		} else if bodyStart >= 0 && bodyStart < len(appContent) {
-			req.Body = append(req.Body[:0], appContent[bodyStart:]...)
-		}
-
-		resp.resetFastH1()
-
-		req.StreamWriter = nil
-		req.RemoteAddr = remoteAddr
-		req.conn = conn
-		req.server = s
-		req.tlsReader = reader
-		req.tlsWriter = writer
-		req.hdrBuf = hdrBuf
-		resp.SetSW(nil)
-		resp.lazyReq = &req
-
-		if fastDispatch {
-			handler := s.Router.Lookup(req.Method, req.Path, &req)
-			handler(&req, &resp)
-			if maxWrite > 0 && int64(resp.BodyLen()) > maxWrite {
-				resp.resetFastH1()
-				resp.Status(500).String("Response Too Large")
-			}
-		} else {
-			s.dispatch(&req, &resp)
-		}
-
-		if req.hijacked {
-			return
-		}
-
-		if resp.IsStreamed() {
-			if sw := req.StreamWriter; sw != nil {
-				if h1sw, ok := sw.(*H1StreamWriter); ok {
-					H1StreamWriterPool.Put(h1sw)
-				}
-			}
-			continue
-		}
-
-		innerBuf, outBuf = writeH1ResponseFast(conn, writer, &resp, overhead, innerBuf, outBuf)
-
-		if EqualFoldASCII(req.cachedConn, "close") {
-			SendCloseNotify(conn, writer)
-			return
-		}
+		prevLen := len(appBuf)
+		appBuf = appBuf[:prevLen+len(appContent)]
+		copy(appBuf[prevLen:], appContent)
 	}
 }
 
-func writeH1ResponseFast(conn net.Conn, writer *TrafficAEAD, resp *Response, overhead int, innerBuf, outBuf []byte) ([]byte, []byte) {
+func writeH1ResponseFast(conn net.Conn, writer *TrafficAEAD, resp *Response, overhead int, innerBuf, outBuf []byte) ([]byte, []byte, error) {
+	innerBuf = appendPlainResponse(resp, innerBuf[:0])
+	return encryptResponsePayloadFast(conn, writer, innerBuf, overhead, outBuf)
+}
+
+func encryptResponsePayloadFast(conn net.Conn, writer *TrafficAEAD, payload []byte, overhead int, outBuf []byte) ([]byte, []byte, error) {
 	const maxInner = MaxRecordPayload - 1
 
-	innerBuf = appendPlainResponse(resp, innerBuf[:0])
-
-	if len(innerBuf) > maxInner {
-		WriteAppData(conn, writer, innerBuf)
-		return innerBuf, outBuf
+	if len(payload) > maxInner {
+		err := WriteAppData(conn, writer, payload)
+		return payload, outBuf, err
 	}
 
-	innerBuf = append(innerBuf, 0x17)
+	payload = append(payload, 0x17)
 
-	ciphertextLen := len(innerBuf) + overhead
+	ciphertextLen := len(payload) + overhead
 	needed := 5 + ciphertextLen
 	if cap(outBuf) < needed {
 		outBuf = make([]byte, 0, needed)
 	}
 	outBuf = outBuf[:0]
 	outBuf = append(outBuf, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
-	outBuf = writer.EncryptAppend(outBuf, innerBuf)
-	conn.Write(outBuf)
-	return innerBuf, outBuf
+	outBuf = writer.EncryptAppend(outBuf, payload)
+	err := writeFull(conn, outBuf)
+	return payload, outBuf, err
+}
+
+func encryptInnerPayloadFast(conn net.Conn, writer *TrafficAEAD, innerPayload []byte, overhead int, outBuf []byte) ([]byte, error) {
+	const maxInner = MaxRecordPayload
+
+	if len(innerPayload) > maxInner {
+		err := WriteAppData(conn, writer, innerPayload[:len(innerPayload)-1])
+		return outBuf, err
+	}
+
+	ciphertextLen := len(innerPayload) + overhead
+	needed := 5 + ciphertextLen
+	if cap(outBuf) < needed {
+		outBuf = make([]byte, 0, needed)
+	}
+	outBuf = outBuf[:0]
+	outBuf = append(outBuf, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
+	outBuf = writer.EncryptAppend(outBuf, innerPayload)
+	err := writeFull(conn, outBuf)
+	return outBuf, err
 }
 
 func ParseH1Request(data []byte, req *Request) int {
@@ -452,7 +535,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 
 	buf = append(buf, connKeepAlive...)
 	buf = append(buf, '\r', '\n')
-	buf = append(buf, resp.GetBody()...)
+	buf = resp.appendBody(buf)
 
 	*bp = buf
 	return buf, bp
@@ -460,7 +543,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 
 func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	const maxInner = MaxRecordPayload - 1
-	body := resp.GetBody()
+	body := resp.bodyBytesUnsafe()
 	bodyLen := len(body)
 	if bodyLen+256 > maxInner {
 		respData, respBP := BuildH1Response(resp)
@@ -514,7 +597,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	}
 	out = append(out, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
 	out = writer.EncryptAppend(out, inner)
-	_, err := conn.Write(out)
+	err := writeFull(conn, out)
 	*ibp = (*ibp)[:0]
 	WriteBufPool.Put(ibp)
 	*obp = out[:0]

@@ -191,6 +191,22 @@ func init() {
 }
 
 func hpackFindStaticName(name string) int {
+	switch name {
+	case ":authority":
+		return 1
+	case ":method":
+		return 2
+	case ":path":
+		return 4
+	case ":scheme":
+		return 6
+	case "content-length":
+		return 28
+	case "content-type":
+		return 31
+	case "server":
+		return 54
+	}
 	if idx, ok := hpackStaticNameMap[name]; ok {
 		return idx
 	}
@@ -201,6 +217,13 @@ type hpackDynEntry struct {
 	name  string
 	value string
 	size  int
+}
+
+type hpackDecoderSnapshot struct {
+	maxTableSize    int
+	protocolMaxSize int
+	dynSize         int
+	entries         []hpackDynEntry
 }
 
 type HpackDecoder struct {
@@ -216,6 +239,33 @@ func NewHpackDecoder() *HpackDecoder {
 	return &HpackDecoder{
 		maxTableSize:    H2HeaderTableSize,
 		protocolMaxSize: H2HeaderTableSize,
+	}
+}
+
+func (d *HpackDecoder) snapshot() hpackDecoderSnapshot {
+	snap := hpackDecoderSnapshot{
+		maxTableSize:    d.maxTableSize,
+		protocolMaxSize: d.protocolMaxSize,
+		dynSize:         d.dynSize,
+	}
+	if d.dynLen > 0 {
+		snap.entries = make([]hpackDynEntry, d.dynLen)
+		for i := 0; i < d.dynLen; i++ {
+			snap.entries[i] = *d.dynGet(i)
+		}
+	}
+	return snap
+}
+
+func (d *HpackDecoder) restore(snap hpackDecoderSnapshot) {
+	*d = HpackDecoder{
+		maxTableSize:    snap.maxTableSize,
+		protocolMaxSize: snap.protocolMaxSize,
+		dynSize:         snap.dynSize,
+		dynLen:          len(snap.entries),
+	}
+	for i := range snap.entries {
+		d.dynRing[i] = snap.entries[i]
 	}
 }
 
@@ -293,25 +343,42 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 		b := data[pos]
 		if b&0x80 != 0 {
 			idx, n := HpackDecodeInt(data[pos:], 7)
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			name, value, ok := d.lookupIndex(idx)
-			if ok {
-				headers = append(headers, [2]string{name, value})
-				if len(headers) > maxHeaders {
-					return nil, ErrTooManyHeaders
-				}
+			if !ok {
+				return nil, ErrH2BadHeader
+			}
+			headers = append(headers, [2]string{name, value})
+			if len(headers) > maxHeaders {
+				return nil, ErrTooManyHeaders
 			}
 		} else if b&0x40 != 0 {
 			idx, n := HpackDecodeInt(data[pos:], 6)
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			var name string
 			if idx > 0 {
-				name, _ = d.lookupName(idx)
+				var ok bool
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return nil, ErrH2BadHeader
+				}
 			} else {
 				name, n = HpackDecodeString(data[pos:])
+				if n <= 0 {
+					return nil, ErrH2BadHeader
+				}
 				pos += n
 			}
 			val, n := HpackDecodeString(data[pos:])
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			headers = append(headers, [2]string{name, val})
 			if len(headers) > maxHeaders {
@@ -320,6 +387,9 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 			d.addEntry(name, val)
 		} else if b&0x20 != 0 {
 			maxSize, n := HpackDecodeInt(data[pos:], 5)
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			if int(maxSize) > d.protocolMaxSize {
 				return nil, ErrHpackTableSizeExceeded
@@ -327,15 +397,28 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 			d.setMaxSize(int(maxSize))
 		} else {
 			idx, n := HpackDecodeInt(data[pos:], 4)
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			var name string
 			if idx > 0 {
-				name, _ = d.lookupName(idx)
+				var ok bool
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return nil, ErrH2BadHeader
+				}
 			} else {
 				name, n = HpackDecodeString(data[pos:])
+				if n <= 0 {
+					return nil, ErrH2BadHeader
+				}
 				pos += n
 			}
 			val, n := HpackDecodeString(data[pos:])
+			if n <= 0 {
+				return nil, ErrH2BadHeader
+			}
 			pos += n
 			headers = append(headers, [2]string{name, val})
 			if len(headers) > maxHeaders {
@@ -344,6 +427,333 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 		}
 	}
 	return headers, nil
+}
+
+func (d *HpackDecoder) DecodeIntoRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, error) {
+	const maxHeaders = 128
+	var meta hpackRequestMeta
+	if headers, meta, ok, err := decodeSimpleGetPathHTTPSRequest(headers, data); ok {
+		return headers, meta, err
+	}
+	if headers == nil {
+		headers = make([][2]string, 0, 16)
+	}
+	headers = headers[:0]
+	pos := 0
+	for pos < len(data) {
+		b := data[pos]
+		if b&0x80 != 0 {
+			idx, n := HpackDecodeInt(data[pos:], 7)
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			name, value, ok := d.lookupIndex(idx)
+			if !ok {
+				return nil, meta, ErrH2BadHeader
+			}
+			headers = append(headers, [2]string{name, value})
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+		} else if b&0x40 != 0 {
+			idx, n := HpackDecodeInt(data[pos:], 6)
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			var (
+				name string
+				ok   bool
+			)
+			if idx > 0 {
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return nil, meta, ErrH2BadHeader
+				}
+			} else {
+				name, n = HpackDecodeString(data[pos:])
+				if n <= 0 {
+					return nil, meta, ErrH2BadHeader
+				}
+				pos += n
+			}
+			value, n := HpackDecodeString(data[pos:])
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			headers = append(headers, [2]string{name, value})
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+			d.addEntry(name, value)
+		} else if b&0x20 != 0 {
+			maxSize, n := HpackDecodeInt(data[pos:], 5)
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			if int(maxSize) > d.protocolMaxSize {
+				return nil, meta, ErrHpackTableSizeExceeded
+			}
+			d.setMaxSize(int(maxSize))
+		} else {
+			idx, n := HpackDecodeInt(data[pos:], 4)
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			var (
+				name string
+				ok   bool
+			)
+			if idx > 0 {
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return nil, meta, ErrH2BadHeader
+				}
+			} else {
+				name, n = HpackDecodeString(data[pos:])
+				if n <= 0 {
+					return nil, meta, ErrH2BadHeader
+				}
+				pos += n
+			}
+			value, n := HpackDecodeString(data[pos:])
+			if n <= 0 {
+				return nil, meta, ErrH2BadHeader
+			}
+			pos += n
+			headers = append(headers, [2]string{name, value})
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+		}
+		if len(headers) > maxHeaders {
+			return nil, meta, ErrTooManyHeaders
+		}
+	}
+	return headers, meta, nil
+}
+
+func decodeSimpleGetPathHTTPSRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, bool, error) {
+	var meta hpackRequestMeta
+	if len(data) < 4 || data[0] != 0x82 || data[1] != 0x04 || data[len(data)-1] != 0x87 {
+		return headers, meta, false, nil
+	}
+	path, n := HpackDecodeString(data[2:])
+	if n <= 0 || 2+n+1 != len(data) {
+		return nil, meta, true, ErrH2BadHeader
+	}
+	if headers == nil {
+		headers = make([][2]string, 0, 3)
+	}
+	headers = headers[:0]
+	path = sanitizeRequestPath(path)
+	headers = append(headers,
+		[2]string{":method", "GET"},
+		[2]string{":path", path},
+		[2]string{":scheme", "https"},
+	)
+	meta.method = "GET"
+	meta.path = path
+	meta.scheme = "https"
+	meta.headerCount = 3
+	return headers, meta, true, nil
+}
+
+type hpackRequestMeta struct {
+	method      string
+	path        string
+	scheme      string
+	authority   string
+	headerCount int
+}
+
+func hpackSkipString(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, ErrH2BadHeader
+	}
+	sLen, n := HpackDecodeInt(data, 7)
+	if n <= 0 || n+int(sLen) > len(data) {
+		return 0, ErrH2BadHeader
+	}
+	return n + int(sLen), nil
+}
+
+func hpackDecodeStringSelective(data []byte, want bool) (string, int, error) {
+	if len(data) == 0 {
+		return "", 0, ErrH2BadHeader
+	}
+	if !want {
+		n, err := hpackSkipString(data)
+		return "", n, err
+	}
+	str, n := HpackDecodeString(data)
+	if n <= 0 || n > len(data) {
+		return "", 0, ErrH2BadHeader
+	}
+	return str, n, nil
+}
+
+func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) {
+	const maxHeaders = 128
+	var meta hpackRequestMeta
+	pos := 0
+	for pos < len(data) {
+		b := data[pos]
+		if b&0x80 != 0 {
+			idx, n := HpackDecodeInt(data[pos:], 7)
+			if n <= 0 {
+				return meta, ErrH2BadHeader
+			}
+			pos += n
+			name, value, ok := d.lookupIndex(idx)
+			if !ok {
+				return meta, ErrH2BadHeader
+			}
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+		} else if b&0x40 != 0 {
+			idx, n := HpackDecodeInt(data[pos:], 6)
+			if n <= 0 {
+				return meta, ErrH2BadHeader
+			}
+			pos += n
+			var name string
+			var ok bool
+			if idx > 0 {
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return meta, ErrH2BadHeader
+				}
+			} else {
+				var err error
+				name, n, err = hpackDecodeStringSelective(data[pos:], true)
+				if err != nil {
+					return meta, err
+				}
+				pos += n
+			}
+			value, n, err := hpackDecodeStringSelective(data[pos:], true)
+			if err != nil {
+				return meta, err
+			}
+			pos += n
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+			d.addEntry(name, value)
+		} else if b&0x20 != 0 {
+			maxSize, n := HpackDecodeInt(data[pos:], 5)
+			if n <= 0 {
+				return meta, ErrH2BadHeader
+			}
+			pos += n
+			if int(maxSize) > d.protocolMaxSize {
+				return meta, ErrHpackTableSizeExceeded
+			}
+			d.setMaxSize(int(maxSize))
+		} else {
+			idx, n := HpackDecodeInt(data[pos:], 4)
+			if n <= 0 {
+				return meta, ErrH2BadHeader
+			}
+			pos += n
+			var (
+				name string
+				ok   bool
+			)
+			if idx > 0 {
+				name, ok = d.lookupName(idx)
+				if !ok {
+					return meta, ErrH2BadHeader
+				}
+			} else {
+				var err error
+				name, n, err = hpackDecodeStringSelective(data[pos:], true)
+				if err != nil {
+					return meta, err
+				}
+				pos += n
+			}
+			wantValue := name == ":method" || name == ":path" || name == ":scheme" || name == ":authority"
+			value, n, err := hpackDecodeStringSelective(data[pos:], wantValue)
+			if err != nil {
+				return meta, err
+			}
+			pos += n
+			meta.headerCount++
+			switch name {
+			case ":method":
+				meta.method = value
+			case ":path":
+				meta.path = sanitizeRequestPath(value)
+			case ":scheme":
+				meta.scheme = value
+			case ":authority":
+				if ValidateHost(value) {
+					meta.authority = value
+				}
+			}
+		}
+		if meta.headerCount > maxHeaders {
+			return meta, ErrTooManyHeaders
+		}
+	}
+	return meta, nil
 }
 
 func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
@@ -379,7 +789,7 @@ func HpackDecodeString(data []byte) (string, int) {
 	huffman := data[0]&0x80 != 0
 	sLen, n := HpackDecodeInt(data, 7)
 	if sLen > uint64(len(data)) || n+int(sLen) > len(data) {
-		return "", n
+		return "", 0
 	}
 	raw := data[n : n+int(sLen)]
 	if huffman {

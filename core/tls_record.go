@@ -6,6 +6,17 @@ import (
 	"net"
 )
 
+const (
+	writeOwnedReleaseNone uint8 = iota
+	writeOwnedReleaseSmallBuf
+	writeOwnedReleaseMediumBuf
+	writeOwnedReleaseLargeBuf
+)
+
+type ownedWriteConn interface {
+	WriteOwned(p []byte, releaseBuf *[]byte, releasePool uint8) (int, error)
+}
+
 type BufConn struct {
 	net.Conn
 	br *bufio.Reader
@@ -96,6 +107,20 @@ func ReleaseRecordBuf(bp *[]byte) {
 	}
 }
 
+func writeFull(conn net.Conn, p []byte) error {
+	for len(p) > 0 {
+		n, err := conn.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
 func WriteRecord(conn net.Conn, ct byte, payload []byte) error {
 	if len(payload) > MaxRecordSize {
 		return ErrRecordTooLarge
@@ -109,7 +134,7 @@ func WriteRecord(conn net.Conn, ct byte, payload []byte) error {
 	rec[3] = byte(pLen >> 8)
 	rec[4] = byte(pLen)
 	copy(rec[5:], payload)
-	_, err := conn.Write(rec)
+	err := writeFull(conn, rec)
 	*bp = rec[:0]
 	RecordBufPool.Put(bp)
 	return err
@@ -154,7 +179,7 @@ func SendCloseNotify(conn net.Conn, writer *TrafficAEAD) {
 func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	const maxContent = MaxRecordPayload - 1
 	ibp := WriteBufPool.Get().(*[]byte)
-	overhead := writer.aead.Overhead()
+	overhead := writer.Overhead()
 	maxRecordLen := 5 + maxContent + 1 + overhead
 
 	numRecords := (len(data) + maxContent - 1) / maxContent
@@ -192,7 +217,34 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 
 	var err error
 	if len(out) > 0 {
-		_, err = conn.Write(out)
+		if owned, ok := conn.(ownedWriteConn); ok {
+			releaseBuf := obp
+			releasePool := writeOwnedReleaseLargeBuf
+			if len(out) <= 512 {
+				sbp := SmallBufPool.Get().(*[]byte)
+				buf := (*sbp)[:len(out)]
+				copy(buf, out)
+				*obp = out[:0]
+				LargeBufPool.Put(obp)
+				out = buf
+				releaseBuf = sbp
+				releasePool = writeOwnedReleaseSmallBuf
+			} else if len(out) <= 4096 {
+				mbp := MediumBufPool.Get().(*[]byte)
+				buf := (*mbp)[:len(out)]
+				copy(buf, out)
+				*obp = out[:0]
+				LargeBufPool.Put(obp)
+				out = buf
+				releaseBuf = mbp
+				releasePool = writeOwnedReleaseMediumBuf
+			}
+			_, err = owned.WriteOwned(out, releaseBuf, releasePool)
+			*ibp = (*ibp)[:0]
+			WriteBufPool.Put(ibp)
+			return err
+		}
+		err = writeFull(conn, out)
 	}
 	*ibp = (*ibp)[:0]
 	WriteBufPool.Put(ibp)

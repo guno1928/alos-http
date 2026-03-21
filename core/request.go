@@ -169,7 +169,13 @@ func (r *Request) cacheHeaderLookup(bit uint32, slot *string, name string) strin
 //	})
 func (r *Request) HijackConn() net.Conn {
 	r.hijacked = true
+	if r.conn == nil {
+		return nil
+	}
 	if r.tlsReader != nil && r.tlsWriter != nil {
+		if len(r.hdrBuf) < 5 {
+			return nil
+		}
 		return &aead13Conn{
 			conn:   r.conn,
 			reader: r.tlsReader,
