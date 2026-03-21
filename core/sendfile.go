@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// SendFileOption configures the behavior of Response.SendFile.
 type SendFileOption func(*sendFileConfig)
 
 type sendFileConfig struct {

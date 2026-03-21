@@ -17,13 +17,6 @@ type RateLimitEvent struct {
 	RetryAfter time.Duration
 }
 
-// RateLimitFunc is the callback signature for rate limit events. Return true to
-// let the default 429 response be sent, or false to handle the response yourself.
-//
-//	srv.OnRateLimit(func(event core.RateLimitEvent, req *core.Request, resp *core.Response) bool {
-//	    resp.Status(429).JSON([]byte(`{"error":"slow down"}`))
-//	    return false
-//	})
 type RateLimitFunc func(event RateLimitEvent, req *Request, resp *Response) bool
 
 type matchType uint8

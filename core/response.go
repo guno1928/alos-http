@@ -2,14 +2,6 @@ package core
 
 import "github.com/bytedance/sonic"
 
-// StreamWriter writes streamed responses a chunk at a time.
-//
-//	type tickerStream struct{}
-//
-//	func (tickerStream) WriteHeader(statusCode int, headers [][2]string, contentType string) error { return nil }
-//	func (tickerStream) WriteChunk(data []byte) error { return nil }
-//	func (tickerStream) Flush() error { return nil }
-//	func (tickerStream) Close() error { return nil }
 type StreamWriter interface {
 	WriteHeader(statusCode int, headers [][2]string, contentType string) error
 	WriteChunk(data []byte) error

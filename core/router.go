@@ -1,27 +1,7 @@
 package core
 
-// HandlerFunc is the function signature for request handlers. Every route handler
-// and middleware endpoint receives a pointer to the incoming Request and a Response
-// to write back to the client.
-//
-//	srv.GET("/hello", func(req *core.Request, resp *core.Response) {
-//	    resp.Status(200).String("Hello, World!")
-//	})
 type HandlerFunc func(req *Request, resp *Response)
 
-// MiddlewareFunc wraps a HandlerFunc to add pre/post processing logic. Middleware
-// receives the next handler in the chain and returns a new handler that calls it.
-//
-//	func AuthMiddleware(next core.HandlerFunc) core.HandlerFunc {
-//	    return func(req *core.Request, resp *core.Response) {
-//	        token := req.Header("Authorization")
-//	        if token == "" {
-//	            resp.Status(401).String("unauthorized")
-//	            return
-//	        }
-//	        next(req, resp)
-//	    }
-//	}
 type MiddlewareFunc func(HandlerFunc) HandlerFunc
 
 type node struct {
@@ -80,23 +60,6 @@ func methodIndex(method string) int {
 	return idx - 1
 }
 
-// Router is a high-performance radix-tree HTTP router. It supports path parameters
-// with :param syntax, catch-all routes with *name syntax, route groups, and
-// per-route or global middleware.
-//
-// After registering all routes, call Build to pre-compile the routing table for
-// faster lookups during request handling.
-//
-//	r := core.NewRouter()
-//	r.Use(core.Logger, core.Recovery)
-//	r.GET("/users/:id", getUser)
-//	r.POST("/users", createUser)
-//
-//	api := r.Group("/api/v1", authMiddleware)
-//	api.GET("/items", listItems)
-//	api.GET("/items/:id", getItem)
-//
-//	r.Build()
 type staticEntry struct {
 	path    string
 	hash    uint32
@@ -109,7 +72,7 @@ type Router struct {
 	staticPaths             [methodCount][]string
 	staticHandlers          [methodCount][]HandlerFunc
 	staticMask              [methodCount]uint32
-	validFirst              [4]uint64 // 256-bit set of first-byte-after-root across all methods
+	validFirst              [4]uint64
 	notFound                HandlerFunc
 	methodNotAllowed        HandlerFunc
 	globalMiddleware        []MiddlewareFunc
@@ -315,9 +278,6 @@ func longestCommonPrefix(a, b string) int {
 	return i
 }
 
-// pathQuickHash computes a fast 4-byte hash for open-addressing lookups.
-// Uses length + three strategic byte positions to distribute well across
-// HTTP paths that share a common '/' prefix.
 func pathQuickHash(s string) uint32 {
 	l := uint32(len(s))
 	if l < 2 {
@@ -567,7 +527,6 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 	}
 }
 
-// findInTree is used only in the unbuilt slow path (pre-Build, for setup/testing).
 func (r *Router) findInTree(root *node, path string, req *Request) HandlerFunc {
 	current := root
 	remaining := path

@@ -14,12 +14,58 @@ type tlsWorkerH2State struct {
 	pendingConnWindow uint32
 	lastStreamID      uint32
 
-	prefaceReceived   bool
+	prefaceReceived    bool
 	expectContinuation uint32
-	headerEndStream   bool
-	appBufOff         int
-	headerAccum       []byte
-	headersBuf        [][2]string
+	headerEndStream    bool
+	appBufOff          int
+	headerAccum        []byte
+	headersBuf         [][2]string
+}
+
+func h2FrameTypeName(frameType byte) string {
+	switch frameType {
+	case H2FrameData:
+		return "DATA"
+	case H2FrameHeaders:
+		return "HEADERS"
+	case H2FramePriority:
+		return "PRIORITY"
+	case H2FrameRSTStream:
+		return "RST_STREAM"
+	case H2FrameSettings:
+		return "SETTINGS"
+	case H2FramePushPromise:
+		return "PUSH_PROMISE"
+	case H2FramePing:
+		return "PING"
+	case H2FrameGoAway:
+		return "GOAWAY"
+	case H2FrameWindowUpdate:
+		return "WINDOW_UPDATE"
+	case H2FrameContinuation:
+		return "CONTINUATION"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func h2SettingName(id uint16) string {
+	switch id {
+	case H2SettingHeaderTableSize:
+		return "HEADER_TABLE_SIZE"
+	case H2SettingEnablePush:
+		return "ENABLE_PUSH"
+	case H2SettingMaxConcurrentStreams:
+		return "MAX_CONCURRENT_STREAMS"
+	case H2SettingInitialWindowSize:
+		return "INITIAL_WINDOW_SIZE"
+	case H2SettingMaxFrameSize:
+		return "MAX_FRAME_SIZE"
+	case H2SettingMaxHeaderListSize:
+		return "MAX_HEADER_LIST_SIZE"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func (st *tlsWorkerH2State) init() {
@@ -86,6 +132,10 @@ func (worker *tlsUringWorker) initHTTP2(conn *tlsWorkerConn) (int, error) {
 	conn.h2.init()
 	conn.phase = tlsConnPhaseH2Native
 	Stats.H2Conns.Add(1)
+	conn.plainBuf = appendH2ServerSettingsFlight(conn.plainBuf[:0])
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker init native HTTP/2 readN=%d appBuf=%d settings-bytes=%d", conn.remoteAddr, conn.readN, len(conn.appBuf), len(conn.plainBuf))
+	}
 	if ok := worker.primeHTTP2FromBufferedCipher(conn); !ok {
 		return tlsWorkerActionClose, nil
 	}
@@ -121,25 +171,47 @@ func (worker *tlsUringWorker) processHTTP2(conn *tlsWorkerConn) (int, error) {
 		}
 		ct, payload, totalLen, ok, err := nextTLSRecord(conn.readBuf[:conn.readN])
 		if err != nil {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 nextTLSRecord error: %v", conn.remoteAddr, err)
+			}
 			return tlsWorkerActionClose, nil
 		}
 		if !ok {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 awaiting more cipher bytes readN=%d appBuf=%d", conn.remoteAddr, conn.readN, len(conn.appBuf)-conn.h2.appBufOff)
+			}
 			return tlsWorkerActionNeedRead, nil
 		}
-		worker.compactCipherBuffer(conn, totalLen)
+		remainingRead := conn.readN - totalLen
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 tls record ct=0x%02x payload=%d remaining-read=%d", conn.remoteAddr, ct, len(payload), remainingRead)
+		}
 		switch ct {
 		case 0x14:
+			worker.compactCipherBuffer(conn, totalLen)
 			continue
 		case 0x15:
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 received alert record", conn.remoteAddr)
+			}
 			return tlsWorkerActionClose, nil
 		case 0x17:
 			pt, err := conn.appReader.Decrypt(payload)
 			if err != nil {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 decrypt failed: %v", conn.remoteAddr, err)
+				}
 				return tlsWorkerActionClose, nil
 			}
 			appContent, appCT, err := StripInnerPlaintext(pt)
 			if err != nil {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 strip inner plaintext failed: %v", conn.remoteAddr, err)
+				}
 				return tlsWorkerActionClose, nil
+			}
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 inner content type=0x%02x len=%d", conn.remoteAddr, appCT, len(appContent))
 			}
 			switch appCT {
 			case 0x15:
@@ -148,9 +220,12 @@ func (worker *tlsUringWorker) processHTTP2(conn *tlsWorkerConn) (int, error) {
 				if !worker.appendHTTP2AppData(conn, appContent) {
 					return tlsWorkerActionClose, nil
 				}
+				worker.compactCipherBuffer(conn, totalLen)
 			default:
+				worker.compactCipherBuffer(conn, totalLen)
 			}
 		default:
+			worker.compactCipherBuffer(conn, totalLen)
 		}
 	}
 }
@@ -160,42 +235,66 @@ func (worker *tlsUringWorker) processHTTP2Frames(conn *tlsWorkerConn) (int, erro
 	if !st.prefaceReceived {
 		avail := len(conn.appBuf) - st.appBufOff
 		if avail < H2PrefaceLen {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 waiting for client preface have=%d need=%d", conn.remoteAddr, avail, H2PrefaceLen)
+			}
 			return worker.flushHTTP2Frames(conn, false)
 		}
 		for i := 0; i < H2PrefaceLen; i++ {
 			if conn.appBuf[st.appBufOff+i] != H2ClientPreface[i] {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 invalid client preface", conn.remoteAddr)
+				}
 				conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf[:0], st.lastStreamID, H2ErrProtocol)
 				return worker.flushHTTP2Frames(conn, true)
 			}
 		}
 		st.prefaceReceived = true
 		st.appBufOff += H2PrefaceLen
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 client preface received", conn.remoteAddr)
+		}
 	}
 
 	for {
 		avail := len(conn.appBuf) - st.appBufOff
 		if avail < 9 {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 awaiting more frame header bytes avail=%d queued=%d", conn.remoteAddr, avail, len(conn.plainBuf))
+			}
 			worker.compactHTTP2AppBuffer(conn, false)
 			return worker.flushHTTP2Frames(conn, false)
 		}
 		base := st.appBufOff
 		frameLen := int(conn.appBuf[base])<<16 | int(conn.appBuf[base+1])<<8 | int(conn.appBuf[base+2])
+		frameType := conn.appBuf[base+3]
+		frameFlags := conn.appBuf[base+4]
+		streamID := (uint32(conn.appBuf[base+5])<<24 | uint32(conn.appBuf[base+6])<<16 | uint32(conn.appBuf[base+7])<<8 | uint32(conn.appBuf[base+8])) & 0x7fffffff
 		if frameLen > int(H2MaxFrameSize) {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 frame too large len=%d", conn.remoteAddr, frameLen)
+			}
 			conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf[:0], st.lastStreamID, H2ErrFrameSize)
 			return worker.flushHTTP2Frames(conn, true)
 		}
 		totalLen := 9 + frameLen
 		if avail < totalLen {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 partial frame type=%s len=%d have=%d", conn.remoteAddr, h2FrameTypeName(frameType), frameLen, avail)
+			}
 			worker.compactHTTP2AppBuffer(conn, false)
 			return worker.flushHTTP2Frames(conn, false)
 		}
-		frameType := conn.appBuf[base+3]
-		frameFlags := conn.appBuf[base+4]
-		streamID := (uint32(conn.appBuf[base+5])<<24 | uint32(conn.appBuf[base+6])<<16 | uint32(conn.appBuf[base+7])<<8 | uint32(conn.appBuf[base+8])) & 0x7fffffff
 		payload := conn.appBuf[base+9 : base+totalLen]
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 frame type=%s(0x%02x) flags=0x%02x stream=%d len=%d queued=%d", conn.remoteAddr, h2FrameTypeName(frameType), frameType, frameFlags, streamID, len(payload), len(conn.plainBuf))
+		}
 
 		if st.expectContinuation != 0 {
 			if frameType != H2FrameContinuation || streamID != st.expectContinuation {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 expected CONTINUATION for stream=%d got type=%s stream=%d", conn.remoteAddr, st.expectContinuation, h2FrameTypeName(frameType), streamID)
+				}
 				conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf[:0], st.lastStreamID, H2ErrProtocol)
 				return worker.flushHTTP2Frames(conn, true)
 			}
@@ -297,6 +396,9 @@ func (worker *tlsUringWorker) processHTTP2Settings(conn *tlsWorkerConn, payload 
 	for i := 0; i+6 <= len(payload); i += 6 {
 		id := uint16(payload[i])<<8 | uint16(payload[i+1])
 		val := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 | uint32(payload[i+4])<<8 | uint32(payload[i+5])
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 setting %s(%d)=%d", conn.remoteAddr, h2SettingName(id), id, val)
+		}
 		switch id {
 		case H2SettingMaxFrameSize:
 			if val < 16384 || val > uint32(H2MaxFrameSize) {
@@ -337,6 +439,9 @@ func (worker *tlsUringWorker) handleHTTP2Headers(conn *tlsWorkerConn, streamID u
 		conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf, st.lastStreamID, H2ErrProtocol)
 		return tlsWorkerActionWrote, true
 	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 HEADERS stream=%d flags=0x%02x len=%d", conn.remoteAddr, streamID, frameFlags, len(payload))
+	}
 	if frameFlags&H2FlagPadded != 0 {
 		if len(payload) == 0 {
 			conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrProtocol)
@@ -361,6 +466,9 @@ func (worker *tlsUringWorker) handleHTTP2Headers(conn *tlsWorkerConn, streamID u
 		st.expectContinuation = streamID
 		st.headerEndStream = frameFlags&H2FlagEndStream != 0
 		st.headerAccum = append(st.headerAccum[:0], payload...)
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 HEADERS awaiting CONTINUATION stream=%d len=%d endStream=%v", conn.remoteAddr, streamID, len(st.headerAccum), st.headerEndStream)
+		}
 		return tlsWorkerActionContinue, false
 	}
 	return worker.processHTTP2DecodedHeaders(conn, streamID, payload, frameFlags&H2FlagEndStream != 0)
@@ -369,6 +477,9 @@ func (worker *tlsUringWorker) handleHTTP2Headers(conn *tlsWorkerConn, streamID u
 func (worker *tlsUringWorker) handleHTTP2Continuation(conn *tlsWorkerConn, streamID uint32, frameFlags byte, payload []byte) (int, bool) {
 	st := &conn.h2
 	st.headerAccum = append(st.headerAccum, payload...)
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 CONTINUATION stream=%d flags=0x%02x total-header-bytes=%d", conn.remoteAddr, streamID, frameFlags, len(st.headerAccum))
+	}
 	if len(st.headerAccum) > H2MaxHeaderListSize*4 {
 		st.expectContinuation = 0
 		conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
@@ -392,8 +503,14 @@ func (worker *tlsUringWorker) processHTTP2DecodedHeaders(conn *tlsWorkerConn, st
 	headers, meta, err := st.decoder.DecodeIntoRequest(st.headersBuf[:0], headerBlock)
 	st.headersBuf = headers[:0]
 	if err != nil {
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 header decode failed stream=%d err=%v", conn.remoteAddr, streamID, err)
+		}
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrCompression)
 		return tlsWorkerActionWrote, false
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 decoded headers stream=%d method=%q path=%q authority=%q headers=%d endStream=%v", conn.remoteAddr, streamID, meta.method, meta.path, meta.authority, len(headers), endStream)
 	}
 	if endStream && worker.server.h2RootFast.enabled && meta.method == "GET" && meta.path == "/" {
 		st.lastStreamID = streamID
@@ -464,7 +581,13 @@ func (worker *tlsUringWorker) handleHTTP2Data(conn *tlsWorkerConn, streamID uint
 	}
 	stream := st.streams[streamID]
 	if stream == nil {
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 DATA for unknown stream=%d len=%d", conn.remoteAddr, streamID, len(payload))
+		}
 		return tlsWorkerActionContinue, false
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 DATA stream=%d flags=0x%02x len=%d", conn.remoteAddr, streamID, frameFlags, len(payload))
 	}
 	if stream.State.Load() >= StreamHalfClosed {
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrStreamClosed)
@@ -533,6 +656,9 @@ func (worker *tlsUringWorker) handleHTTP2WindowUpdate(conn *tlsWorkerConn, strea
 	}
 	if streamID == 0 {
 		st.connWindow += int64(increment)
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 WINDOW_UPDATE conn +%d -> %d", conn.remoteAddr, increment, st.connWindow)
+		}
 		if st.connWindow > 2147483647 {
 			conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf, st.lastStreamID, H2ErrFlowControl)
 			return tlsWorkerActionWrote, true
@@ -544,6 +670,9 @@ func (worker *tlsUringWorker) handleHTTP2WindowUpdate(conn *tlsWorkerConn, strea
 		return tlsWorkerActionContinue, false
 	}
 	newWindow := stream.Window.Load() + int64(increment)
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 WINDOW_UPDATE stream=%d +%d -> %d", conn.remoteAddr, streamID, increment, newWindow)
+	}
 	if newWindow > 2147483647 {
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrFlowControl)
 		worker.releaseHTTP2Stream(st, streamID)
@@ -563,6 +692,9 @@ func (worker *tlsUringWorker) dispatchHTTP2Stream(conn *tlsWorkerConn, streamID 
 	Stats.TotalReqs.Add(1)
 	if worker.server.logRequests.Load() {
 		log.Printf("[H2] stream %d: %s %s (native)", stream.ID, stream.Method, stream.Path)
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 dispatch stream=%d method=%s path=%s hdrs=%d body=%d connWindow=%d streamWindow=%d", conn.remoteAddr, stream.ID, stream.Method, stream.Path, len(stream.Headers), len(stream.Body), st.connWindow, stream.Window.Load())
 	}
 
 	conn.req.Reset()
@@ -592,6 +724,9 @@ func (worker *tlsUringWorker) dispatchHTTP2Stream(conn *tlsWorkerConn, streamID 
 		handler(&conn.req, &conn.resp)
 	} else {
 		worker.server.dispatch(&conn.req, &conn.resp)
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 response stream=%d status=%d body=%d headers=%d streamed=%v hijacked=%v", conn.remoteAddr, stream.ID, conn.resp.StatusCode, conn.resp.BodyLen(), len(conn.resp.Headers), conn.resp.IsStreamed(), conn.req.hijacked)
 	}
 	if conn.req.hijacked || conn.resp.IsStreamed() {
 		conn.resp.Reset()
@@ -631,10 +766,16 @@ func (worker *tlsUringWorker) releaseHTTP2Stream(st *tlsWorkerH2State, streamID 
 
 func (worker *tlsUringWorker) flushHTTP2Frames(conn *tlsWorkerConn, closeAfter bool) (int, error) {
 	if len(conn.plainBuf) == 0 {
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 flush no-op closeAfter=%v", conn.remoteAddr, closeAfter)
+		}
 		if closeAfter {
 			return tlsWorkerActionClose, nil
 		}
 		return tlsWorkerActionContinue, nil
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 flushing %d plain bytes closeAfter=%v", conn.remoteAddr, len(conn.plainBuf), closeAfter)
 	}
 	return worker.queueH2Frames(conn, closeAfter)
 }
@@ -645,6 +786,9 @@ func (worker *tlsUringWorker) queueH2Frames(conn *tlsWorkerConn, closeAfter bool
 	conn.plainBuf = conn.plainBuf[:0]
 	conn.writeN = len(conn.writeBuf)
 	conn.writeSent = 0
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 queue write bytes=%d closeAfter=%v", conn.remoteAddr, conn.writeN, closeAfter)
+	}
 	if conn.writeN == 0 {
 		if closeAfter {
 			return tlsWorkerActionClose, nil
@@ -662,25 +806,43 @@ func (worker *tlsUringWorker) primeHTTP2FromBufferedCipher(conn *tlsWorkerConn) 
 	for {
 		ct, payload, totalLen, ok, err := nextTLSRecord(conn.readBuf[:conn.readN])
 		if err != nil {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 prime nextTLSRecord error: %v", conn.remoteAddr, err)
+			}
 			return false
 		}
 		if !ok {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 prime has no buffered tls records", conn.remoteAddr)
+			}
 			return true
 		}
-		worker.compactCipherBuffer(conn, totalLen)
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 prime tls record ct=0x%02x payload=%d", conn.remoteAddr, ct, len(payload))
+		}
 		switch ct {
 		case 0x14:
+			worker.compactCipherBuffer(conn, totalLen)
 			continue
 		case 0x15:
 			return false
 		case 0x17:
 			pt, err := conn.appReader.Decrypt(payload)
 			if err != nil {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 prime decrypt failed: %v", conn.remoteAddr, err)
+				}
 				return false
 			}
 			appContent, appCT, err := StripInnerPlaintext(pt)
 			if err != nil {
+				if worker.server.IsDebug() {
+					Dbg("[%s] worker HTTP/2 prime strip inner plaintext failed: %v", conn.remoteAddr, err)
+				}
 				return false
+			}
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 prime inner content type=0x%02x len=%d", conn.remoteAddr, appCT, len(appContent))
 			}
 			switch appCT {
 			case 0x15:
@@ -689,7 +851,12 @@ func (worker *tlsUringWorker) primeHTTP2FromBufferedCipher(conn *tlsWorkerConn) 
 				if !worker.appendHTTP2AppData(conn, appContent) {
 					return false
 				}
+				worker.compactCipherBuffer(conn, totalLen)
+			default:
+				worker.compactCipherBuffer(conn, totalLen)
 			}
+		default:
+			worker.compactCipherBuffer(conn, totalLen)
 		}
 	}
 }
@@ -704,6 +871,9 @@ func (worker *tlsUringWorker) appendHTTP2AppData(conn *tlsWorkerConn, appContent
 		}
 	}
 	conn.appBuf = append(conn.appBuf, appContent...)
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker HTTP/2 buffered app data +%d total=%d off=%d", conn.remoteAddr, len(appContent), len(conn.appBuf), conn.h2.appBufOff)
+	}
 	return true
 }
 

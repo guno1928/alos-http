@@ -289,8 +289,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 	if err != nil {
 		Dbg("[PROXY] streaming response aborted after headers for %s %s via %s: %v", req.Method, req.Path, b.Addr, err)
 	}
-	// Headers are already on the wire at this point, so retrying another
-	// backend would corrupt the client response stream.
+
 	return nil
 }
 

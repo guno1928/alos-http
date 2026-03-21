@@ -89,7 +89,7 @@ type tlsWorkerConn struct {
 	appWriter     *TrafficAEAD
 	expectedFin   [64]byte
 	expectedFinN  int
-	h2           tlsWorkerH2State
+	h2            tlsWorkerH2State
 	bridge        *tlsWorkerSharedBridge
 }
 
@@ -300,7 +300,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 			}
 		}
 	}
-	if err := worker.fillAccepts(time.Now().UnixNano()); err != nil {
+	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
 		return err
 	}
 	if err := worker.armWake(); err != nil {
@@ -309,7 +309,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 	if _, err := worker.ring.submitAndWait(0); err != nil {
 		return err
 	}
-	lastSweep := time.Now()
+	lastSweep := MonotonicNanotime()
 	for {
 		if worker.server.doneClosed() {
 			worker.listenerFD = -1
@@ -318,7 +318,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 				return nil
 			}
 		}
-		now := time.Now().UnixNano()
+		now := MonotonicNanotime()
 		if err := worker.drainHandoffs(now); err != nil {
 			return err
 		}
@@ -332,7 +332,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 			if err := worker.parkUntilWork(); err != nil {
 				return err
 			}
-			lastSweep = time.Now()
+			lastSweep = MonotonicNanotime()
 			continue
 		}
 		count := worker.ring.peekBatch(worker.completions[:])
@@ -347,14 +347,14 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 			worker.completions[0] = cqe
 			count = 1
 		}
-		nowTime := time.Now()
+		nowTime := MonotonicNanotime()
 		for i := 0; i < count; i++ {
-			if err := worker.handleCompletion(backend, worker.completions[i], nowTime.UnixNano()); err != nil {
+			if err := worker.handleCompletion(backend, worker.completions[i], nowTime); err != nil {
 				if errors.Is(err, errTLSWorkerPark) {
 					if err := worker.parkUntilWork(); err != nil {
 						return err
 					}
-					lastSweep = time.Now()
+					lastSweep = MonotonicNanotime()
 					count = 0
 					break
 				}
@@ -364,17 +364,17 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 		if count == 0 {
 			continue
 		}
-		if nowTime.Sub(lastSweep) >= time.Second {
-			worker.sweepIdle(nowTime.UnixNano())
+		if nowTime-lastSweep >= int64(time.Second) {
+			worker.sweepIdle(nowTime)
 			lastSweep = nowTime
 		}
-		if err := worker.drainHandoffs(nowTime.UnixNano()); err != nil {
+		if err := worker.drainHandoffs(nowTime); err != nil {
 			return err
 		}
 		if err := worker.drainBridgeRequests(); err != nil {
 			return err
 		}
-		if err := worker.fillAccepts(nowTime.UnixNano()); err != nil {
+		if err := worker.fillAccepts(nowTime); err != nil {
 			return err
 		}
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
@@ -416,6 +416,12 @@ func (worker *tlsUringWorker) handleCompletion(backend *tlsUringBackend, cqe ioU
 		}
 		conn := &worker.connections[connIndex]
 		if conn.fd < 0 || conn.generation != generation {
+			if op == tlsUringOpRead {
+				worker.recycleReadBuffer(cqe.Flags)
+			}
+			return nil
+		}
+		if conn.state == tlsConnStateClosing && op != tlsUringOpClose {
 			if op == tlsUringOpRead {
 				worker.recycleReadBuffer(cqe.Flags)
 			}
@@ -551,6 +557,9 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now
 		return worker.handleBridgeWrite(conn, result, now)
 	}
 	if result < 0 {
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker write completion result=%d phase=%d state=%d sent=%d/%d", conn.remoteAddr, result, conn.phase, conn.state, conn.writeSent, conn.writeN)
+		}
 		err := syscall.Errno(-result)
 		if isIOUringTransient(err) {
 			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
@@ -560,6 +569,9 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now
 	}
 	conn.lastActive = now
 	conn.writeSent += int(result)
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker wrote %d bytes phase=%d state=%d progress=%d/%d", conn.remoteAddr, result, conn.phase, conn.state, conn.writeSent, conn.writeN)
+	}
 	if conn.writeSent < conn.writeN {
 		remaining := conn.writeBuf[conn.writeSent:conn.writeN]
 		return worker.ring.prepSendUserWithFlags(conn.fd, remaining, tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), true)
@@ -605,6 +617,9 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 	n := int(result)
 	if n > len(buf) {
 		n = len(buf)
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker buffered read %d bytes flags=0x%x phase=%d state=%d more=%v", conn.remoteAddr, n, flags, conn.phase, conn.state, conn.readArmed)
 	}
 	if conn.phase == tlsConnPhaseH2Bridge {
 		bridge := conn.bridge
@@ -693,10 +708,13 @@ func (worker *tlsUringWorker) processClientHello(conn *tlsWorkerConn) (int, erro
 		Dbg("[%s] worker parse ClientHello: %v", conn.remoteAddr, err)
 		return tlsWorkerActionClose, nil
 	}
-	selectedALPN := NegotiateALPN(conn.clientHello.ALPNProtos)
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker ClientHello parsed sni=%q alpn=%v tls13=%v", conn.remoteAddr, conn.clientHello.ServerName, conn.clientHello.ALPNProtos, conn.clientHello.SupportsTLS13())
+	}
+	selectedALPN := worker.server.negotiateALPN(conn.clientHello.ALPNProtos)
 	certEntry := worker.server.certStore.Lookup(conn.clientHello.ServerName)
 	if certEntry == nil {
-		Dbg("[%s] worker no cert for SNI=%q", conn.remoteAddr, conn.clientHello.ServerName)
+		Dbg("[%s] worker no cert for SNI=%q loaded-certs=%d default=%q", conn.remoteAddr, conn.clientHello.ServerName, len(worker.server.certStore.ListCerts()), worker.server.config.DefaultDomain)
 		return tlsWorkerActionClose, nil
 	}
 	if !conn.clientHello.SupportsTLS13() || certEntry.PrivKey == nil || conn.clientHello.X25519PubKey == nil {
@@ -707,6 +725,9 @@ func (worker *tlsUringWorker) processClientHello(conn *tlsWorkerConn) (int, erro
 	if cs == nil {
 		Dbg("[%s] worker no common cipher suite", conn.remoteAddr)
 		return tlsWorkerActionClose, nil
+	}
+	if worker.server.IsDebug() {
+		Dbg("[%s] worker negotiated ALPN=%q cipher=0x%04x", conn.remoteAddr, selectedALPN, cs.ID)
 	}
 	transcript := cs.HashFn()
 	transcript.Write(payload)
@@ -814,11 +835,6 @@ func (worker *tlsUringWorker) processClientHello(conn *tlsWorkerConn) (int, erro
 		Dbg("[%s] worker server app AEAD: %v", conn.remoteAddr, err)
 		return tlsWorkerActionClose, nil
 	}
-	if selectedALPN == "h2" {
-		conn.plainBuf = appendH2ServerSettingsFlight(conn.plainBuf[:0])
-		flight = buildTLSAppDataRecords(flight, serverAppWriter, conn.plainBuf, &conn.innerScratch)
-		conn.plainBuf = conn.plainBuf[:0]
-	}
 	conn.writeBuf = flight
 	conn.writeN = len(flight)
 	conn.writeSent = 0
@@ -850,8 +866,12 @@ func (worker *tlsUringWorker) processClientFinished(conn *tlsWorkerConn) (int, e
 		if !ok {
 			return tlsWorkerActionNeedRead, nil
 		}
-		worker.compactCipherBuffer(conn, totalLen)
+		remainingRead := conn.readN - totalLen
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker client Finished record ct=0x%02x payload=%d remaining-read=%d", conn.remoteAddr, ct, len(payload), remainingRead)
+		}
 		if ct == 0x14 {
+			worker.compactCipherBuffer(conn, totalLen)
 			continue
 		}
 		if ct == 0x15 || ct != 0x17 {
@@ -877,12 +897,19 @@ func (worker *tlsUringWorker) processClientFinished(conn *tlsWorkerConn) (int, e
 			Dbg("[%s] worker client Finished verification failed", conn.remoteAddr)
 			return tlsWorkerActionClose, nil
 		}
+		worker.compactCipherBuffer(conn, totalLen)
 		conn.hsReader = nil
 		if conn.selectedALPN == "h2" {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker TLS handshake complete; entering native HTTP/2", conn.remoteAddr)
+			}
 			return worker.initHTTP2(conn)
 		}
 		conn.phase = tlsConnPhaseApplication
 		Stats.H1Conns.Add(1)
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker TLS handshake complete; entering HTTP/1.1", conn.remoteAddr)
+		}
 		return tlsWorkerActionContinue, nil
 	}
 }
@@ -899,9 +926,9 @@ func (worker *tlsUringWorker) processApplication(conn *tlsWorkerConn) (int, erro
 		if !ok {
 			return tlsWorkerActionNeedRead, nil
 		}
-		worker.compactCipherBuffer(conn, totalLen)
 		switch ct {
 		case 0x14:
+			worker.compactCipherBuffer(conn, totalLen)
 			continue
 		case 0x15:
 			return tlsWorkerActionClose, nil
@@ -923,13 +950,16 @@ func (worker *tlsUringWorker) processApplication(conn *tlsWorkerConn) (int, erro
 					return tlsWorkerActionClose, nil
 				}
 				conn.appBuf = append(conn.appBuf, appContent...)
+				worker.compactCipherBuffer(conn, totalLen)
 				if action, err := worker.processHTTPRequests(conn); action != tlsWorkerActionContinue || err != nil {
 					return action, err
 				}
 			default:
+				worker.compactCipherBuffer(conn, totalLen)
 				continue
 			}
 		default:
+			worker.compactCipherBuffer(conn, totalLen)
 			continue
 		}
 	}
@@ -1229,6 +1259,9 @@ func (worker *tlsUringWorker) tryAttachAccepted(fd int, now int64) (bool, error)
 }
 
 func (worker *tlsUringWorker) queueRead(conn *tlsWorkerConn) error {
+	if conn.fd < 0 || conn.state == tlsConnStateClosing {
+		return nil
+	}
 	conn.state = tlsConnStateReading
 	if conn.readArmed {
 		return nil
@@ -1279,7 +1312,7 @@ func (worker *tlsUringWorker) ensureAppCapacity(conn *tlsWorkerConn, addN int, m
 }
 
 func (worker *tlsUringWorker) closeConnection(conn *tlsWorkerConn) error {
-	if conn.fd < 0 {
+	if conn.fd < 0 || conn.state == tlsConnStateClosing {
 		return nil
 	}
 	conn.state = tlsConnStateClosing
@@ -1480,7 +1513,7 @@ func (worker *tlsUringWorker) parkUntilWork() error {
 				}
 				return err
 			}
-			if err := worker.handleCompletion(nil, cqe, time.Now().UnixNano()); err != nil {
+			if err := worker.handleCompletion(nil, cqe, MonotonicNanotime()); err != nil {
 				if errors.Is(err, errTLSWorkerPark) {
 					break
 				}
@@ -1499,7 +1532,7 @@ func (worker *tlsUringWorker) parkUntilWork() error {
 		}
 		_, err := syscall.Read(worker.wakeupReadFD, buffer[:])
 		if err == nil {
-			now := time.Now().UnixNano()
+			now := MonotonicNanotime()
 			if err := worker.drainHandoffs(now); err != nil {
 				return err
 			}

@@ -79,11 +79,15 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 			}
 
 			if fastRoot {
-				if payload, consumed, closeConn, ok := s.matchPlainRootFastRequest(appBuf); ok {
+				if _, consumed, closeConn, ok := s.matchPlainRootFastRequest(appBuf); ok {
 					localReqs++
 					if localReqs&63 == 0 {
 						Stats.TotalReqs.Add(64)
 						localReqs = 0
+					}
+					payload := s.plainRootFast.getKeepAliveTLS
+					if closeConn {
+						payload = s.plainRootFast.getCloseTLS
 					}
 					if outBuf, err = encryptInnerPayloadFast(conn, writer, payload, overhead, outBuf); err != nil {
 						return

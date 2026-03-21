@@ -92,7 +92,7 @@ func NegotiateSuite(clientIDs []uint16) *CipherSuiteConfig {
 type TrafficAEAD struct {
 	aead  cipher.AEAD
 	iv    [12]byte
-	ivLow uint64 // pre-decoded binary.BigEndian.Uint64(iv[4:])
+	ivLow uint64
 	oh    int
 	seq   uint64
 }

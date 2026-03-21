@@ -250,7 +250,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 	if err := worker.ring.enable(); err != nil {
 		return err
 	}
-	if err := worker.fillAccepts(time.Now().UnixNano()); err != nil {
+	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
 		return err
 	}
 	if worker.listenerFD >= 0 {
@@ -261,12 +261,12 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			return err
 		}
 	}
-	lastSweep := time.Now()
+	lastSweep := MonotonicNanotime()
 	for {
 		if worker.server.doneClosed() {
 			return nil
 		}
-		now := time.Now().UnixNano()
+		now := MonotonicNanotime()
 		if err := worker.drainHandoffs(now); err != nil {
 			return err
 		}
@@ -277,7 +277,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			if err := worker.parkUntilWork(); err != nil {
 				return err
 			}
-			lastSweep = time.Now()
+			lastSweep = MonotonicNanotime()
 			continue
 		}
 		count := worker.ring.peekBatch(worker.completions[:])
@@ -292,14 +292,14 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			worker.completions[0] = cqe
 			count = 1
 		}
-		nowTime := time.Now()
+		nowTime := MonotonicNanotime()
 		for i := 0; i < count; i++ {
-			if err := worker.handleCompletion(backend, worker.completions[i], nowTime.UnixNano()); err != nil {
+			if err := worker.handleCompletion(backend, worker.completions[i], nowTime); err != nil {
 				if errors.Is(err, errPlainWorkerPark) {
 					if err := worker.parkUntilWork(); err != nil {
 						return err
 					}
-					lastSweep = time.Now()
+					lastSweep = MonotonicNanotime()
 					count = 0
 					break
 				}
@@ -309,14 +309,14 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 		if count == 0 {
 			continue
 		}
-		if nowTime.Sub(lastSweep) >= time.Second {
-			worker.sweepIdle(nowTime.UnixNano())
+		if nowTime-lastSweep >= int64(time.Second) {
+			worker.sweepIdle(nowTime)
 			lastSweep = nowTime
 		}
-		if err := worker.drainHandoffs(nowTime.UnixNano()); err != nil {
+		if err := worker.drainHandoffs(nowTime); err != nil {
 			return err
 		}
-		if err := worker.fillAccepts(nowTime.UnixNano()); err != nil {
+		if err := worker.fillAccepts(nowTime); err != nil {
 			return err
 		}
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
@@ -346,6 +346,9 @@ func (worker *plainUringWorker) handleCompletion(backend *plainUringBackend, cqe
 		}
 		conn := &worker.connections[connIndex]
 		if conn.fd < 0 || conn.generation != generation {
+			return nil
+		}
+		if conn.state == plainConnStateClosing && op != plainUringOpClose {
 			return nil
 		}
 		switch op {
@@ -641,6 +644,9 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 }
 
 func (worker *plainUringWorker) queueRead(conn *plainWorkerConn) error {
+	if conn.fd < 0 || conn.state == plainConnStateClosing {
+		return nil
+	}
 	if !worker.ensureReadCapacity(conn, plainReadMinFree, int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))) {
 		return worker.closeConnection(conn)
 	}
@@ -661,7 +667,7 @@ func (worker *plainUringWorker) ensureReadCapacity(conn *plainWorkerConn, minFre
 }
 
 func (worker *plainUringWorker) closeConnection(conn *plainWorkerConn) error {
-	if conn.fd < 0 {
+	if conn.fd < 0 || conn.state == plainConnStateClosing {
 		return nil
 	}
 	conn.state = plainConnStateClosing
@@ -834,7 +840,7 @@ func (worker *plainUringWorker) parkUntilWork() error {
 				}
 				return err
 			}
-			if err := worker.handleCompletion(nil, cqe, time.Now().UnixNano()); err != nil {
+			if err := worker.handleCompletion(nil, cqe, MonotonicNanotime()); err != nil {
 				if errors.Is(err, errPlainWorkerPark) {
 					break
 				}
@@ -853,7 +859,7 @@ func (worker *plainUringWorker) parkUntilWork() error {
 		}
 		_, err := syscall.Read(worker.wakeupReadFD, buffer[:])
 		if err == nil {
-			now := time.Now().UnixNano()
+			now := MonotonicNanotime()
 			if err := worker.drainHandoffs(now); err != nil {
 				return err
 			}

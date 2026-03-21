@@ -487,10 +487,15 @@ func findX25519KeyShare(ch *ParsedClientHello, data []byte) []byte {
 	return nil
 }
 
-func NegotiateALPN(clientProtos []string) string {
-	for _, p := range clientProtos {
-		if p == "h2" {
-			return "h2"
+// NegotiateALPN picks the best supported application protocol from the
+// client's ALPN list. When allowH2 is false, "h2" is skipped and only
+// HTTP/1.1 may be selected.
+func NegotiateALPN(clientProtos []string, allowH2 bool) string {
+	if allowH2 {
+		for _, p := range clientProtos {
+			if p == "h2" {
+				return "h2"
+			}
 		}
 	}
 	for _, p := range clientProtos {

@@ -165,7 +165,7 @@ func (ring *ioUring) prepAcceptMultishotUser(fd int, userData uint64, flags uint
 	}
 	sqe.Opcode = ioUringOpAccept
 	sqe.FD = int32(fd)
-	// The multishot accept bit lives in sqe.ioprio; accept flags stay in OpFlags.
+
 	sqe.Ioprio = ioUringAcceptMultishot
 	sqe.OpFlags = flags
 	sqe.UserData = userData
@@ -186,7 +186,7 @@ func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64,
 	sqe.FD = int32(fd)
 	sqe.Len = 0
 	sqe.UserData = userData
-	// buf_group shares storage with buf_index in the UAPI union.
+
 	sqe.BufIndex = bgid
 	return nil
 }

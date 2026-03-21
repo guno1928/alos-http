@@ -8,8 +8,6 @@ import (
 	"time"
 )
 
-// LoadBalancerType selects the algorithm the proxy uses to distribute requests
-// across backends for a domain.
 type LoadBalancerType uint8
 
 const (
@@ -95,7 +93,6 @@ type ProxyError struct {
 	Err        error
 }
 
-// ProxyErrorFunc is the callback signature for proxy error events.
 type ProxyErrorFunc func(ProxyError)
 
 // ProxyRequest is passed to the OnRequest callback before the request is
@@ -131,8 +128,6 @@ type ProxyRequest struct {
 	Host       string
 }
 
-// ProxyInterceptFunc is the callback signature for request interception.
-// Return true to allow the request, false to reject with 502.
 type ProxyInterceptFunc func(pr *ProxyRequest) bool
 
 // ProxyResponse is passed to the OnResponse callback after the backend replies
@@ -171,9 +166,6 @@ type ProxyResponse struct {
 	cacheCompressMin int
 }
 
-// CacheOption is a functional option that tweaks caching behavior when passed
-// to ProxyResponse.CacheThis. Use WithPreCompress and WithCompressMinLen to
-// control whether a gzip copy is stored alongside the original.
 type CacheOption func(*cacheOpts)
 
 type cacheOpts struct {
@@ -241,7 +233,6 @@ func (pr *ProxyResponse) DontCache() {
 	pr.cacheTTL = 0
 }
 
-// ProxyResponseFunc is the callback signature for response interception.
 type ProxyResponseFunc func(pr *ProxyResponse)
 
 // DomainConfig holds the full configuration for a proxied domain, including its

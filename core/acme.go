@@ -55,8 +55,9 @@ type acmeIntegration struct {
 
 	challengeDir string
 
-	domains  []string
-	domainMu sync.Mutex
+	domains     []string
+	domainMu    sync.Mutex
+	initialOnce sync.Once
 
 	challenges sync.Map
 
@@ -303,7 +304,7 @@ func (ai *acmeIntegration) Stop() {
 }
 
 func (ai *acmeIntegration) runLoop() {
-	ai.initialObtainAll()
+	ai.primeInitial()
 
 	ticker := time.NewTicker(acmeRenewCheckEvery)
 	defer ticker.Stop()
@@ -317,6 +318,26 @@ func (ai *acmeIntegration) runLoop() {
 			ai.renewAll()
 		}
 	}
+}
+
+func (ai *acmeIntegration) primeInitial() {
+	if ai == nil {
+		return
+	}
+	ai.initialOnce.Do(func() {
+		ai.initialObtainAll()
+	})
+}
+
+func (ai *acmeIntegration) domainsSnapshot() []string {
+	if ai == nil {
+		return nil
+	}
+	ai.domainMu.Lock()
+	defer ai.domainMu.Unlock()
+	out := make([]string, len(ai.domains))
+	copy(out, ai.domains)
+	return out
 }
 
 func (ai *acmeIntegration) initialObtainAll() {
@@ -365,6 +386,9 @@ func (ai *acmeIntegration) tryLoadCached(domain string) bool {
 	}
 
 	ai.server.certStore.AddCert(entry)
+	if ai.server.config.DefaultDomain != "" {
+		ai.server.certStore.SetDefault(ai.server.config.DefaultDomain)
+	}
 	ai.server.rebuildFallbackTLSConfig()
 	daysLeft := int(time.Until(leaf.NotAfter).Hours() / 24)
 	acmePrintf("[ACME] loaded cached cert for %s (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
@@ -544,6 +568,9 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		return err
 	}
 	ai.server.certStore.AddCert(entry)
+	if ai.server.config.DefaultDomain != "" {
+		ai.server.certStore.SetDefault(ai.server.config.DefaultDomain)
+	}
 	ai.server.rebuildFallbackTLSConfig()
 
 	liveDir := filepath.Join(ai.cacheDir, "live", domain)

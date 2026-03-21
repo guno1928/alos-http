@@ -126,6 +126,9 @@ func (s *Server) startHTTPRedirect() {
 	}
 	if addr == "" {
 		addr = defaultHTTPAddr(s.config.Addr)
+		if addr == "-" || addr == "off" || addr == "disable" {
+			return
+		}
 	}
 
 	numListeners := s.config.Listeners

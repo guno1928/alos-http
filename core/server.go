@@ -36,10 +36,12 @@ var timeNow = time.Now
 //
 // Fields:
 //   - Addr: listen address (":443", ":8443", "0.0.0.0:443", etc.)
-//   - HTTPAddr: listen address for the HTTP→HTTPS redirect listener. Defaults
+//   - HTTPAddr: listen address for the HTTP-to-HTTPS redirect listener. Defaults
 //     to ":80" when Addr uses port 443, otherwise disabled.
 //   - PlainHTTP: when true the server speaks plain HTTP/1.1 on Addr, skipping
 //     TLS entirely.
+//   - DisableHTTP2: when true the server never negotiates HTTP/2 and only
+//     serves HTTP/1.1 over TLS.
 //   - IdleTimeout: how long an idle keep-alive connection stays open.
 //   - HandshakeTimeout: deadline for the TLS handshake.
 //   - MaxBodySize: reject request bodies larger than this (0 = unlimited).
@@ -88,6 +90,7 @@ type Config struct {
 	LogRequests     bool
 	ShutdownTimeout time.Duration
 	PlainHTTP       bool
+	DisableHTTP2    bool
 }
 
 // DefaultConfig returns a Config with sensible defaults. It listens on
@@ -123,8 +126,9 @@ func DefaultConfig() Config {
 //	s.Router.GET("/", handler)
 //	log.Fatal(s.ListenAndServeTLS())
 //
-// The Server manages its own TLS 1.3 implementation, HTTP/2 multiplexing,
-// connection pooling, reverse proxy, CORS, rate limiting, and ACME.
+// The Server manages its own TLS 1.3 implementation, optional HTTP/2
+// multiplexing, connection pooling, reverse proxy, CORS, rate limiting,
+// and ACME.
 // All public methods are safe for concurrent use.
 type Server struct {
 	debug       atomic.Bool
@@ -250,6 +254,21 @@ func (s *Server) ensureTLSRuntime() {
 	})
 }
 
+func (s *Server) http2Enabled() bool {
+	return !s.config.DisableHTTP2
+}
+
+func (s *Server) tlsNextProtos() []string {
+	if s.http2Enabled() {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
+}
+
+func (s *Server) negotiateALPN(clientProtos []string) string {
+	return NegotiateALPN(clientProtos, s.http2Enabled())
+}
+
 func (s *Server) SetDebug(on bool) {
 	s.debug.Store(on)
 	SetDebugFlag(on)
@@ -271,8 +290,9 @@ func (s *Server) IsDebug() bool {
 
 // ListenAndServeTLS starts the HTTPS server with ALOS's built-in TLS 1.3
 // stack. It loads certificates (self-signed, manual PEM, or ACME),
-// opens the configured number of SO_REUSEPORT listeners, starts the
-// HTTP→HTTPS redirect listener, and blocks until Shutdown is called
+// opens the configured number of SO_REUSEPORT listeners, optionally
+// advertises HTTP/2 depending on Config.DisableHTTP2, starts the
+// HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called
 // or an unrecoverable error occurs.
 //
 //	log.Fatal(s.ListenAndServeTLS())
@@ -285,6 +305,7 @@ func (s *Server) ListenAndServeTLS() error {
 	s.rebuildFallbackTLSConfig()
 
 	s.startHTTPRedirect()
+	s.primeTLSCertificates()
 
 	if s.acme != nil {
 		s.acme.Start()
@@ -310,7 +331,11 @@ func (s *Server) ListenAndServeTLS() error {
 		}
 	}()
 
-	log.Println("=== ALOS TLS Server (TLS 1.3/1.2/1.1 | HTTP/1.1 + HTTP/2) ===")
+	protocols := "HTTP/1.1 + HTTP/2"
+	if !s.http2Enabled() {
+		protocols = "HTTP/1.1"
+	}
+	log.Printf("=== ALOS TLS Server (TLS 1.3/1.2/1.1 | %s) ===", protocols)
 	log.Printf("Listening on https://%s (%d listener(s))", s.config.Addr, len(listeners))
 	certs := s.certStore.ListCerts()
 	for _, ci := range certs {
@@ -322,6 +347,9 @@ func (s *Server) ListenAndServeTLS() error {
 			label = "acme"
 		}
 		log.Printf("  cert: %s (%s)", ci.Domain, label)
+	}
+	if len(certs) == 0 {
+		log.Printf("[WARN] no TLS certificates are loaded; incoming HTTPS handshakes will fail until a certificate becomes available")
 	}
 
 	errCh := make(chan error, len(listeners))
@@ -502,9 +530,6 @@ func (s *Server) loadCerts() error {
 				acmeDomains = append(acmeDomains, cc.Domain)
 			}
 		}
-		if s.config.DefaultDomain != "" {
-			s.certStore.SetDefault(s.config.DefaultDomain)
-		}
 	}
 
 	if s.config.ACME != nil {
@@ -532,6 +557,9 @@ func (s *Server) loadCerts() error {
 	}
 
 	if len(s.config.Certs) > 0 || s.acme != nil {
+		if s.config.DefaultDomain != "" {
+			s.certStore.SetDefault(s.config.DefaultDomain)
+		}
 		return nil
 	}
 
@@ -543,11 +571,35 @@ func (s *Server) loadCerts() error {
 	return nil
 }
 
+func (s *Server) primeTLSCertificates() {
+	if s.acme == nil {
+		return
+	}
+	before := len(s.certStore.ListCerts())
+	if before == 0 {
+		log.Printf("[ACME] priming initial TLS certificates before opening HTTPS listeners")
+	}
+	s.acme.primeInitial()
+	after := len(s.certStore.ListCerts())
+	if after == 0 {
+		domains := s.acme.domainsSnapshot()
+		if len(domains) == 0 {
+			log.Printf("[WARN] ACME is enabled but no TLS certificates are loaded yet")
+			return
+		}
+		log.Printf("[WARN] ACME has no usable certificate yet for %v; HTTPS handshakes will fail until one is obtained or loaded from cache", domains)
+		return
+	}
+	if before == 0 {
+		log.Printf("[ACME] %d certificate(s) ready for HTTPS startup", after)
+	}
+}
+
 func (s *Server) rebuildFallbackTLSConfig() {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		MaxVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
+		NextProtos: s.tlsNextProtos(),
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			entry := s.certStore.Lookup(hello.ServerName)
 			if entry != nil {
@@ -690,7 +742,7 @@ func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello
 	}
 	Dbg("[%s] selected suite: 0x%04x", addr, cs.ID)
 
-	selectedALPN := NegotiateALPN(ch.ALPNProtos)
+	selectedALPN := s.negotiateALPN(ch.ALPNProtos)
 	Dbg("[%s] ALPN: %q", addr, selectedALPN)
 
 	transcript := cs.HashFn()
@@ -1069,7 +1121,7 @@ func (s *Server) computePlainRootFastResponse(fast bool) {
 
 func (s *Server) computeH2RootFastResponse(fast bool) {
 	s.h2RootFast = h2RootFastResponse{}
-	if !fast || len(s.Router.globalMiddleware) != 0 {
+	if !fast || !s.http2Enabled() || len(s.Router.globalMiddleware) != 0 {
 		return
 	}
 	handler := s.lookupStaticHandler(methodGET, "/")
