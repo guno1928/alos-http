@@ -36,6 +36,7 @@ var (
 	ErrProxyNoBackend         = &staticError{"proxy: no healthy backend"}
 	ErrProxyTimeout           = &staticError{"proxy: upstream timeout"}
 	ErrProxyConnFailed        = &staticError{"proxy: connection failed"}
+	ErrIOUringRequired        = &staticError{"io_uring worker backend required"}
 	ErrInternal               = &staticError{"internal error"}
 	ErrRateLimit              = &staticError{"rate limit exceeded"}
 	ErrTooManyHeaders         = &staticError{"too many headers"}

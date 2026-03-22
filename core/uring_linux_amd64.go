@@ -18,44 +18,60 @@ import (
 )
 
 const (
-	ioUringOffSqRing         = 0
-	ioUringOffCqRing         = 0x08000000
-	ioUringOffSqes           = 0x10000000
-	ioUringEnterGetEvents    = 1
-	ioUringRegisterSyscall   = 427
-	ioUringOpReadv           = 1
-	ioUringOpAccept          = 13
-	ioUringOpClose           = 19
-	ioUringOpRecv            = 27
-	ioUringOpSend            = 26
-	ioUringFeatSingleMmap    = 1
-	ioUringSetupSyscall      = 425
-	ioUringEnterSyscall      = 426
-	ioUringSetupRDisabled    = 1 << 6
-	ioUringSetupSubmitAll    = 1 << 7
-	ioUringSetupCoopTaskrun  = 1 << 8
-	ioUringSetupTaskrunFlag  = 1 << 9
-	ioUringSetupSingleIssuer = 1 << 12
-	ioUringSetupDeferTaskrun = 1 << 13
-	ioUringEntries           = 256
-	ioUringConnEntries       = 32
-	ioUringPollFirst         = 1 << 0
-	ioUringRecvMultishot     = 1 << 1
-	ioUringAcceptMultishot   = 1 << 0
-	ioUringSqeFixedFile      = 1 << 0
-	ioUringSqeBufferSelect   = 1 << 5
-	ioUringSqTaskrun         = 1 << 2
-	ioUringCqeBuffer         = 1 << 0
-	ioUringCqeMore           = 1 << 1
-	ioUringCqeSockNonEmpty   = 1 << 2
-	ioUringCqeBufferShift    = 16
-	ioUringRegisterEnable    = 12
-	ioUringRegisterPbufRing  = 22
-	sockCloexec              = 0x80000
-	sockNonblock             = 0x800
-	ioUringConnsPerShard     = 600
-	ioUringAcceptDepth       = 16
-	ioUringConnSlotsPerLN    = 2048
+	ioUringOffSqRing                 = 0
+	ioUringOffCqRing                 = 0x08000000
+	ioUringOffSqes                   = 0x10000000
+	ioUringEnterGetEvents            = 1
+	ioUringEnterRegistered           = 1 << 4
+	ioUringRegisterSyscall           = 427
+	ioUringOpReadv                   = 1
+	ioUringOpAccept                  = 13
+	ioUringOpAsyncCancel             = 14
+	ioUringOpClose                   = 19
+	ioUringOpRecv                    = 27
+	ioUringOpSend                    = 26
+	ioUringOpSendZC                  = 47
+	ioUringFeatSingleMmap            = 1
+	ioUringFeatRegRegRing            = 1 << 13
+	ioUringFeatRecvSendBundle        = 1 << 14
+	ioUringSetupSyscall              = 425
+	ioUringEnterSyscall              = 426
+	ioUringSetupRDisabled            = 1 << 6
+	ioUringSetupSubmitAll            = 1 << 7
+	ioUringSetupCoopTaskrun          = 1 << 8
+	ioUringSetupTaskrunFlag          = 1 << 9
+	ioUringSetupSingleIssuer         = 1 << 12
+	ioUringSetupDeferTaskrun         = 1 << 13
+	ioUringEntries                   = 256
+	ioUringConnEntries               = 32
+	ioUringPollFirst                 = 1 << 0
+	ioUringRecvMultishot             = 1 << 1
+	ioUringAcceptMultishot           = 1 << 0
+	ioUringSqeFixedFile              = 1 << 0
+	ioUringSqeBufferSelect           = 1 << 5
+	ioUringSqTaskrun                 = 1 << 2
+	ioUringCqeBuffer                 = 1 << 0
+	ioUringCqeMore                   = 1 << 1
+	ioUringCqeSockNonEmpty           = 1 << 2
+	ioUringCqeNotif                  = 1 << 3
+	ioUringCqeBufferShift            = 16
+	ioUringRegisterEnable            = 12
+	ioUringRegisterUseRegisteredRing = 1 << 31
+	ioUringRegisterRingFDs           = 20
+	ioUringUnregisterRingFDs         = 21
+	ioUringRegisterPbufRing          = 22
+	ioUringRegisterSyncCancel        = 24
+	ioUringAsyncCancelAll            = 1 << 0
+	ioUringAsyncCancelFD             = 1 << 1
+	ioUringAsyncCancelOp             = 1 << 5
+	ioUringRecvSendBundle            = 1 << 4
+	ioUringSendZCReportUsage         = 1 << 3
+	sockCloexec                      = 0x80000
+	sockNonblock                     = 0x800
+	ioUringConnsPerShard             = 600
+	ioUringAcceptDepth               = 16
+	ioUringConnSlotsPerLN            = 2048
+	ioUringSendZCThreshold           = 32 << 10
 )
 
 type ioUringSqringOffsets struct {
@@ -118,28 +134,54 @@ type ioUringCqe struct {
 	Flags    uint32
 }
 
+type ioUringRsrcUpdate struct {
+	Offset uint32
+	Resv   uint32
+	Data   uint64
+}
+
+type ioUringKernelTimespec struct {
+	Sec  int64
+	Nsec int64
+}
+
+type ioUringSyncCancelReg struct {
+	Addr    uint64
+	FD      int32
+	Flags   uint32
+	Timeout ioUringKernelTimespec
+	Opcode  uint8
+	Pad     [7]uint8
+	Pad2    [3]uint64
+}
+
 type ioUring struct {
-	fd int
+	fd      int
+	enterFD int
 
 	sqRing []byte
 	cqRing []byte
 	sqes   []ioUringSqe
 	cqes   []ioUringCqe
 
-	sqHead      *uint32
-	sqTail      *uint32
-	sqMask      *uint32
-	sqEntries   *uint32
-	sqFlags     *uint32
-	sqArray     []uint32
-	cqHead      *uint32
-	cqTail      *uint32
-	cqMask      *uint32
-	localSqTail uint32
-	submitted   uint32
-	flags       uint32
-	features    uint32
-	disabled    bool
+	sqHead          *uint32
+	sqTail          *uint32
+	sqMask          *uint32
+	sqEntries       *uint32
+	sqFlags         *uint32
+	sqArray         []uint32
+	cqHead          *uint32
+	cqTail          *uint32
+	cqMask          *uint32
+	localSqTail     uint32
+	submitted       uint32
+	flags           uint32
+	features        uint32
+	disabled        bool
+	registeredRing  bool
+	regRegRing      bool
+	sendZCState     uint8
+	syncCancelState uint8
 }
 
 type ioUringAcceptor struct {
@@ -181,58 +223,40 @@ type syscallConnListener interface {
 	SyscallConn() (syscall.RawConn, error)
 }
 
-func (s *Server) tryServeWithIOUring(listeners []net.Listener, plain bool) (bool, error) {
+func (s *Server) tryServeWithIOUringRedirect(listeners []net.Listener) error {
 	slotPool := make(chan struct{}, ioUringTotalConnSlots(s.config.Listeners, len(listeners)))
 	acceptors := make([]*ioUringAcceptor, 0, len(listeners))
-
 	for _, listener := range listeners {
 		acceptor, err := newIOUringAcceptor(listener, slotPool)
 		if err != nil {
-			for _, acceptor := range acceptors {
-				acceptor.close()
+			for _, item := range acceptors {
+				item.close()
 			}
-			log.Printf("[INFO] io_uring accept mode unavailable, falling back to standard listener path: %v", err)
-			return false, nil
+			return err
 		}
 		acceptors = append(acceptors, acceptor)
 	}
-
-	mode := "TLS/HTTP/2"
-	if plain {
-		mode = "plain HTTP/1.1"
-	}
-	log.Printf("[INFO] io_uring accept mode active on Linux amd64 for %s", mode)
-	shards, acceptShards := ioUringShardLayout()
-	log.Printf("[INFO] io_uring shard layout: shards=%d accept-shards=%d listeners=%d accept-depth=%d conn-slots-per-listener=%d total-conn-cap=%d", shards, acceptShards, len(acceptors), ioUringAcceptDepth, ioUringConnSlotsPerLN, cap(slotPool))
-
 	errCh := make(chan error, len(acceptors))
-	var wg sync.WaitGroup
 	for _, acceptor := range acceptors {
-		wg.Add(1)
-		go func(acceptor *ioUringAcceptor) {
-			defer wg.Done()
-			s.ioUringAcceptLoop(acceptor, plain, errCh)
-		}(acceptor)
+		acceptor := acceptor
+		go s.ioUringRedirectAcceptLoop(acceptor, errCh)
 	}
-
-	waitAndClose := func() {
-		wg.Wait()
-		for _, acceptor := range acceptors {
-			acceptor.close()
+	go func() {
+		select {
+		case <-s.done:
+			for _, ln := range listeners {
+				_ = ln.Close()
+			}
+		case err := <-errCh:
+			if err != nil {
+				log.Printf("[HTTP] redirect io_uring listener failed: %v", err)
+			}
+			for _, ln := range listeners {
+				_ = ln.Close()
+			}
 		}
-	}
-
-	select {
-	case <-s.done:
-		waitAndClose()
-		return true, nil
-	case err := <-errCh:
-		for _, ln := range listeners {
-			_ = ln.Close()
-		}
-		waitAndClose()
-		return true, err
-	}
+	}()
+	return nil
 }
 
 func ioUringListenerCount(configured int) int {
@@ -316,13 +340,16 @@ func newIOUringAcceptor(listener net.Listener, slots chan struct{}) (*ioUringAcc
 		slots:    slots,
 	}, nil
 }
-
-func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh chan<- error) {
+func (s *Server) ioUringRedirectAcceptLoop(acceptor *ioUringAcceptor, errCh chan<- error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer acceptor.releaseInflight()
+	defer acceptor.close()
 	if err := acceptor.ring.enable(); err != nil {
-		errCh <- err
+		select {
+		case errCh <- err:
+		default:
+		}
 		return
 	}
 	var completions [64]ioUringCqe
@@ -334,7 +361,7 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 			if err := acceptor.ring.prepAccept(acceptor.fd, uint32(sockCloexec|sockNonblock)); err != nil {
 				acceptor.releaseSlot()
 				select {
-				case errCh <- fmt.Errorf("io_uring prepAccept listener_fd=%d inflight=%d: %w", acceptor.fd, acceptor.inflight, err):
+				case errCh <- fmt.Errorf("io_uring redirect prepAccept listener_fd=%d: %w", acceptor.fd, err):
 				default:
 				}
 				return
@@ -345,7 +372,7 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 			if err := acceptor.ring.prepAccept(acceptor.fd, uint32(sockCloexec|sockNonblock)); err != nil {
 				acceptor.releaseSlot()
 				select {
-				case errCh <- fmt.Errorf("io_uring refill prepAccept listener_fd=%d inflight=%d: %w", acceptor.fd, acceptor.inflight, err):
+				case errCh <- fmt.Errorf("io_uring redirect refill listener_fd=%d: %w", acceptor.fd, err):
 				default:
 				}
 				return
@@ -357,12 +384,11 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 				return
 			}
 			select {
-			case errCh <- fmt.Errorf("io_uring accept submit listener_fd=%d inflight=%d: %w", acceptor.fd, acceptor.inflight, err):
+			case errCh <- fmt.Errorf("io_uring redirect submit listener_fd=%d: %w", acceptor.fd, err):
 			default:
 			}
 			return
 		}
-
 		count := acceptor.ring.peekBatch(completions[:])
 		if count == 0 {
 			cqe, err := acceptor.ring.waitCqe()
@@ -371,7 +397,7 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 					return
 				}
 				select {
-				case errCh <- fmt.Errorf("io_uring accept wait listener_fd=%d inflight=%d: %w", acceptor.fd, acceptor.inflight, err):
+				case errCh <- fmt.Errorf("io_uring redirect wait listener_fd=%d: %w", acceptor.fd, err):
 				default:
 				}
 				return
@@ -379,7 +405,6 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 			completions[0] = cqe
 			count = 1
 		}
-
 		for i := 0; i < count; i++ {
 			if acceptor.inflight > 0 {
 				acceptor.inflight--
@@ -395,17 +420,16 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 					continue
 				}
 				select {
-				case errCh <- fmt.Errorf("io_uring accept cqe listener_fd=%d inflight=%d: %w", acceptor.fd, acceptor.inflight, err):
+				case errCh <- fmt.Errorf("io_uring redirect cqe listener_fd=%d: %w", acceptor.fd, err):
 				default:
 				}
 				return
 			}
-
 			fd := int(cqe.Res)
 			conn, err := newIOUringConn(fd)
 			if err != nil {
 				acceptor.releaseSlot()
-				log.Printf("[WARN] io_uring accepted fd conversion failed: %v", err)
+				log.Printf("[HTTP] redirect accepted fd conversion failed: %v", err)
 				continue
 			}
 			if uringConn, ok := conn.(*ioUringConn); ok {
@@ -413,13 +437,7 @@ func (s *Server) ioUringAcceptLoop(acceptor *ioUringAcceptor, plain bool, errCh 
 			} else {
 				acceptor.releaseSlot()
 			}
-
-			s.activeConns.Add(1)
-			if plain {
-				go s.servePlainConn(conn)
-			} else {
-				go s.serveTLSConn(conn)
-			}
+			go s.serveHTTPRedirectConn(conn)
 		}
 	}
 }
@@ -488,7 +506,7 @@ func isIOUringTransient(err error) bool {
 }
 
 func newIOUringConn(fd int) (net.Conn, error) {
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	prepareAcceptedFD(fd)
 	localAddr, remoteAddr := socketAddrs(fd)
 	readRing, err := newIOUring(ioUringConnEntries)
 	if err != nil {
@@ -728,11 +746,20 @@ func newIOUring(entries uint32) (*ioUring, error) {
 }
 
 func newOwnedIOUring(entries uint32) (*ioUring, error) {
-	return newIOUringWithFlagFallback(entries,
-		ioUringSetupCoopTaskrun|ioUringSetupTaskrunFlag|ioUringSetupSubmitAll,
+	ring, err := newIOUringWithFlagFallback(entries,
+		ioUringSetupSingleIssuer|ioUringSetupDeferTaskrun|ioUringSetupCoopTaskrun|ioUringSetupTaskrunFlag|ioUringSetupSubmitAll,
+		ioUringSetupSingleIssuer|ioUringSetupCoopTaskrun|ioUringSetupTaskrunFlag|ioUringSetupSubmitAll,
 		ioUringSetupCoopTaskrun|ioUringSetupTaskrunFlag|ioUringSetupSubmitAll,
 		ioUringSetupCoopTaskrun|ioUringSetupSubmitAll,
 	)
+	if err != nil {
+		return nil, err
+	}
+	if err := ring.registerRingFD(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOSYS) && !errors.Is(err, syscall.EOPNOTSUPP) && !errors.Is(err, syscall.EEXIST) {
+		ring.close()
+		return nil, err
+	}
+	return ring, nil
 }
 
 func newIOUringWithFlagFallback(entries uint32, flagCandidates ...uint32) (*ioUring, error) {
@@ -814,7 +841,7 @@ func newIOUringConfigured(entries uint32, flags uint32) (*ioUring, error) {
 		return nil, err
 	}
 
-	ring := &ioUring{fd: int(fd), sqRing: sqRing, cqRing: cqRing}
+	ring := &ioUring{fd: int(fd), enterFD: int(fd), sqRing: sqRing, cqRing: cqRing}
 	ring.sqHead = byteOffsetPtr[uint32](sqRing, params.SqOff.Head)
 	ring.sqTail = byteOffsetPtr[uint32](sqRing, params.SqOff.Tail)
 	ring.sqMask = byteOffsetPtr[uint32](sqRing, params.SqOff.RingMask)
@@ -831,12 +858,16 @@ func newIOUringConfigured(entries uint32, flags uint32) (*ioUring, error) {
 	ring.flags = params.Flags
 	ring.features = params.Features
 	ring.disabled = params.Flags&ioUringSetupRDisabled != 0
+	ring.regRegRing = params.Features&ioUringFeatRegRegRing != 0
 	return ring, nil
 }
 
 func (ring *ioUring) close() {
 	if ring == nil {
 		return
+	}
+	if ring.registeredRing {
+		_ = ring.unregisterRingFD()
 	}
 	if len(ring.sqes) > 0 {
 		sqeBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(ring.sqes))), len(ring.sqes)*int(unsafe.Sizeof(ioUringSqe{})))
@@ -950,13 +981,28 @@ func (ring *ioUring) prepSend(fd int, buf []byte) error {
 }
 
 func (ring *ioUring) prepSendWithFlags(fd int, buf []byte, pollFirst bool) error {
+	return ring.prepSendWithFlagsAndMode(fd, buf, pollFirst, false)
+}
+
+func (ring *ioUring) prepSendZCWithFlags(fd int, buf []byte, pollFirst bool) error {
+	return ring.prepSendWithFlagsAndMode(fd, buf, pollFirst, true)
+}
+
+func (ring *ioUring) prepSendWithFlagsAndMode(fd int, buf []byte, pollFirst bool, zeroCopy bool) error {
 	sqe, err := ring.getSqe()
 	if err != nil {
 		return err
 	}
-	sqe.Opcode = ioUringOpSend
+	if zeroCopy {
+		sqe.Opcode = ioUringOpSendZC
+	} else {
+		sqe.Opcode = ioUringOpSend
+	}
 	if pollFirst {
 		sqe.Ioprio = ioUringPollFirst
+	}
+	if zeroCopy {
+		sqe.Ioprio |= ioUringSendZCReportUsage
 	}
 	sqe.FD = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
@@ -965,14 +1011,24 @@ func (ring *ioUring) prepSendWithFlags(fd int, buf []byte, pollFirst bool) error
 }
 
 func (ring *ioUring) register(op uint32, arg uintptr, nrArgs uint32) error {
+	_, err := ring.registerResult(op, arg, nrArgs)
+	return err
+}
+
+func (ring *ioUring) registerResult(op uint32, arg uintptr, nrArgs uint32) (int, error) {
 	if ring == nil || ring.fd < 0 {
-		return syscall.EBADF
+		return 0, syscall.EBADF
 	}
-	_, _, errno := syscall.Syscall6(ioUringRegisterSyscall, uintptr(ring.fd), uintptr(op), arg, uintptr(nrArgs), 0, 0)
+	fd := ring.fd
+	if ring.registeredRing && ring.regRegRing && ring.enterFD >= 0 {
+		op |= ioUringRegisterUseRegisteredRing
+		fd = ring.enterFD
+	}
+	ret, _, errno := syscall.Syscall6(ioUringRegisterSyscall, uintptr(fd), uintptr(op), arg, uintptr(nrArgs), 0, 0)
 	if errno != 0 {
-		return errno
+		return 0, errno
 	}
-	return nil
+	return int(ret), nil
 }
 
 func (ring *ioUring) enable() error {
@@ -1020,10 +1076,18 @@ func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
 			atomic.StoreUint32(ring.sqTail, ring.localSqTail)
 		}
 		flags := uintptr(0)
+		fd := ring.fd
+		if ring.registeredRing && ring.enterFD >= 0 {
+			fd = ring.enterFD
+			flags |= ioUringEnterRegistered
+		}
 		if minComplete != 0 {
 			flags = ioUringEnterGetEvents
+			if ring.registeredRing && ring.enterFD >= 0 {
+				flags |= ioUringEnterRegistered
+			}
 		}
-		submitted, _, errno := syscall.Syscall6(ioUringEnterSyscall, uintptr(ring.fd), uintptr(toSubmit), uintptr(minComplete), flags, 0, 0)
+		submitted, _, errno := syscall.Syscall6(ioUringEnterSyscall, uintptr(fd), uintptr(toSubmit), uintptr(minComplete), flags, 0, 0)
 		if errno == syscall.EINTR {
 			continue
 		}
@@ -1033,6 +1097,105 @@ func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
 		ring.submitted += uint32(submitted)
 		return uint32(submitted), nil
 	}
+}
+
+func (ring *ioUring) registerRingFD() error {
+	if ring == nil || ring.fd < 0 || ring.registeredRing {
+		return nil
+	}
+	update := ioUringRsrcUpdate{
+		Offset: ^uint32(0),
+		Data:   uint64(ring.fd),
+	}
+	ret, err := ring.registerResult(ioUringRegisterRingFDs, uintptr(unsafe.Pointer(&update)), 1)
+	if err != nil {
+		return err
+	}
+	if ret == 1 {
+		ring.enterFD = int(update.Offset)
+		ring.registeredRing = true
+	}
+	return nil
+}
+
+func (ring *ioUring) unregisterRingFD() error {
+	if ring == nil || !ring.registeredRing {
+		return nil
+	}
+	update := ioUringRsrcUpdate{Offset: uint32(ring.enterFD)}
+	ret, err := ring.registerResult(ioUringUnregisterRingFDs, uintptr(unsafe.Pointer(&update)), 1)
+	if err != nil {
+		return err
+	}
+	if ret == 1 {
+		ring.registeredRing = false
+		ring.enterFD = ring.fd
+	}
+	return nil
+}
+
+func (ring *ioUring) supportsRecvSendBundle() bool {
+	return ring != nil && ring.features&ioUringFeatRecvSendBundle != 0
+}
+
+func (ring *ioUring) canUseSendZC() bool {
+	if ring == nil {
+		return false
+	}
+	if ring.sendZCState == 0 {
+		probe := getIOUringStartupProbe()
+		if probe.sendZCOK {
+			ring.sendZCState = 1
+		} else {
+			ring.sendZCState = 2
+		}
+	}
+	return ring.sendZCState == 1
+}
+
+func (ring *ioUring) markSendZCSupported() {
+	if ring != nil {
+		ring.sendZCState = 1
+	}
+}
+
+func (ring *ioUring) markSendZCUnsupported() {
+	if ring != nil {
+		ring.sendZCState = 2
+	}
+}
+
+func (ring *ioUring) cancelFD(fd int, opcode uint8) error {
+	if ring == nil || ring.fd < 0 || fd < 0 {
+		return nil
+	}
+	if ring.syncCancelState == 2 {
+		return nil
+	}
+	reg := ioUringSyncCancelReg{
+		FD:    int32(fd),
+		Flags: ioUringAsyncCancelFD | ioUringAsyncCancelAll,
+	}
+	if opcode != 0 {
+		reg.Flags |= ioUringAsyncCancelOp
+		reg.Opcode = opcode
+	}
+	_, err := ring.registerResult(ioUringRegisterSyncCancel, uintptr(unsafe.Pointer(&reg)), 1)
+	if err != nil {
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP) {
+			ring.syncCancelState = 2
+			return nil
+		}
+		if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ETIME) || errors.Is(err, syscall.EALREADY) {
+			ring.syncCancelState = 1
+			return nil
+		}
+		return err
+	}
+	if ring.syncCancelState == 0 {
+		ring.syncCancelState = 1
+	}
+	return nil
 }
 
 func (ring *ioUring) waitCqe() (ioUringCqe, error) {

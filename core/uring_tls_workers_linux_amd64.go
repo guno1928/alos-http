@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -65,6 +64,7 @@ type tlsWorkerConn struct {
 	generation uint16
 	state      uint8
 	phase      uint8
+	closeDone  bool
 
 	closeAfter    bool
 	requestCount  uint32
@@ -73,6 +73,8 @@ type tlsWorkerConn struct {
 	readPollFirst bool
 	writeN        int
 	writeSent     int
+	writeZeroCopy bool
+	zcPending     int
 	lastActive    int64
 	remoteAddr    string
 	selectedALPN  string
@@ -126,17 +128,6 @@ type tlsUringBackend struct {
 	dispatch atomic.Uint32
 	wg       sync.WaitGroup
 	errCh    chan error
-}
-
-func (s *Server) tryServeWithIOUringTLSWorkers(listeners []net.Listener) (bool, error) {
-	backend, err := newTLSUringBackend(s, listeners)
-	if err != nil {
-		return false, nil
-	}
-	defer backend.closeResources()
-	log.Printf("[INFO] io_uring TLS worker mode active on Linux amd64: workers=%d accept-shards=%d conns-per-shard=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringConnsPerShard)
-	backend.start()
-	return true, backend.wait()
 }
 
 func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, error) {
@@ -410,20 +401,23 @@ func (worker *tlsUringWorker) handleCompletion(backend *tlsUringBackend, cqe ioU
 	case tlsUringOpRead, tlsUringOpWrite, tlsUringOpClose:
 		if connIndex < 0 || connIndex >= len(worker.connections) {
 			if op == tlsUringOpRead {
-				worker.recycleReadBuffer(cqe.Flags)
+				worker.recycleReadBuffer(cqe.Flags, cqe.Res)
 			}
 			return nil
 		}
 		conn := &worker.connections[connIndex]
-		if conn.fd < 0 || conn.generation != generation {
+		if (conn.fd < 0 && !(op == tlsUringOpWrite && cqe.Flags&ioUringCqeNotif != 0)) || conn.generation != generation {
 			if op == tlsUringOpRead {
-				worker.recycleReadBuffer(cqe.Flags)
+				worker.recycleReadBuffer(cqe.Flags, cqe.Res)
 			}
 			return nil
 		}
 		if conn.state == tlsConnStateClosing && op != tlsUringOpClose {
+			if op == tlsUringOpWrite && cqe.Flags&ioUringCqeNotif != 0 {
+				return worker.handleWriteNotification(conn)
+			}
 			if op == tlsUringOpRead {
-				worker.recycleReadBuffer(cqe.Flags)
+				worker.recycleReadBuffer(cqe.Flags, cqe.Res)
 			}
 			return nil
 		}
@@ -431,7 +425,10 @@ func (worker *tlsUringWorker) handleCompletion(backend *tlsUringBackend, cqe ioU
 		case tlsUringOpRead:
 			return worker.handleRead(conn, cqe.Res, cqe.Flags, now)
 		case tlsUringOpWrite:
-			return worker.handleWrite(conn, cqe.Res, now)
+			if cqe.Flags&ioUringCqeNotif != 0 {
+				return worker.handleWriteNotification(conn)
+			}
+			return worker.handleWrite(conn, cqe.Res, cqe.Flags, now)
 		case tlsUringOpClose:
 			worker.finishClose(conn)
 		}
@@ -501,7 +498,7 @@ func (worker *tlsUringWorker) handleAccept(backend *tlsUringBackend, result int3
 	if worker.server.IsDebug() {
 		Dbg("tls worker %d accepted fd=%d multishot=%v", worker.id, fd, worker.useMultishotAccept)
 	}
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	prepareAcceptedFD(fd)
 	backend.dispatchAccepted(worker, fd, now)
 	return nil
 }
@@ -552,7 +549,7 @@ func (worker *tlsUringWorker) handleRead(conn *tlsWorkerConn, result int32, flag
 	return worker.processTLSConn(conn)
 }
 
-func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now int64) error {
+func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, flags uint32, now int64) error {
 	if conn.phase == tlsConnPhaseH2Bridge {
 		return worker.handleBridgeWrite(conn, result, now)
 	}
@@ -561,11 +558,21 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now
 			Dbg("[%s] worker write completion result=%d phase=%d state=%d sent=%d/%d", conn.remoteAddr, result, conn.phase, conn.state, conn.writeSent, conn.writeN)
 		}
 		err := syscall.Errno(-result)
+		if conn.writeZeroCopy && (errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP)) {
+			worker.ring.markSendZCUnsupported()
+			conn.writeZeroCopy = false
+			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
+			return worker.queueWrite(conn, remaining, true)
+		}
 		if isIOUringTransient(err) {
 			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-			return worker.ring.prepSendUserWithFlags(conn.fd, remaining, tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), true)
+			return worker.queueWrite(conn, remaining, true)
 		}
 		return worker.closeConnection(conn)
+	}
+	if conn.writeZeroCopy && flags&ioUringCqeMore != 0 {
+		conn.zcPending++
+		worker.ring.markSendZCSupported()
 	}
 	conn.lastActive = now
 	conn.writeSent += int(result)
@@ -574,7 +581,7 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now
 	}
 	if conn.writeSent < conn.writeN {
 		remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-		return worker.ring.prepSendUserWithFlags(conn.fd, remaining, tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), true)
+		return worker.queueWrite(conn, remaining, true)
 	}
 	conn.writeSent = 0
 	conn.writeN = 0
@@ -585,11 +592,24 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, now
 	return worker.processTLSConn(conn)
 }
 
+func (worker *tlsUringWorker) handleWriteNotification(conn *tlsWorkerConn) error {
+	if conn.zcPending > 0 {
+		conn.zcPending--
+	}
+	if conn.zcPending == 0 {
+		conn.writeZeroCopy = false
+		if conn.closeDone {
+			worker.releaseConnection(conn)
+		}
+	}
+	return nil
+}
+
 func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int32, flags uint32, now int64) error {
 	conn.readArmed = flags&ioUringCqeMore != 0
 	bufferID := cqeBufferID(flags)
 	buf := worker.recvBufs.buffer(bufferID)
-	defer worker.recvBufs.recycle(bufferID)
+	defer worker.recycleReadBuffer(flags, result)
 	if result < 0 {
 		if worker.server.IsDebug() {
 			Dbg("tls worker %d buffered read completion result=%d flags=0x%x", worker.id, result, flags)
@@ -627,7 +647,7 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 			return worker.closeConnection(conn)
 		}
 		bridge.mu.Lock()
-		bridge.inbound = append(bridge.inbound, buf[:n]...)
+		worker.appendBufferedRead(&bridge.inbound, bufferID, n)
 		bridge.mu.Unlock()
 		bridge.signalReadReady()
 		if !conn.readArmed {
@@ -642,7 +662,7 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 	if len(conn.readBuf) < conn.readN {
 		conn.readBuf = conn.readBuf[:conn.readN]
 	}
-	conn.readBuf = append(conn.readBuf, buf[:n]...)
+	worker.appendBufferedRead(&conn.readBuf, bufferID, n)
 	conn.readN = len(conn.readBuf)
 	if conn.state == tlsConnStateWriting {
 		return nil
@@ -650,7 +670,18 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 	return worker.processTLSConn(conn)
 }
 
-func (worker *tlsUringWorker) recycleReadBuffer(flags uint32) {
+func (worker *tlsUringWorker) appendBufferedRead(dst *[]byte, startID uint16, total int) {
+	if worker.recvBufs == nil || total <= 0 {
+		return
+	}
+	buf := worker.recvBufs.buffer(startID)
+	if total > len(buf) {
+		total = len(buf)
+	}
+	*dst = append(*dst, buf[:total]...)
+}
+
+func (worker *tlsUringWorker) recycleReadBuffer(flags uint32, result int32) {
 	if worker.recvBufs == nil || flags&ioUringCqeBuffer == 0 {
 		return
 	}
@@ -850,7 +881,8 @@ func (worker *tlsUringWorker) processClientHello(conn *tlsWorkerConn) (int, erro
 	conn.phase = tlsConnPhaseClientFinished
 	worker.compactCipherBuffer(conn, totalLen)
 	conn.state = tlsConnStateWriting
-	if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+	conn.writeZeroCopy = false
+	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend()); err != nil {
 		return tlsWorkerActionClose, nil
 	}
 	return tlsWorkerActionWrote, nil
@@ -986,7 +1018,8 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 				return tlsWorkerActionClose, nil
 			}
 			conn.state = tlsConnStateWriting
-			if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+			conn.writeZeroCopy = false
+			if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend()); err != nil {
 				return tlsWorkerActionClose, nil
 			}
 			return tlsWorkerActionWrote, nil
@@ -1063,12 +1096,13 @@ func (worker *tlsUringWorker) queueTLSResponse(conn *tlsWorkerConn, keepAlive bo
 	conn.writeBuf = buildTLSAppDataRecords(conn.writeBuf[:0], conn.appWriter, conn.plainBuf, &conn.innerScratch)
 	conn.writeN = len(conn.writeBuf)
 	conn.writeSent = 0
+	conn.writeZeroCopy = worker.shouldUseZeroCopySend(conn)
 	worker.compactAppBuffer(conn, consumed)
 	if conn.writeN == 0 {
 		return tlsWorkerActionClose, nil
 	}
 	conn.state = tlsConnStateWriting
-	if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend()); err != nil {
 		return tlsWorkerActionClose, nil
 	}
 	return tlsWorkerActionWrote, nil
@@ -1195,7 +1229,8 @@ func (worker *tlsUringWorker) processBridge(conn *tlsWorkerConn) error {
 	conn.writeN = len(conn.writeBuf)
 	conn.writeSent = 0
 	conn.state = tlsConnStateWriting
-	return worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend())
+	conn.writeZeroCopy = false
+	return worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend())
 }
 
 func (worker *tlsUringWorker) attachAccepted(fd int, now int64) error {
@@ -1220,8 +1255,11 @@ func (worker *tlsUringWorker) tryAttachAccepted(fd int, now int64) (bool, error)
 	conn.readPollFirst = false
 	conn.writeN = 0
 	conn.writeSent = 0
+	conn.writeZeroCopy = false
+	conn.zcPending = 0
 	conn.requestCount = 0
 	conn.closeAfter = false
+	conn.closeDone = false
 	conn.lastActive = now
 	conn.selectedALPN = ""
 	conn.expectedFinN = 0
@@ -1268,7 +1306,7 @@ func (worker *tlsUringWorker) queueRead(conn *tlsWorkerConn) error {
 	}
 	if worker.recvBufs != nil {
 		conn.readArmed = true
-		if err := worker.ring.prepRecvMultishotUser(conn.fd, worker.recvBufs.bgid, tlsEncodeUserData(tlsUringOpRead, int(conn.index), conn.generation), conn.readPollFirst); err != nil {
+		if err := worker.ring.prepRecvMultishotUser(conn.fd, worker.recvBufs.bgid, tlsEncodeUserData(tlsUringOpRead, int(conn.index), conn.generation), conn.readPollFirst, false); err != nil {
 			conn.readArmed = false
 			return err
 		}
@@ -1316,7 +1354,9 @@ func (worker *tlsUringWorker) closeConnection(conn *tlsWorkerConn) error {
 		return nil
 	}
 	conn.state = tlsConnStateClosing
+	conn.closeDone = false
 	conn.readArmed = false
+	_ = worker.ring.cancelFD(conn.fd, 0)
 	if err := worker.ring.prepCloseUser(conn.fd, tlsEncodeUserData(tlsUringOpClose, int(conn.index), conn.generation)); err != nil {
 		_ = syscall.Close(conn.fd)
 		worker.finishClose(conn)
@@ -1326,6 +1366,10 @@ func (worker *tlsUringWorker) closeConnection(conn *tlsWorkerConn) error {
 
 func (worker *tlsUringWorker) finishClose(conn *tlsWorkerConn) {
 	conn.fd = -1
+	conn.closeDone = true
+	if conn.zcPending > 0 {
+		return
+	}
 	worker.releaseConnection(conn)
 }
 
@@ -1351,6 +1395,9 @@ func (worker *tlsUringWorker) releaseConnection(conn *tlsWorkerConn) {
 	conn.remoteAddr = ""
 	conn.selectedALPN = ""
 	conn.expectedFinN = 0
+	conn.closeDone = false
+	conn.writeZeroCopy = false
+	conn.zcPending = 0
 	conn.hsReader = nil
 	conn.appReader = nil
 	conn.appWriter = nil
@@ -1367,6 +1414,18 @@ func (worker *tlsUringWorker) releaseConnection(conn *tlsWorkerConn) {
 	conn.plainBuf = conn.plainBuf[:0]
 	conn.writeBuf = conn.writeBuf[:0]
 	conn.innerScratch = conn.innerScratch[:0]
+}
+
+func (worker *tlsUringWorker) shouldUseZeroCopySend(conn *tlsWorkerConn) bool {
+	return conn.closeAfter && conn.writeN >= ioUringSendZCThreshold && worker.ring.canUseSendZC()
+}
+
+func (worker *tlsUringWorker) queueWrite(conn *tlsWorkerConn, buf []byte, pollFirst bool) error {
+	userData := tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation)
+	if conn.writeZeroCopy {
+		return worker.ring.prepSendZCUser(conn.fd, buf, userData, pollFirst)
+	}
+	return worker.ring.prepSendUserWithFlags(conn.fd, buf, userData, pollFirst)
 }
 
 func (worker *tlsUringWorker) acquireConnection() *tlsWorkerConn {
@@ -1599,7 +1658,7 @@ func (worker *tlsUringWorker) handleBridgeWrite(conn *tlsWorkerConn, result int3
 		err := syscall.Errno(-result)
 		if isIOUringTransient(err) {
 			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-			return worker.ring.prepSendUserWithFlags(conn.fd, remaining, tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), true)
+			return worker.queueWrite(conn, remaining, true)
 		}
 		return worker.closeConnection(conn)
 	}
@@ -1607,7 +1666,7 @@ func (worker *tlsUringWorker) handleBridgeWrite(conn *tlsWorkerConn, result int3
 	conn.writeSent += int(result)
 	if conn.writeSent < conn.writeN {
 		remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-		return worker.ring.prepSendUserWithFlags(conn.fd, remaining, tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), true)
+		return worker.queueWrite(conn, remaining, true)
 	}
 	conn.writeSent = 0
 	conn.writeN = 0
@@ -1624,25 +1683,10 @@ func (worker *tlsUringWorker) handleBridgeWrite(conn *tlsWorkerConn, result int3
 	return worker.processBridge(conn)
 }
 
-func (worker *tlsUringWorker) handoffTLSHTTP2(conn *tlsWorkerConn) (int, error) {
-	prefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
-	shared := newTLSWorkerSharedConn(worker, conn, prefix)
-	conn.phase = tlsConnPhaseH2Bridge
-	conn.readN = 0
-	conn.readBuf = conn.readBuf[:0]
-	Stats.H2Conns.Add(1)
-	if err := worker.queueRead(conn); err != nil {
-		return tlsWorkerActionClose, err
-	}
-	go worker.server.serveH2SharedConn(shared, conn.appReader, conn.appWriter)
-	return tlsWorkerActionHanded, nil
-}
-
 func (worker *tlsUringWorker) handoffTLSFallback(conn *tlsWorkerConn) (int, error) {
 	prefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
-	addr := conn.remoteAddr
 	fd := conn.fd
-	wrapped, err := netConnFromFD(fd)
+	wrapped, err := newIOUringConn(fd)
 	if err != nil {
 		conn.fd = -1
 		worker.releaseConnection(conn)
@@ -1651,25 +1695,8 @@ func (worker *tlsUringWorker) handoffTLSFallback(conn *tlsWorkerConn) (int, erro
 	conn.fd = -1
 	worker.releaseConnection(conn)
 	worker.server.activeConns.Add(1)
-	go worker.server.serveTLSFallbackWithPrefix(wrapped, prefix, addr)
+	go worker.server.serveTLSConnWithPrefix(wrapped, prefix)
 	return tlsWorkerActionHanded, nil
-}
-
-func netConnFromFD(fd int) (net.Conn, error) {
-	file := os.NewFile(uintptr(fd), "alos-tls-fallback")
-	if file == nil {
-		return nil, syscall.EBADF
-	}
-	conn, err := net.FileConn(file)
-	closeErr := file.Close()
-	if err != nil {
-		return nil, err
-	}
-	if closeErr != nil {
-		_ = conn.Close()
-		return nil, closeErr
-	}
-	return conn, nil
 }
 
 func nextTLSRecord(buf []byte) (byte, []byte, int, bool, error) {

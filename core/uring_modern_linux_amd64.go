@@ -172,7 +172,7 @@ func (ring *ioUring) prepAcceptMultishotUser(fd int, userData uint64, flags uint
 	return nil
 }
 
-func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64, pollFirst bool) error {
+func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64, pollFirst bool, bundle bool) error {
 	sqe, err := ring.getSqe()
 	if err != nil {
 		return err
@@ -181,6 +181,9 @@ func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64,
 	sqe.Ioprio = ioUringRecvMultishot
 	if pollFirst {
 		sqe.Ioprio |= ioUringPollFirst
+	}
+	if bundle {
+		sqe.Ioprio |= ioUringRecvSendBundle
 	}
 	sqe.Flags = ioUringSqeBufferSelect
 	sqe.FD = int32(fd)

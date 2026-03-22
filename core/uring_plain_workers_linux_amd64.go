@@ -27,6 +27,10 @@ const (
 	plainConnStateWriting = 2
 	plainConnStateClosing = 3
 
+	plainConnProtoUnknown = 0
+	plainConnProtoH1      = 1
+	plainConnProtoH2      = 2
+
 	plainAcceptDepth       = 4
 	plainWorkerRingEntries = 4096
 	plainReadMinFree       = 4096
@@ -45,20 +49,25 @@ type plainWorkerConn struct {
 	fd            int
 	generation    uint16
 	state         uint8
+	closeDone     bool
 	writeBorrowed bool
+	writeZeroCopy bool
 	keepAlive     bool
 	readN         int
 	writeN        int
 	writeSent     int
+	zcPending     int
 	requestCount  uint32
 	lastActive    int64
 	remoteAddr    string
+	protocol      uint8
 	readBuf       []byte
 	writeBuf      []byte
 	req           Request
 	resp          Response
 	consumed      int
 	closeAfter    bool
+	h2            tlsWorkerH2State
 }
 
 type plainUringWorker struct {
@@ -94,12 +103,17 @@ type plainUringBackend struct {
 func (s *Server) tryServeWithIOUringPlainWorkers(listeners []net.Listener) (bool, error) {
 	backend, err := newPlainUringBackend(s, listeners)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("plain new backend: %w", err)
 	}
 	defer backend.closeResources()
+	prevProcs := runtime.GOMAXPROCS(len(backend.workers))
+	defer runtime.GOMAXPROCS(prevProcs)
 	log.Printf("[INFO] io_uring plain worker mode active on Linux amd64: workers=%d accept-shards=%d conns-per-shard=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringConnsPerShard)
 	backend.start()
-	return true, backend.wait()
+	if err := backend.wait(); err != nil {
+		return true, fmt.Errorf("plain backend wait: %w", err)
+	}
+	return true, nil
 }
 
 func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBackend, error) {
@@ -107,7 +121,7 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 		return nil, errors.New("no listeners")
 	}
 	shards, _ := ioUringShardLayout()
-	workerCount := plainUringWorkerCount(shards)
+	workerCount := plainUringWorkerCount(s.config, shards)
 	acceptShards := minInt(len(listeners), workerCount)
 	backend := &plainUringBackend{
 		server:  s,
@@ -118,19 +132,19 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 	for i, listener := range listeners {
 		fd, err := listenerFD(listener)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("plain listener fd %d: %w", i, err)
 		}
 		listenerFDs[i] = fd
 	}
 	for workerID := 0; workerID < workerCount; workerID++ {
-		ring, err := newOwnedIOUring(plainWorkerRingEntries)
+		ring, err := newIOUring(plainWorkerRingEntries)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("plain worker %d ring create: %w", workerID, err)
 		}
 		wakeupPair, err := openWakePipeALOS()
 		if err != nil {
 			ring.close()
-			return nil, err
+			return nil, fmt.Errorf("plain worker %d wake pipe: %w", workerID, err)
 		}
 		worker := &plainUringWorker{
 			id:            workerID,
@@ -161,7 +175,11 @@ func (backend *plainUringBackend) start() {
 		backend.wg.Add(1)
 		go func() {
 			defer backend.wg.Done()
-			backend.errCh <- worker.run(backend)
+			err := worker.run(backend)
+			if err != nil {
+				log.Printf("[WARN] io_uring plain worker %d exited: %v", worker.id, err)
+			}
+			backend.errCh <- err
 		}()
 	}
 }
@@ -248,34 +266,38 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 	defer runtime.UnlockOSThread()
 	defer worker.flushReqStats()
 	if err := worker.ring.enable(); err != nil {
-		return err
+		return fmt.Errorf("plain ring enable: %w", err)
 	}
 	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
-		return err
+		return fmt.Errorf("plain initial fill accepts: %w", err)
 	}
 	if worker.listenerFD >= 0 {
 		if err := worker.armWake(); err != nil {
-			return err
+			return fmt.Errorf("plain initial arm wake: %w", err)
 		}
 		if _, err := worker.ring.submitAndWait(0); err != nil {
-			return err
+			return fmt.Errorf("plain initial submit: %w", err)
 		}
 	}
 	lastSweep := MonotonicNanotime()
 	for {
 		if worker.server.doneClosed() {
-			return nil
+			worker.listenerFD = -1
+			worker.closeAllConnections()
+			if worker.active.Load() == 0 && len(worker.handoffs) == 0 {
+				return nil
+			}
 		}
 		now := MonotonicNanotime()
 		if err := worker.drainHandoffs(now); err != nil {
-			return err
+			return fmt.Errorf("plain drain handoffs: %w", err)
 		}
 		if err := worker.fillAccepts(now); err != nil {
-			return err
+			return fmt.Errorf("plain refill accepts: %w", err)
 		}
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
 			if err := worker.parkUntilWork(); err != nil {
-				return err
+				return fmt.Errorf("plain park until work: %w", err)
 			}
 			lastSweep = MonotonicNanotime()
 			continue
@@ -287,7 +309,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 				if worker.server.doneClosed() && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
 					return nil
 				}
-				return err
+				return fmt.Errorf("plain wait cqe: %w", err)
 			}
 			worker.completions[0] = cqe
 			count = 1
@@ -297,7 +319,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			if err := worker.handleCompletion(backend, worker.completions[i], nowTime); err != nil {
 				if errors.Is(err, errPlainWorkerPark) {
 					if err := worker.parkUntilWork(); err != nil {
-						return err
+						return fmt.Errorf("plain park after completion: %w", err)
 					}
 					lastSweep = MonotonicNanotime()
 					count = 0
@@ -314,10 +336,10 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			lastSweep = nowTime
 		}
 		if err := worker.drainHandoffs(nowTime); err != nil {
-			return err
+			return fmt.Errorf("plain drain handoffs after cqe: %w", err)
 		}
 		if err := worker.fillAccepts(nowTime); err != nil {
-			return err
+			return fmt.Errorf("plain refill accepts after cqe: %w", err)
 		}
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
 			continue
@@ -326,7 +348,16 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			if worker.server.doneClosed() && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
 				return nil
 			}
-			return err
+			return fmt.Errorf("plain submit after cqe: %w", err)
+		}
+	}
+}
+
+func (worker *plainUringWorker) closeAllConnections() {
+	for i := range worker.connections {
+		conn := &worker.connections[i]
+		if conn.fd >= 0 && conn.state != plainConnStateClosing {
+			_ = worker.closeConnection(conn)
 		}
 	}
 }
@@ -345,17 +376,23 @@ func (worker *plainUringWorker) handleCompletion(backend *plainUringBackend, cqe
 			return nil
 		}
 		conn := &worker.connections[connIndex]
-		if conn.fd < 0 || conn.generation != generation {
+		if (conn.fd < 0 && !(op == plainUringOpWrite && cqe.Flags&ioUringCqeNotif != 0)) || conn.generation != generation {
 			return nil
 		}
 		if conn.state == plainConnStateClosing && op != plainUringOpClose {
+			if op == plainUringOpWrite && cqe.Flags&ioUringCqeNotif != 0 {
+				return worker.handleWriteNotification(conn)
+			}
 			return nil
 		}
 		switch op {
 		case plainUringOpRead:
 			return worker.handleRead(conn, cqe.Res, now)
 		case plainUringOpWrite:
-			return worker.handleWrite(conn, cqe.Res, now)
+			if cqe.Flags&ioUringCqeNotif != 0 {
+				return worker.handleWriteNotification(conn)
+			}
+			return worker.handleWrite(conn, cqe.Res, cqe.Flags, now)
 		case plainUringOpClose:
 			worker.finishClose(conn)
 		}
@@ -400,7 +437,7 @@ func (worker *plainUringWorker) handleAccept(backend *plainUringBackend, result 
 	}
 	atomic.StoreInt64(&worker.nextAcceptRetry, 0)
 	fd := int(result)
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	prepareAcceptedFD(fd)
 	backend.dispatchAccepted(worker, fd, now)
 	return nil
 }
@@ -421,10 +458,19 @@ func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, 
 	if len(conn.readBuf) < conn.readN {
 		conn.readBuf = conn.readBuf[:conn.readN]
 	}
+	if conn.protocol == plainConnProtoH2 {
+		return worker.processHTTP2(conn)
+	}
 	return worker.processRequests(conn)
 }
 
 func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
+	if conn.protocol == plainConnProtoH2 {
+		return worker.processHTTP2(conn)
+	}
+	if worker.maybeInitHTTP2(conn) {
+		return worker.processHTTP2(conn)
+	}
 	maxRead := worker.server.config.MaxReadSize
 	if maxRead <= 0 {
 		maxRead = 2 << 20
@@ -467,6 +513,10 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 			}
 			conn.req.Body = conn.readBuf[headerEnd:bodyEnd]
 			consumed = bodyEnd
+		}
+		if conn.protocol == plainConnProtoUnknown {
+			conn.protocol = plainConnProtoH1
+			Stats.H1Conns.Add(1)
 		}
 		conn.requestCount++
 		worker.bumpReqStats()
@@ -530,8 +580,9 @@ func (worker *plainUringWorker) queueResponse(conn *plainWorkerConn, keepAlive b
 	if conn.writeN == 0 {
 		return worker.closeConnection(conn)
 	}
+	conn.writeZeroCopy = worker.shouldUseZeroCopySend(conn)
 	conn.state = plainConnStateWriting
-	if err := worker.ring.prepSendUser(conn.fd, conn.writeBuf[:conn.writeN], plainEncodeUserData(plainUringOpWrite, int(conn.index), conn.generation)); err != nil {
+	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN]); err != nil {
 		return worker.closeConnection(conn)
 	}
 	return nil
@@ -549,35 +600,65 @@ func (worker *plainUringWorker) queuePrebuiltResponse(conn *plainWorkerConn, pay
 	if conn.writeN == 0 {
 		return worker.closeConnection(conn)
 	}
+	conn.writeZeroCopy = worker.shouldUseZeroCopySend(conn)
 	conn.state = plainConnStateWriting
-	if err := worker.ring.prepSendUser(conn.fd, conn.writeBuf[:conn.writeN], plainEncodeUserData(plainUringOpWrite, int(conn.index), conn.generation)); err != nil {
+	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN]); err != nil {
 		return worker.closeConnection(conn)
 	}
 	return nil
 }
 
-func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32, now int64) error {
+func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32, flags uint32, now int64) error {
 	if result < 0 {
 		err := syscall.Errno(-result)
+		if conn.writeZeroCopy && (errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP)) {
+			worker.ring.markSendZCUnsupported()
+			conn.writeZeroCopy = false
+			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
+			return worker.queueWrite(conn, remaining)
+		}
 		if isIOUringTransient(err) {
 			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-			return worker.ring.prepSendUser(conn.fd, remaining, plainEncodeUserData(plainUringOpWrite, int(conn.index), conn.generation))
+			return worker.queueWrite(conn, remaining)
 		}
 		return worker.closeConnection(conn)
+	}
+	if conn.writeZeroCopy && flags&ioUringCqeMore != 0 {
+		conn.zcPending++
+		worker.ring.markSendZCSupported()
 	}
 	conn.lastActive = now
 	conn.writeSent += int(result)
 	if conn.writeSent < conn.writeN {
 		remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-		return worker.ring.prepSendUser(conn.fd, remaining, plainEncodeUserData(plainUringOpWrite, int(conn.index), conn.generation))
+		return worker.queueWrite(conn, remaining)
+	}
+	if conn.protocol == plainConnProtoH2 {
+		conn.writeBuf = conn.writeBuf[:0]
 	}
 	if conn.closeAfter {
 		return worker.closeConnection(conn)
 	}
 	if conn.readN > 0 {
+		if conn.protocol == plainConnProtoH2 {
+			return worker.processHTTP2(conn)
+		}
 		return worker.processRequests(conn)
 	}
 	return worker.queueRead(conn)
+}
+
+func (worker *plainUringWorker) handleWriteNotification(conn *plainWorkerConn) error {
+	if conn.zcPending > 0 {
+		conn.zcPending--
+	}
+	if conn.zcPending == 0 {
+		conn.writeZeroCopy = false
+		if conn.closeDone {
+			worker.releaseConnection(conn)
+		}
+	}
+	return nil
 }
 
 func (worker *plainUringWorker) fillAccepts(now int64) error {
@@ -627,8 +708,13 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	conn.requestCount = 0
 	conn.keepAlive = false
 	conn.closeAfter = false
+	conn.closeDone = false
 	conn.writeBorrowed = false
+	conn.writeZeroCopy = false
+	conn.zcPending = 0
 	conn.lastActive = now
+	conn.protocol = plainConnProtoUnknown
+	conn.h2.reset()
 	if conn.readBuf == nil {
 		conn.readBuf = make([]byte, 0, 8192)
 	}
@@ -639,7 +725,6 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	worker.server.activeConns.Add(1)
 	Stats.ActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
-	Stats.H1Conns.Add(1)
 	return worker.queueRead(conn)
 }
 
@@ -671,6 +756,8 @@ func (worker *plainUringWorker) closeConnection(conn *plainWorkerConn) error {
 		return nil
 	}
 	conn.state = plainConnStateClosing
+	conn.closeDone = false
+	_ = worker.ring.cancelFD(conn.fd, 0)
 	if err := worker.ring.prepCloseUser(conn.fd, plainEncodeUserData(plainUringOpClose, int(conn.index), conn.generation)); err != nil {
 		_ = syscall.Close(conn.fd)
 		worker.finishClose(conn)
@@ -682,6 +769,14 @@ func (worker *plainUringWorker) finishClose(conn *plainWorkerConn) {
 	if conn.fd >= 0 {
 		conn.fd = -1
 	}
+	conn.closeDone = true
+	if conn.zcPending > 0 {
+		return
+	}
+	worker.releaseConnection(conn)
+}
+
+func (worker *plainUringWorker) releaseConnection(conn *plainWorkerConn) {
 	conn.state = plainConnStateFree
 	conn.readN = 0
 	conn.writeN = 0
@@ -698,6 +793,11 @@ func (worker *plainUringWorker) finishClose(conn *plainWorkerConn) {
 	conn.lastActive = 0
 	conn.requestCount = 0
 	conn.remoteAddr = ""
+	conn.protocol = plainConnProtoUnknown
+	conn.closeDone = false
+	conn.writeZeroCopy = false
+	conn.zcPending = 0
+	conn.h2.reset()
 	conn.req.resetFastH1()
 	conn.resp.resetFastH1()
 	conn.readBuf = conn.readBuf[:0]
@@ -707,6 +807,44 @@ func (worker *plainUringWorker) finishClose(conn *plainWorkerConn) {
 	} else {
 		conn.writeBuf = conn.writeBuf[:0]
 	}
+}
+
+func (worker *plainUringWorker) shouldUseZeroCopySend(conn *plainWorkerConn) bool {
+	return conn.closeAfter && conn.writeN >= ioUringSendZCThreshold && worker.ring.canUseSendZC()
+}
+
+func (worker *plainUringWorker) queueWrite(conn *plainWorkerConn, buf []byte) error {
+	userData := plainEncodeUserData(plainUringOpWrite, int(conn.index), conn.generation)
+	if conn.writeZeroCopy {
+		return worker.ring.prepSendZCUser(conn.fd, buf, userData, false)
+	}
+	return worker.ring.prepSendUser(conn.fd, buf, userData)
+}
+
+func (worker *plainUringWorker) maybeInitHTTP2(conn *plainWorkerConn) bool {
+	if conn.protocol != plainConnProtoUnknown || conn.readN == 0 {
+		return false
+	}
+	prefixLen := conn.readN
+	if prefixLen > H2PrefaceLen {
+		prefixLen = H2PrefaceLen
+	}
+	for i := 0; i < prefixLen; i++ {
+		if conn.readBuf[i] != H2ClientPreface[i] {
+			return false
+		}
+	}
+	if conn.readN < H2PrefaceLen {
+		return true
+	}
+	conn.protocol = plainConnProtoH2
+	conn.h2.init()
+	conn.writeBuf = appendH2ServerSettingsFlight(conn.writeBuf[:0])
+	Stats.H2Conns.Add(1)
+	if worker.server.IsDebug() {
+		Dbg("[%s] plain worker entering native h2c", conn.remoteAddr)
+	}
+	return true
 }
 
 func (worker *plainUringWorker) acquireConnection() *plainWorkerConn {
@@ -772,8 +910,11 @@ func (backend *plainUringBackend) dispatchAccepted(source *plainUringWorker, fd 
 	_ = source.attachAccepted(fd, now)
 }
 
-func plainUringWorkerCount(maxShards int) int {
-	workers := runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2
+func plainUringWorkerCount(cfg Config, maxShards int) int {
+	workers := cfg.WorkerCount
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2
+	}
 	if workers < 1 {
 		workers = 1
 	}
@@ -961,13 +1102,28 @@ func (ring *ioUring) prepSendUser(fd int, buf []byte, userData uint64) error {
 }
 
 func (ring *ioUring) prepSendUserWithFlags(fd int, buf []byte, userData uint64, pollFirst bool) error {
+	return ring.prepSendUserWithFlagsAndMode(fd, buf, userData, pollFirst, false)
+}
+
+func (ring *ioUring) prepSendZCUser(fd int, buf []byte, userData uint64, pollFirst bool) error {
+	return ring.prepSendUserWithFlagsAndMode(fd, buf, userData, pollFirst, true)
+}
+
+func (ring *ioUring) prepSendUserWithFlagsAndMode(fd int, buf []byte, userData uint64, pollFirst bool, zeroCopy bool) error {
 	sqe, err := ring.getSqe()
 	if err != nil {
 		return err
 	}
-	sqe.Opcode = ioUringOpSend
+	if zeroCopy {
+		sqe.Opcode = ioUringOpSendZC
+	} else {
+		sqe.Opcode = ioUringOpSend
+	}
 	if pollFirst {
 		sqe.Ioprio = ioUringPollFirst
+	}
+	if zeroCopy {
+		sqe.Ioprio |= ioUringSendZCReportUsage
 	}
 	sqe.FD = int32(fd)
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))

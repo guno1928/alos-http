@@ -5,6 +5,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -26,7 +27,6 @@ const (
 	ioUringFeatRsrcTags       = 1 << 10
 	ioUringFeatCQESkip        = 1 << 11
 	ioUringFeatLinkedFile     = 1 << 12
-	ioUringFeatRegRegRing     = 1 << 13
 )
 
 type ioUringStartupProbeResult struct {
@@ -36,6 +36,8 @@ type ioUringStartupProbeResult struct {
 	kernelFeatures         uint32
 	preferredOwnerFlagsOK  bool
 	preferredOwnerFlagsErr error
+	sendZCOK               bool
+	sendZCErr              error
 	multishotAcceptOK      bool
 	multishotAcceptErr     error
 	providedBufRingOK      bool
@@ -105,6 +107,10 @@ func runIOUringStartupProbe() ioUringStartupProbeResult {
 		result.preferredOwnerFlagsErr = err
 	}
 
+	sendZC := probeIOUringSendZCDetailed()
+	result.sendZCOK = sendZC.ok
+	result.sendZCErr = sendZC.err
+
 	multishotAccept := probeIOUringMultishotAcceptDetailed()
 	result.multishotAcceptOK = multishotAccept.ok
 	result.multishotAcceptErr = multishotAccept.err
@@ -142,8 +148,9 @@ func ioUringStartupProbeLines(result ioUringStartupProbeResult) []string {
 	)
 
 	lines = append(lines, formatProbeLine("summary", fmt.Sprintf(
-		"preferred-owner-flags=%s, multishot-accept=%s, provided-buf-ring=%s, multishot-recv=%s",
+		"preferred-owner-flags=%s, send-zc=%s, multishot-accept=%s, provided-buf-ring=%s, multishot-recv=%s",
 		formatProbeSummaryStatus(result.preferredOwnerFlagsOK, result.preferredOwnerFlagsErr, "supported", "unsupported"),
+		formatProbeSummaryStatus(result.sendZCOK, result.sendZCErr, "active", "disabled"),
 		formatProbeSummaryStatus(result.multishotAcceptOK, result.multishotAcceptErr, "active", "one-shot accept fallback"),
 		formatProbeSummaryStatus(result.providedBufRingOK, result.providedBufRingErr, "active", "disabled"),
 		formatProbeSummaryStatus(result.multishotRecvOK, result.multishotRecvErr, "active", "classic recv fallback"),
@@ -157,6 +164,14 @@ func ioUringStartupProbeLines(result ioUringStartupProbeResult) []string {
 			err:     result.preferredOwnerFlagsErr,
 			yesText: "supported",
 			noText:  "unsupported",
+		},
+		{
+			label:   "send_zc",
+			request: "IORING_OP_SEND_ZC on tcp4 loopback with accepted socket preparation",
+			ok:      result.sendZCOK,
+			err:     result.sendZCErr,
+			yesText: "active",
+			noText:  "disabled",
 		},
 		{
 			label:   "multishot accept",
@@ -274,12 +289,18 @@ func formatProbeNote(label string, err error) string {
 		switch label {
 		case "preferred owner flags":
 			return "kernel rejected one or more requested io_uring setup flags"
+		case "send_zc":
+			return "kernel/runtime rejected the zero-copy send request shape on this machine"
 		case "provided buffer ring":
 			return "kernel rejected the provided buffer ring registration request"
 		case "multishot accept":
 			return "kernel rejected the multishot accept request shape"
 		case "multishot recv":
 			return "kernel rejected multishot recv or its provided-buffer setup"
+		}
+	case syscall.EOPNOTSUPP:
+		if label == "send_zc" {
+			return "protocol or kernel configuration does not support zero-copy send here"
 		}
 	}
 	return ""
@@ -418,7 +439,7 @@ func probeIOUringRecvMultishotDetailed() ioUringCapabilityProbe {
 	}
 	defer syscall.Close(fds[0])
 	defer syscall.Close(fds[1])
-	if err := ring.prepRecvMultishotUser(fds[0], bufs.bgid, 1, false); err != nil {
+	if err := ring.prepRecvMultishotUser(fds[0], bufs.bgid, 1, false, false); err != nil {
 		return ioUringCapabilityProbe{err: err}
 	}
 	if _, err := ring.submitAndWait(0); err != nil {
@@ -440,6 +461,99 @@ func probeIOUringRecvMultishotDetailed() ioUringCapabilityProbe {
 	}
 	if cqe.Flags&ioUringCqeBuffer != 0 {
 		bufs.recycle(cqeBufferID(cqe.Flags))
+	}
+	return ioUringCapabilityProbe{ok: true}
+}
+
+func probeIOUringSendZCDetailed() ioUringCapabilityProbe {
+	ring, err := newOwnedIOUring(16)
+	if err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	defer ring.close()
+	if err := ring.enable(); err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	defer listener.Close()
+
+	payloadSize := ioUringSendZCThreshold
+	if payloadSize < 64<<10 {
+		payloadSize = 64 << 10
+	}
+	payload := make([]byte, payloadSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			readDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		prepareAcceptedConn(conn)
+		_, copyErr := io.Copy(io.Discard, io.LimitReader(conn, int64(len(payload))))
+		readDone <- copyErr
+	}()
+
+	clientConn, err := net.DialTimeout("tcp4", listener.Addr().String(), 500*time.Millisecond)
+	if err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	defer clientConn.Close()
+	prepareAcceptedConn(clientConn)
+
+	tcpConn, ok := clientConn.(*net.TCPConn)
+	if !ok {
+		return ioUringCapabilityProbe{err: fmt.Errorf("unexpected client conn type %T", clientConn)}
+	}
+	raw, err := tcpConn.SyscallConn()
+	if err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	fd := -1
+	if err := raw.Control(func(value uintptr) {
+		fd = int(value)
+	}); err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	if fd < 0 {
+		return ioUringCapabilityProbe{err: errors.New("tcp fd unavailable")}
+	}
+
+	if err := ring.prepSendZCUser(fd, payload, 1, false); err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	if _, err := ring.submitAndWait(1); err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	cqe, err := ring.waitCqe()
+	if err != nil {
+		return ioUringCapabilityProbe{err: err}
+	}
+	if cqe.Res < 0 {
+		return ioUringCapabilityProbe{err: syscall.Errno(-cqe.Res)}
+	}
+	if cqe.Flags&ioUringCqeMore != 0 {
+		if _, err := ring.submitAndWait(1); err != nil {
+			return ioUringCapabilityProbe{err: err}
+		}
+		notif, err := ring.waitCqe()
+		if err != nil {
+			return ioUringCapabilityProbe{err: err}
+		}
+		if notif.Flags&ioUringCqeNotif == 0 {
+			return ioUringCapabilityProbe{err: syscall.EINVAL}
+		}
+	}
+	if err := <-readDone; err != nil {
+		return ioUringCapabilityProbe{err: err}
 	}
 	return ioUringCapabilityProbe{ok: true}
 }

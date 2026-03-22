@@ -4,16 +4,12 @@ package core
 
 import "net"
 
-func (s *Server) tryServeWithIOUring(listeners []net.Listener, plain bool) (bool, error) {
-	return false, nil
-}
-
 func (s *Server) tryServeWithIOUringPlainWorkers(listeners []net.Listener) (bool, error) {
 	return false, nil
 }
 
-func (s *Server) tryServeWithIOUringTLSWorkers(listeners []net.Listener) (bool, error) {
-	return false, nil
+func (s *Server) tryServeWithIOUringRedirect(listeners []net.Listener) error {
+	return ErrIOUringRequired
 }
 
 func ioUringListenerCount(configured int) int {

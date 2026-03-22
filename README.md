@@ -153,6 +153,20 @@ func main() {
 }
 ```
 
+## Auto Tune
+
+ALOS HTTP has a built-in finetuner for Linux amd64. It benchmarks a set of worker and listener combinations on your machine, applies the best result automatically, and prints the full sweep at the end.
+
+With the current default sweep it takes about 3 minutes to fully complete the raw benchmark runs, plus a little extra startup and shutdown time between runs.
+
+```go
+if err := srv.FineTune(); err != nil {
+    log.Fatalf("[FINETUNE] failed: %v", err)
+}
+```
+
+That will find the best tune for your machine from the built-in default candidates and apply the winning worker/listener configuration to the server.
+
 ## Plain HTTP Example
 
 ```go

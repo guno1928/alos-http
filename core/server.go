@@ -3,18 +3,15 @@ package core
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/tls"
 	"io"
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/crypto/curve25519"
 )
 
 var timeNow = time.Now
@@ -303,8 +300,6 @@ func (s *Server) ListenAndServeTLS() error {
 		return err
 	}
 	s.rebuildFallbackTLSConfig()
-
-	s.startHTTPRedirect()
 	s.primeTLSCertificates()
 
 	if s.acme != nil {
@@ -351,24 +346,17 @@ func (s *Server) ListenAndServeTLS() error {
 	if len(certs) == 0 {
 		log.Printf("[WARN] no TLS certificates are loaded; incoming HTTPS handshakes will fail until a certificate becomes available")
 	}
-
-	errCh := make(chan error, len(listeners))
-	if started, err := s.tryServeWithIOUringTLSWorkers(listeners); started || err != nil {
+	backend, err := newTLSUringBackend(s, listeners)
+	if err != nil {
 		return err
 	}
-	if started, err := s.tryServeWithIOUring(listeners, false); started || err != nil {
+	defer backend.closeResources()
+	log.Printf("[INFO] io_uring TLS worker mode active on Linux amd64: workers=%d accept-shards=%d conns-per-shard=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringConnsPerShard)
+	backend.start()
+	if err := s.startHTTPRedirect(); err != nil {
 		return err
 	}
-	for _, ln := range listeners {
-		go s.acceptLoop(ln, errCh)
-	}
-
-	select {
-	case <-s.done:
-		return nil
-	case err := <-errCh:
-		return err
-	}
+	return backend.wait()
 }
 
 // ListenAndServe starts a plain HTTP/1.1 server (no TLS). Use this when
@@ -378,6 +366,20 @@ func (s *Server) ListenAndServeTLS() error {
 //	s.Router.GET("/", handler)
 //	log.Fatal(s.ListenAndServe())
 func (s *Server) ListenAndServe() error {
+	workers := s.config.WorkerCount
+	if workers < 1 {
+		workers = runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	listenerCount := s.config.Listeners
+	if listenerCount < 1 {
+		listenerCount = 1
+	}
+	listenerCount = ioUringListenerCount(listenerCount)
+	prevProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(prevProcs)
 	maybeRaiseProcessFileLimit()
 	logIOUringStartupProbe()
 	s.Router.Build()
@@ -405,79 +407,13 @@ func (s *Server) ListenAndServe() error {
 		}
 	}()
 
-	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1) ===")
+	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge) ===")
 	log.Printf("Listening on http://%s (%d listener(s))", addr, len(listeners))
 
-	errCh := make(chan error, len(listeners))
 	if started, err := s.tryServeWithIOUringPlainWorkers(listeners); started || err != nil {
 		return err
 	}
-	if started, err := s.tryServeWithIOUring(listeners, true); started || err != nil {
-		return err
-	}
-	for _, ln := range listeners {
-		go s.acceptLoopPlain(ln, errCh)
-	}
-
-	select {
-	case <-s.done:
-		return nil
-	case err := <-errCh:
-		return err
-	}
-}
-
-func (s *Server) acceptLoopPlain(ln net.Listener, errCh chan<- error) {
-	for {
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-s.done:
-				return
-			default:
-				log.Printf("accept: %v", err)
-				continue
-			}
-		}
-		s.activeConns.Add(1)
-		go s.servePlainConn(conn)
-	}
-}
-
-func (s *Server) handlePlainConn(conn net.Conn) {
-	prepareAcceptedConn(conn)
-	Stats.ActiveConns.Add(1)
-	Stats.TotalConns.Add(1)
-	Stats.H1Conns.Add(1)
-	logReqs := s.logRequests.Load()
-	var addr string
-	if logReqs || s.debug.Load() {
-		addr = conn.RemoteAddr().String()
-	}
-	if logReqs {
-		log.Printf("[CONN] %s connected (plain HTTP)", addr)
-	}
-	defer func() {
-		conn.Close()
-		Stats.ActiveConns.Add(-1)
-		if logReqs {
-			log.Printf("[CONN] %s disconnected", addr)
-		}
-	}()
-
-	s.ServeH1Plain(conn)
-}
-
-func (s *Server) serveTLSConn(conn net.Conn) {
-	var hdrBuf [5]byte
-	s.handleConn(conn, hdrBuf[:])
-	s.activeConns.Done()
+	return ErrIOUringRequired
 }
 
 func (s *Server) serveTLSConnWithPrefix(conn net.Conn, prefix []byte) {
@@ -486,17 +422,6 @@ func (s *Server) serveTLSConnWithPrefix(conn net.Conn, prefix []byte) {
 		addr = remote.String()
 	}
 	s.serveTLSFallbackWithPrefix(conn, prefix, addr)
-	s.activeConns.Done()
-}
-
-func (s *Server) serveH2SharedConn(conn net.Conn, reader, writer *TrafficAEAD) {
-	defer conn.Close()
-	var hdrBuf [5]byte
-	s.ServeH2(conn, reader, writer, hdrBuf[:])
-}
-
-func (s *Server) servePlainConn(conn net.Conn) {
-	s.handlePlainConn(conn)
 	s.activeConns.Done()
 }
 
@@ -597,7 +522,7 @@ func (s *Server) primeTLSCertificates() {
 
 func (s *Server) rebuildFallbackTLSConfig() {
 	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS11,
 		MaxVersion: tls.VersionTLS12,
 		NextProtos: s.tlsNextProtos(),
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -609,29 +534,6 @@ func (s *Server) rebuildFallbackTLSConfig() {
 		},
 	}
 	s.fallbackTLS.Store(cfg)
-}
-
-func (s *Server) acceptLoop(ln net.Listener, errCh chan<- error) {
-	for {
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-s.done:
-				return
-			default:
-				log.Printf("accept: %v", err)
-				continue
-			}
-		}
-		s.activeConns.Add(1)
-		go s.serveTLSConn(conn)
-	}
 }
 
 // Shutdown gracefully drains in-flight connections and stops ACME
@@ -672,303 +574,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (s *Server) handleConn(conn net.Conn, hdrBuf []byte) {
-	prepareAcceptedConn(conn)
-	Stats.ActiveConns.Add(1)
-	Stats.TotalConns.Add(1)
-	logReqs := s.logRequests.Load()
-	var addr string
-	if logReqs || s.debug.Load() {
-		addr = conn.RemoteAddr().String()
-	}
-	if logReqs {
-		log.Printf("[CONN] %s connected", addr)
-	}
-	defer func() {
-		conn.Close()
-		Stats.ActiveConns.Add(-1)
-		if logReqs {
-			log.Printf("[CONN] %s disconnected", addr)
-		}
-	}()
-
-	conn.SetDeadline(timeNow().Add(s.config.HandshakeTimeout))
-
-	ct, chRaw, chBP, err := ReadRecord(conn, hdrBuf)
-	if err != nil {
-		s.connLog("[%s] read ClientHello: %v", addr, err)
-		return
-	}
-
-	if ct != 0x16 {
-		s.connLog("[%s] expected handshake (0x16), got 0x%02x", addr, ct)
-		ReleaseRecordBuf(chBP)
-		return
-	}
-
-	var ch ParsedClientHello
-	if err := ParseClientHello(chRaw, &ch); err != nil {
-		s.connLog("[%s] parse ClientHello: %v", addr, err)
-		ReleaseRecordBuf(chBP)
-		return
-	}
-	Dbg("[%s] ClientHello: %d suites, ALPN: %v, SNI: %s, versions: %v",
-		addr, len(ch.CipherSuites), ch.ALPNProtos, ch.ServerName, ch.SupportedVersions)
-
-	certEntry := s.certStore.Lookup(ch.ServerName)
-	if certEntry == nil {
-		s.connLog("[%s] no certificate for SNI=%q", addr, ch.ServerName)
-		ReleaseRecordBuf(chBP)
-		return
-	}
-
-	if ch.SupportsTLS13() && certEntry.PrivKey != nil && ch.X25519PubKey != nil {
-		s.handleTLS13(conn, hdrBuf, &ch, chRaw, chBP, certEntry, addr)
-	} else {
-		s.handleTLSFallback(conn, hdrBuf, chRaw, chBP, addr)
-	}
-}
-
-func (s *Server) handleTLS13(conn net.Conn, hdrBuf []byte, ch *ParsedClientHello, chRaw []byte, chBP *[]byte, certEntry *CertEntry, addr string) {
-	defer ReleaseRecordBuf(chBP)
-	s.ensureTLSRuntime()
-
-	cs := NegotiateSuite(ch.CipherSuites)
-	if cs == nil {
-		s.connLog("[%s] no common cipher suite", addr)
-		return
-	}
-	Dbg("[%s] selected suite: 0x%04x", addr, cs.ID)
-
-	selectedALPN := s.negotiateALPN(ch.ALPNProtos)
-	Dbg("[%s] ALPN: %q", addr, selectedALPN)
-
-	transcript := cs.HashFn()
-	transcript.Write(chRaw)
-
-	serverKey, err := s.x25519Pool.Get()
-	if err != nil {
-		s.connLog("[%s] generate server key share: %v", addr, err)
-		return
-	}
-	defer func() {
-		serverKey.zero()
-	}()
-
-	var shared [32]byte
-	curve25519.ScalarMult(&shared, &serverKey.priv, &ch.x25519PubKeyBuf)
-	allZero := true
-	for _, b := range shared {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
-		s.connLog("[%s] x25519 shared: %v", addr, ErrBadKeyShare)
-		return
-	}
-	defer func() {
-		for i := range shared {
-			shared[i] = 0
-		}
-	}()
-	DbgHex("Shared secret", shared[:])
-
-	var srvRandom [32]byte
-	if _, err := rand.Read(srvRandom[:]); err != nil {
-		s.connLog("[%s] rand.Read server random: %v", addr, err)
-		return
-	}
-	shMsg := BuildServerHello(srvRandom[:], ch.SessionID, cs.ID, serverKey.pub[:])
-	transcript.Write(shMsg)
-
-	var handshakeSecretBuf [64]byte
-	handshakeSecret := TLSExtractTo(cs.HashFn, cs.derivedFromEarly, shared[:], handshakeSecretBuf[:0])
-	var hsHashBuf [64]byte
-	hsHash := transcript.Sum(hsHashBuf[:0])
-	DbgHex("Transcript hash (CH+SH)", hsHash)
-	var clientHSSecretBuf [64]byte
-	clientHSSecret := cs.DeriveSecretTo(&cs.labelClientHSTraffic, handshakeSecret, hsHash, clientHSSecretBuf[:0])
-	var serverHSSecretBuf [64]byte
-	serverHSSecret := cs.DeriveSecretTo(&cs.labelServerHSTraffic, handshakeSecret, hsHash, serverHSSecretBuf[:0])
-
-	serverHSWriter, err := NewTrafficAEAD(cs.HashFn, serverHSSecret, cs)
-	if err != nil {
-		s.connLog("[%s] server HS AEAD: %v", addr, err)
-		return
-	}
-	Dbg("[%s] Handshake keys derived", addr)
-
-	eeCert := certEntry.CachedEECert(selectedALPN)
-	DbgHex("EncryptedExtensions+Certificate", eeCert)
-	transcript.Write(eeCert)
-
-	var cvHashBuf [64]byte
-	sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(cvHashBuf[:0]))
-	if err != nil {
-		s.connLog("[%s] sign CertificateVerify: %v", addr, err)
-		return
-	}
-
-	bp := LargeBufPool.Get().(*[]byte)
-	inner := (*bp)[:0]
-	inner = append(inner, eeCert...)
-	cvStart := len(inner)
-	inner = appendCertificateVerify(inner, sig)
-	cv := inner[cvStart:]
-	transcript.Write(cv)
-
-	var finHashBuf [64]byte
-	var srvVerifyBuf [64]byte
-	srvVerifyData := cs.ComputeFinishedTo(serverHSSecret, transcript.Sum(finHashBuf[:0]), srvVerifyBuf[:0])
-	finStart := len(inner)
-	inner = appendFinished(inner, srvVerifyData)
-	fin := inner[finStart:]
-	transcript.Write(fin)
-	inner = append(inner, 0x16)
-
-	flightBP := LargeBufPool.Get().(*[]byte)
-	flight := (*flightBP)[:0]
-	flight = AppendRecord(flight, 0x16, shMsg)
-	flight = AppendRecord(flight, 0x14, []byte{0x01})
-	ciphertextLen := len(inner) + serverHSWriter.Overhead()
-	flight = append(flight, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
-	flight = serverHSWriter.EncryptAppend(flight, inner)
-	if err := writeFull(conn, flight); err != nil {
-		*bp = inner[:0]
-		LargeBufPool.Put(bp)
-		*flightBP = flight[:0]
-		LargeBufPool.Put(flightBP)
-		s.connLog("[%s] write handshake flight: %v", addr, err)
-		return
-	}
-	*bp = inner[:0]
-	LargeBufPool.Put(bp)
-	*flightBP = flight[:0]
-	LargeBufPool.Put(flightBP)
-	Dbg("[%s] Encrypted handshake flight sent (ALPN=%s)", addr, selectedALPN)
-
-	var derivedFromHSBuf [64]byte
-	derivedFromHS := cs.DeriveSecretTo(&cs.labelDerived, handshakeSecret, cs.emptyTranscriptHash, derivedFromHSBuf[:0])
-	var masterSecretBuf [64]byte
-	masterSecret := TLSExtractTo(cs.HashFn, derivedFromHS, cs.zeroHashInput, masterSecretBuf[:0])
-	var appHashBuf [64]byte
-	appHash := transcript.Sum(appHashBuf[:0])
-	DbgHex("Transcript hash (CH..sFin)", appHash)
-
-	var clientAppSecretBuf [64]byte
-	clientAppSecret := cs.DeriveSecretTo(&cs.labelClientAppTraffic, masterSecret, appHash, clientAppSecretBuf[:0])
-	var serverAppSecretBuf [64]byte
-	serverAppSecret := cs.DeriveSecretTo(&cs.labelServerAppTraffic, masterSecret, appHash, serverAppSecretBuf[:0])
-	Dbg("[%s] Application keys derived", addr)
-
-	clientHSReader, err := NewTrafficAEAD(cs.HashFn, clientHSSecret, cs)
-	if err != nil {
-		s.connLog("[%s] client HS AEAD: %v", addr, err)
-		return
-	}
-
-	finRecCT, finRec, finBP, err := ReadRecordSkipCCS(conn, hdrBuf)
-	if err != nil {
-		s.connLog("[%s] read client Finished: %v", addr, err)
-		return
-	}
-
-	if finRecCT == 0x15 {
-		if len(finRec) >= 2 {
-			desc := finRec[1]
-			reason := tlsAlertName(desc)
-			s.connLog("[%s] TLS alert from client: %s (level=%d desc=%d)", addr, reason, finRec[0], desc)
-		} else {
-			s.connLog("[%s] TLS alert from client (truncated, len=%d)", addr, len(finRec))
-		}
-		ReleaseRecordBuf(finBP)
-		return
-	}
-
-	if finRecCT != 0x17 {
-		s.connLog("[%s] unexpected record type 0x%02x, expected application data (0x17)", addr, finRecCT)
-		ReleaseRecordBuf(finBP)
-		return
-	}
-
-	finPt, err := clientHSReader.Decrypt(finRec)
-	if err != nil {
-		s.connLog("[%s] decrypt client Finished: %v", addr, err)
-		ReleaseRecordBuf(finBP)
-		return
-	}
-
-	finContent, finCT, err := StripInnerPlaintext(finPt)
-	if err != nil || finCT != 0x16 {
-		if finCT == 0x15 && len(finContent) >= 2 {
-			desc := finContent[1]
-			reason := tlsAlertName(desc)
-			s.connLog("[%s] TLS alert from client: %s (level=%d desc=%d)", addr, reason, finContent[0], desc)
-		} else {
-			s.connLog("[%s] bad inner type for Finished: 0x%02x err=%v", addr, finCT, err)
-		}
-		ReleaseRecordBuf(finBP)
-		return
-	}
-
-	if len(finContent) < 4 || finContent[0] != 0x14 {
-		s.connLog("[%s] not a Finished message", addr)
-		ReleaseRecordBuf(finBP)
-		return
-	}
-	clientVerify := finContent[4:]
-	var expectedVerifyBuf [64]byte
-	expectedVerify := cs.ComputeFinishedTo(clientHSSecret, appHash, expectedVerifyBuf[:0])
-	if !hmac.Equal(clientVerify, expectedVerify) {
-		s.connLog("[%s] client Finished verification FAILED", addr)
-		ReleaseRecordBuf(finBP)
-		return
-	}
-	ReleaseRecordBuf(finBP)
-	Dbg("[%s] TLS 1.3 handshake complete!", addr)
-
-	clientAppReader, err := NewTrafficAEAD(cs.HashFn, clientAppSecret, cs)
-	if err != nil {
-		s.connLog("[%s] client app AEAD: %v", addr, err)
-		return
-	}
-	serverAppWriter, err := NewTrafficAEAD(cs.HashFn, serverAppSecret, cs)
-	if err != nil {
-		s.connLog("[%s] server app AEAD: %v", addr, err)
-		return
-	}
-
-	conn.SetDeadline(time.Time{})
-	if s.config.IdleTimeout > 0 {
-		conn.SetDeadline(timeNow().Add(s.config.IdleTimeout))
-	}
-
-	if selectedALPN == "h2" {
-		Stats.H2Conns.Add(1)
-		if s.logRequests.Load() {
-			log.Printf("[%s] serving HTTP/2 (TLS 1.3)", addr)
-		}
-		s.ServeH2(conn, clientAppReader, serverAppWriter, hdrBuf)
-	} else {
-		Stats.H1Conns.Add(1)
-		if s.logRequests.Load() {
-			log.Printf("[%s] serving HTTP/1.1 (TLS 1.3)", addr)
-		}
-		s.ServeH1(conn, clientAppReader, serverAppWriter, hdrBuf)
-	}
-}
-
-func (s *Server) handleTLSFallback(conn net.Conn, hdrBuf []byte, chRaw []byte, chBP *[]byte, addr string) {
-	fullRecord := make([]byte, 5+len(chRaw))
-	copy(fullRecord[:5], hdrBuf[:5])
-	copy(fullRecord[5:], chRaw)
-	ReleaseRecordBuf(chBP)
-
-	s.serveTLSFallbackWithPrefix(conn, fullRecord, addr)
 }
 
 func (s *Server) serveTLSFallbackWithPrefix(conn net.Conn, prefix []byte, addr string) {

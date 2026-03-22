@@ -119,15 +119,15 @@ func (hr *HTTPRouter) match(path string) *httpRouteEntry {
 	return nil
 }
 
-func (s *Server) startHTTPRedirect() {
+func (s *Server) startHTTPRedirect() error {
 	addr := s.config.HTTPAddr
 	if addr == "-" || addr == "off" || addr == "disable" {
-		return
+		return nil
 	}
 	if addr == "" {
 		addr = defaultHTTPAddr(s.config.Addr)
 		if addr == "-" || addr == "off" || addr == "disable" {
-			return
+			return nil
 		}
 	}
 
@@ -138,35 +138,22 @@ func (s *Server) startHTTPRedirect() {
 
 	listeners, err := createListeners(addr, numListeners)
 	if err != nil {
-		log.Printf("[HTTP] redirect listener FAILED on %s: %v", addr, err)
-		return
+		return err
+	}
+	if err := s.tryServeWithIOUringRedirect(listeners); err != nil {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+		return err
 	}
 	log.Printf("[HTTP] %d redirect listener(s) started on %s", len(listeners), addr)
+	return nil
+}
 
-	go func() {
-		<-s.done
-		for _, ln := range listeners {
-			ln.Close()
-		}
-	}()
-
-	for _, ln := range listeners {
-		ln := ln
-		go func() {
-			for {
-				conn, err := ln.Accept()
-				if err != nil {
-					select {
-					case <-s.done:
-						return
-					default:
-						continue
-					}
-				}
-				go s.handleHTTPRedirect(conn)
-			}
-		}()
-	}
+func (s *Server) serveHTTPRedirectConn(conn net.Conn) {
+	s.activeConns.Add(1)
+	defer s.activeConns.Done()
+	s.handleHTTPRedirect(conn)
 }
 
 func (s *Server) handleHTTPRedirect(conn net.Conn) {
