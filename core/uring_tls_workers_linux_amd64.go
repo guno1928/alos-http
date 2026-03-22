@@ -51,6 +51,7 @@ const (
 )
 
 var errTLSWorkerPark = errors.New("tls worker park")
+var errTLSPbufUnavailable = errors.New("tls provided buffer ring unavailable")
 
 type tlsAcceptedConn struct {
 	fd         int
@@ -142,6 +143,13 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 	if err != nil {
 		return nil, err
 	}
+	if recvMultishotSupported {
+		tlsRecvPath := probeIOUringTLSRecvPathDetailed(workerCount)
+		if !tlsRecvPath.ok {
+			recvMultishotSupported = false
+			log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during live-size startup probe, starting in classic recv mode: %v", tlsRecvPath.err)
+		}
+	}
 	if !recvMultishotSupported {
 		log.Printf("[INFO] io_uring multishot recv unavailable during startup probe, starting in classic recv mode")
 	}
@@ -154,31 +162,31 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 	for i, listener := range listeners {
 		fd, err := listenerFD(listener)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("tls listener fd %d: %w", i, err)
 		}
 		listenerFDs[i] = fd
 	}
 	for workerID := 0; workerID < workerCount; workerID++ {
-		ring, err := newOwnedIOUring(tlsWorkerRingEntries)
+		ring, err := newIOUring(tlsWorkerRingEntries)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("tls worker %d ring create: %w", workerID, err)
 		}
 		wakeupPair, err := openWakePipeALOS()
 		if err != nil {
 			ring.close()
-			return nil, err
+			return nil, fmt.Errorf("tls worker %d wake pipe: %w", workerID, err)
 		}
 		worker := &tlsUringWorker{
 			id:                 workerID,
 			listenerFD:         -1,
 			wakeupReadFD:       wakeupPair[0],
 			wakeupWriteFD:      wakeupPair[1],
-			handoffs:           make(chan tlsAcceptedConn, ioUringConnsPerShard),
+			handoffs:           make(chan tlsAcceptedConn, ioUringInitialConnsPerShard),
 			ring:               ring,
 			server:             s,
-			connections:        make([]tlsWorkerConn, ioUringConnsPerShard),
+			connections:        make([]tlsWorkerConn, ioUringInitialConnsPerShard),
 			freeHead:           0,
-			bridgeRequests:     make(chan int32, ioUringConnsPerShard*2),
+			bridgeRequests:     make(chan int32, ioUringInitialConnsPerShard*2),
 			useMultishotAccept: true,
 		}
 		if recvMultishotSupported {
@@ -187,7 +195,7 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 				ring.close()
 				_ = syscall.Close(wakeupPair[0])
 				_ = syscall.Close(wakeupPair[1])
-				return nil, err
+				return nil, fmt.Errorf("tls worker %d recv buf ring create: %w", workerID, err)
 			}
 			worker.recvBufs = recvBufs
 		}
@@ -204,32 +212,83 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 }
 
 func (backend *tlsUringBackend) start() {
+	pbufDisabled := false
+	for _, worker := range backend.workers {
+		if pbufDisabled && worker.recvBufs != nil {
+			_ = worker.recvBufs.unregister(worker.ring)
+			worker.recvBufs.close()
+			worker.recvBufs = nil
+		}
+		if err := worker.prepare(); err != nil {
+			if errors.Is(err, errTLSPbufUnavailable) {
+				if !pbufDisabled {
+					pbufDisabled = true
+					log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during worker startup, disabling buffered recv for all TLS workers: %v", err)
+					backend.disableBufferedRecv()
+				}
+				continue
+			}
+			backend.errCh <- err
+			return
+		}
+	}
 	for _, worker := range backend.workers {
 		worker := worker
 		backend.wg.Add(1)
 		go func() {
 			defer backend.wg.Done()
-			backend.errCh <- worker.run(backend)
+			if err := worker.run(backend); err != nil {
+				backend.errCh <- err
+			}
 		}()
 	}
+}
+
+func (backend *tlsUringBackend) disableBufferedRecv() {
+	for _, worker := range backend.workers {
+		if worker.recvBufs == nil {
+			continue
+		}
+		_ = worker.recvBufs.unregister(worker.ring)
+		worker.recvBufs.close()
+		worker.recvBufs = nil
+	}
+}
+
+func (worker *tlsUringWorker) prepare() error {
+	if err := worker.ring.enable(); err != nil {
+		return err
+	}
+	if worker.recvBufs != nil {
+		if err := worker.recvBufs.register(worker.ring); err != nil {
+			if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EEXIST) {
+				worker.recvBufs.close()
+				worker.recvBufs = nil
+				return fmt.Errorf("%w on worker %d: %v", errTLSPbufUnavailable, worker.id, err)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (backend *tlsUringBackend) stop() {
+	for _, ln := range backend.server.listeners {
+		_ = ln.Close()
+	}
+	for _, worker := range backend.workers {
+		worker.signalWake()
+	}
+	backend.wg.Wait()
 }
 
 func (backend *tlsUringBackend) wait() error {
 	select {
 	case <-backend.server.done:
-		for _, worker := range backend.workers {
-			worker.signalWake()
-		}
-		backend.wg.Wait()
+		backend.stop()
 		return nil
 	case err := <-backend.errCh:
-		for _, ln := range backend.server.listeners {
-			_ = ln.Close()
-		}
-		for _, worker := range backend.workers {
-			worker.signalWake()
-		}
-		backend.wg.Wait()
+		backend.stop()
 		return err
 	}
 }
@@ -249,56 +308,68 @@ func (backend *tlsUringBackend) closeResources() {
 			worker.wakeupWriteFD = -1
 		}
 		if worker.recvBufs != nil {
+			_ = worker.recvBufs.unregister(worker.ring)
 			worker.recvBufs.close()
 			worker.recvBufs = nil
 		}
 	}
 }
 
+func (worker *tlsUringWorker) initConnectionSlot(index int, nextFree int32) {
+	conn := &worker.connections[index]
+	conn.index = int32(index)
+	conn.fd = -1
+	conn.req.Headers = make([][2]string, 0, 16)
+	conn.req.Body = make([]byte, 0, 1024)
+	conn.req.Proto = "HTTP/1.1"
+	conn.resp.Headers = make([][2]string, 0, 8)
+	conn.resp.body = make([]byte, 0, 4096)
+	conn.nextFree = nextFree
+}
+
 func (worker *tlsUringWorker) initConnections() {
 	for index := range worker.connections {
-		conn := &worker.connections[index]
-		conn.index = int32(index)
-		conn.fd = -1
-		conn.req.Headers = make([][2]string, 0, 16)
-		conn.req.Body = make([]byte, 0, 1024)
-		conn.req.Proto = "HTTP/1.1"
-		conn.resp.Headers = make([][2]string, 0, 8)
-		conn.resp.body = make([]byte, 0, 4096)
+		nextFree := int32(index + 1)
 		if index == len(worker.connections)-1 {
-			conn.nextFree = -1
-		} else {
-			conn.nextFree = int32(index + 1)
+			nextFree = -1
 		}
+		worker.initConnectionSlot(index, nextFree)
 	}
+}
+
+func (worker *tlsUringWorker) growConnections() {
+	oldLen := len(worker.connections)
+	growBy := oldLen
+	if growBy < ioUringInitialConnsPerShard {
+		growBy = ioUringInitialConnsPerShard
+	}
+	if growBy == 0 {
+		growBy = ioUringInitialConnsPerShard
+	}
+	prevHead := worker.freeHead
+	worker.connections = append(worker.connections, make([]tlsWorkerConn, growBy)...)
+	for index := oldLen; index < len(worker.connections); index++ {
+		nextFree := int32(index + 1)
+		if index == len(worker.connections)-1 {
+			nextFree = prevHead
+		}
+		worker.initConnectionSlot(index, nextFree)
+	}
+	worker.freeHead = int32(oldLen)
 }
 
 func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer worker.flushReqStats()
-	if err := worker.ring.enable(); err != nil {
-		return err
-	}
-	if worker.recvBufs != nil {
-		if err := worker.recvBufs.register(worker.ring); err != nil {
-			if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) {
-				log.Printf("[INFO] io_uring provided buffer ring unavailable on worker %d, falling back to classic recv path: %v", worker.id, err)
-				worker.recvBufs.close()
-				worker.recvBufs = nil
-			} else {
-				return err
-			}
-		}
-	}
 	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
-		return err
+		return fmt.Errorf("tls worker %d initial fillAccepts: %w", worker.id, err)
 	}
 	if err := worker.armWake(); err != nil {
-		return err
+		return fmt.Errorf("tls worker %d initial armWake: %w", worker.id, err)
 	}
 	if _, err := worker.ring.submitAndWait(0); err != nil {
-		return err
+		return fmt.Errorf("tls worker %d initial submit: %w", worker.id, err)
 	}
 	lastSweep := MonotonicNanotime()
 	for {
@@ -1430,7 +1501,10 @@ func (worker *tlsUringWorker) queueWrite(conn *tlsWorkerConn, buf []byte, pollFi
 
 func (worker *tlsUringWorker) acquireConnection() *tlsWorkerConn {
 	if worker.freeHead < 0 {
-		return nil
+		worker.growConnections()
+		if worker.freeHead < 0 {
+			return nil
+		}
 	}
 	index := worker.freeHead
 	conn := &worker.connections[index]
@@ -1544,7 +1618,7 @@ func (worker *tlsUringWorker) armWake() error {
 }
 
 func (worker *tlsUringWorker) queueWake() error {
-	return worker.ring.prepReadvUser(worker.wakeupReadFD, &worker.wakeupIovec, tlsEncodeUserData(tlsUringOpWake, 0, 0))
+	return worker.ring.prepReadUser(worker.wakeupReadFD, worker.wakeupBuf[:], tlsEncodeUserData(tlsUringOpWake, 0, 0))
 }
 
 func (worker *tlsUringWorker) signalWake() {

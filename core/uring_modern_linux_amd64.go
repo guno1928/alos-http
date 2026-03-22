@@ -29,6 +29,7 @@ type ioUringBufferRing struct {
 	entries uint16
 	mask    uint16
 	bufSize int
+	active  bool
 	ringMem []byte
 	bufs    []ioUringBuf
 	tail    uint16
@@ -90,16 +91,39 @@ func (group *ioUringBufferRing) register(ring *ioUring) error {
 		Bgid:        group.bgid,
 	}
 	if err := ring.register(ioUringRegisterPbufRing, uintptr(unsafe.Pointer(&reg)), 1); err != nil {
-		return err
+		if err == syscall.EEXIST {
+			if unregisterErr := ring.unregisterPbufRing(group.bgid); unregisterErr != nil && unregisterErr != syscall.ENOENT {
+				return err
+			}
+			if retryErr := ring.register(ioUringRegisterPbufRing, uintptr(unsafe.Pointer(&reg)), 1); retryErr != nil {
+				return retryErr
+			}
+		} else {
+			return err
+		}
 	}
+	group.active = true
 	group.refillAll()
 	return nil
+}
+
+func (group *ioUringBufferRing) unregister(ring *ioUring) error {
+	if group == nil || !group.active {
+		return nil
+	}
+	err := ring.unregisterPbufRing(group.bgid)
+	if err == nil || err == syscall.ENOENT {
+		group.active = false
+		return nil
+	}
+	return err
 }
 
 func (group *ioUringBufferRing) close() {
 	if group == nil {
 		return
 	}
+	group.active = false
 	if len(group.ringMem) > 0 {
 		_ = syscall.Munmap(group.ringMem)
 		group.ringMem = nil

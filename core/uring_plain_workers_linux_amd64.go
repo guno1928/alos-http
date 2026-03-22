@@ -108,7 +108,7 @@ func (s *Server) tryServeWithIOUringPlainWorkers(listeners []net.Listener) (bool
 	defer backend.closeResources()
 	prevProcs := runtime.GOMAXPROCS(len(backend.workers))
 	defer runtime.GOMAXPROCS(prevProcs)
-	log.Printf("[INFO] io_uring plain worker mode active on Linux amd64: workers=%d accept-shards=%d conns-per-shard=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringConnsPerShard)
+	log.Printf("[INFO] io_uring plain worker mode active on Linux amd64: workers=%d accept-shards=%d initial-conn-pool=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringInitialConnsPerShard)
 	backend.start()
 	if err := backend.wait(); err != nil {
 		return true, fmt.Errorf("plain backend wait: %w", err)
@@ -151,10 +151,10 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 			listenerFD:    -1,
 			wakeupReadFD:  wakeupPair[0],
 			wakeupWriteFD: wakeupPair[1],
-			handoffs:      make(chan plainAcceptedConn, ioUringConnsPerShard),
+			handoffs:      make(chan plainAcceptedConn, ioUringInitialConnsPerShard),
 			ring:          ring,
 			server:        s,
-			connections:   make([]plainWorkerConn, ioUringConnsPerShard),
+			connections:   make([]plainWorkerConn, ioUringInitialConnsPerShard),
 			freeHead:      0,
 		}
 		if workerID < acceptShards {
@@ -178,28 +178,29 @@ func (backend *plainUringBackend) start() {
 			err := worker.run(backend)
 			if err != nil {
 				log.Printf("[WARN] io_uring plain worker %d exited: %v", worker.id, err)
+				backend.errCh <- err
 			}
-			backend.errCh <- err
 		}()
 	}
+}
+
+func (backend *plainUringBackend) stop() {
+	for _, ln := range backend.server.listeners {
+		_ = ln.Close()
+	}
+	for _, worker := range backend.workers {
+		worker.signalWake()
+	}
+	backend.wg.Wait()
 }
 
 func (backend *plainUringBackend) wait() error {
 	select {
 	case <-backend.server.done:
-		for _, worker := range backend.workers {
-			worker.signalWake()
-		}
-		backend.wg.Wait()
+		backend.stop()
 		return nil
 	case err := <-backend.errCh:
-		for _, ln := range backend.server.listeners {
-			_ = ln.Close()
-		}
-		for _, worker := range backend.workers {
-			worker.signalWake()
-		}
-		backend.wg.Wait()
+		backend.stop()
 		return err
 	}
 }
@@ -243,22 +244,47 @@ func listenerFD(listener net.Listener) (int, error) {
 	return fd, nil
 }
 
+func (worker *plainUringWorker) initConnectionSlot(index int, nextFree int32) {
+	conn := &worker.connections[index]
+	conn.index = int32(index)
+	conn.fd = -1
+	conn.req.Headers = make([][2]string, 0, 16)
+	conn.req.Body = make([]byte, 0, 1024)
+	conn.req.Proto = "HTTP/1.1"
+	conn.resp.Headers = make([][2]string, 0, 8)
+	conn.resp.body = make([]byte, 0, 4096)
+	conn.nextFree = nextFree
+}
+
 func (worker *plainUringWorker) initConnections() {
 	for index := range worker.connections {
-		conn := &worker.connections[index]
-		conn.index = int32(index)
-		conn.fd = -1
-		conn.req.Headers = make([][2]string, 0, 16)
-		conn.req.Body = make([]byte, 0, 1024)
-		conn.req.Proto = "HTTP/1.1"
-		conn.resp.Headers = make([][2]string, 0, 8)
-		conn.resp.body = make([]byte, 0, 4096)
+		nextFree := int32(index + 1)
 		if index == len(worker.connections)-1 {
-			conn.nextFree = -1
-		} else {
-			conn.nextFree = int32(index + 1)
+			nextFree = -1
 		}
+		worker.initConnectionSlot(index, nextFree)
 	}
+}
+
+func (worker *plainUringWorker) growConnections() {
+	oldLen := len(worker.connections)
+	growBy := oldLen
+	if growBy < ioUringInitialConnsPerShard {
+		growBy = ioUringInitialConnsPerShard
+	}
+	if growBy == 0 {
+		growBy = ioUringInitialConnsPerShard
+	}
+	prevHead := worker.freeHead
+	worker.connections = append(worker.connections, make([]plainWorkerConn, growBy)...)
+	for index := oldLen; index < len(worker.connections); index++ {
+		nextFree := int32(index + 1)
+		if index == len(worker.connections)-1 {
+			nextFree = prevHead
+		}
+		worker.initConnectionSlot(index, nextFree)
+	}
+	worker.freeHead = int32(oldLen)
 }
 
 func (worker *plainUringWorker) run(backend *plainUringBackend) error {
@@ -849,7 +875,10 @@ func (worker *plainUringWorker) maybeInitHTTP2(conn *plainWorkerConn) bool {
 
 func (worker *plainUringWorker) acquireConnection() *plainWorkerConn {
 	if worker.freeHead < 0 {
-		return nil
+		worker.growConnections()
+		if worker.freeHead < 0 {
+			return nil
+		}
 	}
 	index := worker.freeHead
 	conn := &worker.connections[index]
@@ -953,7 +982,7 @@ func (worker *plainUringWorker) armWake() error {
 }
 
 func (worker *plainUringWorker) queueWake() error {
-	return worker.ring.prepReadvUser(worker.wakeupReadFD, &worker.wakeupIovec, plainEncodeUserData(plainUringOpWake, 0, 0))
+	return worker.ring.prepReadUser(worker.wakeupReadFD, worker.wakeupBuf[:], plainEncodeUserData(plainUringOpWake, 0, 0))
 }
 
 func (worker *plainUringWorker) signalWake() {
@@ -1030,8 +1059,8 @@ func (worker *plainUringWorker) parkUntilWork() error {
 }
 
 func openWakePipeALOS() ([2]int, error) {
-	fds := []int{0, 0}
-	if err := syscall.Pipe2(fds, syscall.O_CLOEXEC); err != nil {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
 		return [2]int{}, err
 	}
 	if err := syscall.SetNonblock(fds[1], true); err != nil {

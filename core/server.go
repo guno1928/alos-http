@@ -108,8 +108,8 @@ func DefaultConfig() Config {
 		ServerName:        "ALOS",
 		CompressLevel:     6,
 		CompressMinSize:   256,
-		WorkerCount:       0,
-		Listeners:         0,
+		WorkerCount:       12,
+		Listeners:         1,
 		Debug:             false,
 		LogRequests:       true,
 		ShutdownTimeout:   30 * time.Second,
@@ -351,9 +351,10 @@ func (s *Server) ListenAndServeTLS() error {
 		return err
 	}
 	defer backend.closeResources()
-	log.Printf("[INFO] io_uring TLS worker mode active on Linux amd64: workers=%d accept-shards=%d conns-per-shard=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringConnsPerShard)
+	log.Printf("[INFO] io_uring TLS worker mode active on Linux amd64: workers=%d accept-shards=%d initial-conn-pool=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringInitialConnsPerShard)
 	backend.start()
 	if err := s.startHTTPRedirect(); err != nil {
+		backend.stop()
 		return err
 	}
 	return backend.wait()

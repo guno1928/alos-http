@@ -405,6 +405,7 @@ func probeIOUringProvidedBufferRingDetailed() ioUringCapabilityProbe {
 	if err := bufs.register(ring); err != nil {
 		return ioUringCapabilityProbe{err: err}
 	}
+	defer bufs.unregister(ring)
 	return ioUringCapabilityProbe{ok: true}
 }
 
@@ -433,6 +434,7 @@ func probeIOUringRecvMultishotDetailed() ioUringCapabilityProbe {
 	if err := bufs.register(ring); err != nil {
 		return ioUringCapabilityProbe{err: err}
 	}
+	defer bufs.unregister(ring)
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return ioUringCapabilityProbe{err: err}
@@ -461,6 +463,37 @@ func probeIOUringRecvMultishotDetailed() ioUringCapabilityProbe {
 	}
 	if cqe.Flags&ioUringCqeBuffer != 0 {
 		bufs.recycle(cqeBufferID(cqe.Flags))
+	}
+	return ioUringCapabilityProbe{ok: true}
+}
+
+func probeIOUringTLSRecvPathDetailed(workers int) ioUringCapabilityProbe {
+	if workers < 1 {
+		workers = 1
+	}
+	for workerID := 0; workerID < workers; workerID++ {
+		ring, err := newOwnedIOUring(tlsWorkerRingEntries)
+		if err != nil {
+			return ioUringCapabilityProbe{err: err}
+		}
+		bufs, err := newIOUringBufferRing(tlsRecvBufRingSize, tlsRecvBufSize, uint16(workerID+1))
+		if err != nil {
+			ring.close()
+			return ioUringCapabilityProbe{err: err}
+		}
+		if err := ring.enable(); err != nil {
+			bufs.close()
+			ring.close()
+			return ioUringCapabilityProbe{err: err}
+		}
+		if err := bufs.register(ring); err != nil {
+			bufs.close()
+			ring.close()
+			return ioUringCapabilityProbe{err: err}
+		}
+		_ = bufs.unregister(ring)
+		bufs.close()
+		ring.close()
 	}
 	return ioUringCapabilityProbe{ok: true}
 }

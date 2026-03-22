@@ -140,14 +140,35 @@ func (s *Server) startHTTPRedirect() error {
 	if err != nil {
 		return err
 	}
-	if err := s.tryServeWithIOUringRedirect(listeners); err != nil {
-		for _, ln := range listeners {
+	go func(items []net.Listener) {
+		<-s.done
+		for _, ln := range items {
 			_ = ln.Close()
 		}
-		return err
+	}(listeners)
+	for _, ln := range listeners {
+		ln := ln
+		go s.serveHTTPRedirectListener(ln)
 	}
 	log.Printf("[HTTP] %d redirect listener(s) started on %s", len(listeners), addr)
 	return nil
+}
+
+func (s *Server) serveHTTPRedirectListener(listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if s.doneClosed() || isIOUringAcceptShutdownError(err) {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return
+		}
+		go s.serveHTTPRedirectConn(conn)
+	}
 }
 
 func (s *Server) serveHTTPRedirectConn(conn net.Conn) {

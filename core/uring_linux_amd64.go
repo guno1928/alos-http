@@ -25,6 +25,7 @@ const (
 	ioUringEnterRegistered           = 1 << 4
 	ioUringRegisterSyscall           = 427
 	ioUringOpReadv                   = 1
+	ioUringOpRead                    = 22
 	ioUringOpAccept                  = 13
 	ioUringOpAsyncCancel             = 14
 	ioUringOpClose                   = 19
@@ -60,6 +61,7 @@ const (
 	ioUringRegisterRingFDs           = 20
 	ioUringUnregisterRingFDs         = 21
 	ioUringRegisterPbufRing          = 22
+	ioUringUnregisterPbufRing        = 23
 	ioUringRegisterSyncCancel        = 24
 	ioUringAsyncCancelAll            = 1 << 0
 	ioUringAsyncCancelFD             = 1 << 1
@@ -68,7 +70,7 @@ const (
 	ioUringSendZCReportUsage         = 1 << 3
 	sockCloexec                      = 0x80000
 	sockNonblock                     = 0x800
-	ioUringConnsPerShard             = 600
+	ioUringInitialConnsPerShard      = 600
 	ioUringAcceptDepth               = 16
 	ioUringConnSlotsPerLN            = 2048
 	ioUringSendZCThreshold           = 32 << 10
@@ -328,7 +330,7 @@ func newIOUringAcceptor(listener net.Listener, slots chan struct{}) (*ioUringAcc
 		return nil, errors.New("listener fd unavailable")
 	}
 
-	ring, err := newOwnedIOUring(ioUringEntries)
+	ring, err := newIOUring(ioUringEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -961,6 +963,19 @@ func (ring *ioUring) prepRecv(fd int, buf []byte) error {
 	return ring.prepRecvWithFlags(fd, buf, false)
 }
 
+func (ring *ioUring) prepReadUser(fd int, buf []byte, userData uint64) error {
+	sqe, err := ring.getSqe()
+	if err != nil {
+		return err
+	}
+	sqe.Opcode = ioUringOpRead
+	sqe.FD = int32(fd)
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
+	sqe.Len = uint32(len(buf))
+	sqe.UserData = userData
+	return nil
+}
+
 func (ring *ioUring) prepRecvWithFlags(fd int, buf []byte, pollFirst bool) error {
 	sqe, err := ring.getSqe()
 	if err != nil {
@@ -1019,12 +1034,7 @@ func (ring *ioUring) registerResult(op uint32, arg uintptr, nrArgs uint32) (int,
 	if ring == nil || ring.fd < 0 {
 		return 0, syscall.EBADF
 	}
-	fd := ring.fd
-	if ring.registeredRing && ring.regRegRing && ring.enterFD >= 0 {
-		op |= ioUringRegisterUseRegisteredRing
-		fd = ring.enterFD
-	}
-	ret, _, errno := syscall.Syscall6(ioUringRegisterSyscall, uintptr(fd), uintptr(op), arg, uintptr(nrArgs), 0, 0)
+	ret, _, errno := syscall.Syscall6(ioUringRegisterSyscall, uintptr(ring.fd), uintptr(op), arg, uintptr(nrArgs), 0, 0)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -1132,6 +1142,15 @@ func (ring *ioUring) unregisterRingFD() error {
 		ring.enterFD = ring.fd
 	}
 	return nil
+}
+
+func (ring *ioUring) unregisterPbufRing(bgid uint16) error {
+	if ring == nil || ring.fd < 0 {
+		return syscall.EBADF
+	}
+	bgidCopy := bgid
+	_, err := ring.registerResult(ioUringUnregisterPbufRing, uintptr(unsafe.Pointer(&bgidCopy)), 1)
+	return err
 }
 
 func (ring *ioUring) supportsRecvSendBundle() bool {

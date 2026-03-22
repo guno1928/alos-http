@@ -112,8 +112,8 @@ type FineTuneOptions struct {
 
 func DefaultFineTuneOptions() FineTuneOptions {
 	return FineTuneOptions{
-		WorkerCandidates:   []int{12, 24, 32, 42},
-		ListenerCandidates: []int{1, 10},
+		WorkerCandidates:   []int{12, 24, 32, 42, 52, 62},
+		ListenerCandidates: []int{1, 5, 10},
 		Scenarios: []FineTuneScenario{
 			{Name: "30 connections / 30 threads", Connections: 30, Threads: 30, Duration: 6 * time.Second},
 			{Name: "500 connections / 50 threads", Connections: 500, Threads: 50, Duration: 6 * time.Second},
