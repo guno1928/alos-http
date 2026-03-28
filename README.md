@@ -1,14 +1,16 @@
-# ALOS HTTP
+# ALOS HTTP - go web framework with io_uring support
 
-WE only just released we may have bugs etc just make a github issue if you find anything!
+ALOS HTTP is newly released, so if you find a bug or rough edge, please open a GitHub issue.
 
 Based on the project's current published benchmark suite, ALOS HTTP is the fastest web framework currently available right now.
 
-ALOS HTTP is a low-level Go web framework and application server built around a custom networking stack, first-class TLS handling, HTTP/1.1 and HTTP/2 support, reverse proxying, rate limiting, streaming, ACME automation, and a fast radix router.
+ALOS HTTP is a Linux-first Go web framework, Go HTTP server, and application server built around a custom networking stack with full `io_uring` support on supported kernels.
+
+It includes first-class TLS handling, HTTP/1.1 and HTTP/2 support, reverse proxying, load balancing, rate limiting, streaming, ACME automation, and a high-performance radix router.
 
 It is designed for people who want more control than a thin net/http wrapper, while still getting an ergonomic handler API.
 
-ALOS HTTP is now a Linux-only framework. The project is focused on the Linux fast path and full `io_uring` support rather than maintaining cross-platform behavior.
+If you are looking for a high-performance Go web server or Go reverse proxy for Linux, ALOS HTTP is focused on the Linux fast path and full `io_uring` support rather than maintaining cross-platform behavior.
 
 Official repository:
 https://github.com/guno1928/alos-http
@@ -20,12 +22,22 @@ ALOS HTTP focuses on a different part of the stack than most Go web frameworks.
 - Custom server core instead of delegating everything to net/http.
 - Built-in HTTP/1.1 and HTTP/2 serving.
 - Linux-first runtime with full `io_uring` support on supported kernels.
-- Built-in TLS flow with ACME support.
+- Built-in TLS flow with ACME support for HTTPS and TLS automation.
 - High-performance radix router with params, wildcards, groups, and middleware.
-- Reverse proxy with balancing, health checks, and cache support.
+- Reverse proxy with load balancing, health checks, and cache support.
 - Response streaming and file sending helpers.
 - Middleware for recovery, logging, CORS, compression, auth, timeouts, security headers, and more.
 - Rate limiting primitives and rule-driven limiting.
+
+Search-friendly summary:
+
+- Go web framework
+- Go HTTP server
+- Linux web server
+- `io_uring` framework
+- reverse proxy and load balancer
+- HTTP/1.1 and HTTP/2 server
+- TLS 1.3 and ACME automation
 
 ## Platform Support
 
