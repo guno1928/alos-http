@@ -621,19 +621,43 @@ func (hc *H2Conn) handleContinuation(f *H2Frame) {
 }
 
 func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, endStream bool) {
+	prevLastStream := hc.lastStreamID.Load()
+	if streamID%2 == 0 || (prevLastStream > 0 && streamID <= prevLastStream) {
+		hc.sendGoAway(H2ErrProtocol)
+		return
+	}
+
 	if endStream && hc.server.h2RootFast.enabled && matchIndexedH2FastRootHeaderBlock(headerBlock) {
-		prevLastStream := hc.lastStreamID.Load()
-		if streamID%2 == 0 || (prevLastStream > 0 && streamID <= prevLastStream) {
-			hc.sendGoAway(H2ErrProtocol)
+		if hc.server.tryAcquireRequestSlot() {
+			hc.lastStreamID.Store(streamID)
+			if hc.server.logRequests.Load() {
+				log.Printf("[H2] stream %d: GET / (fast)", streamID)
+			}
+			Stats.TotalReqs.Add(1)
+			hc.writeFastH2RootResponse(streamID)
+			hc.server.releaseRequestSlot()
 			return
 		}
-		hc.lastStreamID.Store(streamID)
-		if hc.server.logRequests.Load() {
-			log.Printf("[H2] stream %d: GET / (fast)", streamID)
+	}
+
+	if endStream && hc.server.h2RootFast.enabled {
+		meta, ok, err := hc.decoder.DecodeFastRootRequest(headerBlock)
+		if err != nil {
+			hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrCompression))
+			return
 		}
-		Stats.TotalReqs.Add(1)
-		hc.writeFastH2RootResponse(streamID)
-		return
+		if ok {
+			if hc.server.tryAcquireRequestSlot() {
+				hc.lastStreamID.Store(streamID)
+				if hc.server.logRequests.Load() {
+					log.Printf("[H2] stream %d: %s %s (fast meta)", streamID, meta.method, meta.path)
+				}
+				Stats.TotalReqs.Add(1)
+				hc.writeFastH2RootResponse(streamID)
+				hc.server.releaseRequestSlot()
+				return
+			}
+		}
 	}
 
 	headers, meta, err := hc.decoder.DecodeIntoRequest(hc.headersBuf[:0], headerBlock)
@@ -647,21 +671,18 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrEnhanceYourCalm))
 		return
 	}
-
-	prevLastStream := hc.lastStreamID.Load()
-	if streamID%2 == 0 || (prevLastStream > 0 && streamID <= prevLastStream) {
-		hc.sendGoAway(H2ErrProtocol)
-		return
-	}
 	hc.lastStreamID.Store(streamID)
 
 	if endStream && hc.server.h2RootFast.enabled && meta.method == "GET" && meta.path == "/" {
-		if hc.server.logRequests.Load() {
-			log.Printf("[H2] stream %d: %s %s (fast)", streamID, meta.method, meta.path)
+		if hc.server.tryAcquireRequestSlot() {
+			if hc.server.logRequests.Load() {
+				log.Printf("[H2] stream %d: %s %s (fast)", streamID, meta.method, meta.path)
+			}
+			Stats.TotalReqs.Add(1)
+			hc.writeFastH2RootResponse(streamID)
+			hc.server.releaseRequestSlot()
+			return
 		}
-		Stats.TotalReqs.Add(1)
-		hc.writeFastH2RootResponse(streamID)
-		return
 	}
 
 	if int(hc.activeStreams.Load()) >= H2MaxConcurrentStream {
@@ -820,6 +841,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	req.StreamID = stream.ID
 	req.IsH2 = true
 	req.StreamWriter = hc.server.NewH2StreamWriter(stream.ID, hc, &stream.Window)
+	bindRequestMethodToStreamWriter(req.StreamWriter, req.Method)
 	req.Host = stream.Auth
 	req.cachedHost = stream.Auth
 	req.headerCacheMask = headerCacheHost
@@ -829,11 +851,12 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	resp := ResponsePool.Get().(*Response)
 	resp.Reset()
 	resp.SetSW(req.StreamWriter)
+	resp.lazyReq = req
 
 	if hc.server.fastDispatch.Load() {
 		handler := hc.server.Router.Lookup(req.Method, req.Path, req)
 		handler(req, resp)
-		if hc.server.config.MaxWriteSize > 0 && int64(resp.BodyLen()) > hc.server.config.MaxWriteSize {
+		if hc.server.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > hc.server.config.MaxWriteSize {
 			resp.Reset()
 			resp.Status(500).String("Response Too Large")
 		}
@@ -917,90 +940,105 @@ func (hc *H2Conn) writeFastH2RootResponse(streamID uint32) {
 	hc.enqueueWriteOwned(buf, fbp, writeReleaseH2Frame)
 }
 
+func (hc *H2Conn) reserveWriteWindow(stream *H2Stream, desired int) int {
+	if desired <= 0 {
+		return 0
+	}
+	granted := desired
+	waitStart := time.Now()
+	hc.flowCond.L.Lock()
+	for {
+		connAvail := hc.connWindow.Load()
+		avail := connAvail
+		if stream != nil {
+			streamAvail := stream.Window.Load()
+			if streamAvail < avail {
+				avail = streamAvail
+			}
+		}
+		if avail > 0 {
+			if int64(granted) > avail {
+				granted = int(avail)
+			}
+			break
+		}
+		select {
+		case <-hc.done:
+			hc.flowCond.L.Unlock()
+			return 0
+		default:
+		}
+		if time.Since(waitStart) > 30*time.Second {
+			hc.flowCond.L.Unlock()
+			return 0
+		}
+		hc.flowCond.Wait()
+	}
+	hc.flowCond.L.Unlock()
+
+	if hc.server.connLimiter != nil {
+		hc.server.connLimiter.ThrottleDownload(int64(granted))
+	}
+	if hc.server.globalLimiter != nil && hc.server.globalLimiter.Download != nil {
+		hc.server.globalLimiter.Download.Wait(int64(granted))
+	}
+
+	hc.connWindow.Add(-int64(granted))
+	if stream != nil {
+		stream.Window.Add(-int64(granted))
+	}
+	return granted
+}
+
 func (hc *H2Conn) writeH2Response(streamID uint32, resp *Response) {
 	bp := MediumBufPool.Get().(*[]byte)
 
 	enc := HpackEncoder{}
 	enc.Reset((*bp)[:0])
-	enc.EncodeStatus(resp.StatusCode)
-
-	if resp.ContentType != "" {
-		enc.EncodeHeader("content-type", resp.ContentType)
-	}
-	var clBuf [20]byte
-	clStr := appendUint(clBuf[:0], int64(resp.BodyLen()))
-	enc.EncodeHeader("content-length", UnsafeString(clStr))
-	for i := range resp.Headers {
-		enc.EncodeHeader(resp.Headers[i][0], resp.Headers[i][1])
-	}
-	enc.EncodeHeader("server", "ALOS")
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers)
 
 	headerPayload := enc.Buf
 
-	body := resp.bodyBytesUnsafe()
+	body := resp.transmittedBodyBytes()
 	stream, _ := hc.streams.Load(streamID)
 	fbp := H2FrameBufPool.Get().(*[]byte)
 	frameBuf := (*fbp)[:0]
+	queuedOwned := false
 
 	if len(body) == 0 {
 		frameBuf = appendH2Frame(frameBuf, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, headerPayload)
 		hc.enqueueWriteOwned(frameBuf, fbp, writeReleaseH2Frame)
+		queuedOwned = true
 	} else {
 		maxFrame := int(hc.maxFrameSize.Load())
-		headerFrame := appendH2Frame(frameBuf, H2FrameHeaders, H2FlagEndHeaders, streamID, headerPayload)
-		hc.enqueueWriteOwned(headerFrame, fbp, writeReleaseH2Frame)
+		firstChunkLen := len(body)
+		if firstChunkLen > maxFrame {
+			firstChunkLen = maxFrame
+		}
+		granted := hc.reserveWriteWindow(stream, firstChunkLen)
+		if granted > 0 {
+			firstChunk := body[:granted]
+			body = body[granted:]
+			flags := byte(0)
+			if len(body) == 0 {
+				flags = H2FlagEndStream
+			}
+			frameBuf = appendH2Frame(frameBuf, H2FrameHeaders, H2FlagEndHeaders, streamID, headerPayload)
+			frameBuf = appendH2Frame(frameBuf, H2FrameData, flags, streamID, firstChunk)
+			hc.enqueueWriteOwned(frameBuf, fbp, writeReleaseH2Frame)
+			queuedOwned = true
+		}
 		for len(body) > 0 {
 			chunk := body
 			if len(chunk) > maxFrame {
 				chunk = chunk[:maxFrame]
 			}
-
-			waitStart := time.Now()
-			hc.flowCond.L.Lock()
-			for {
-				connAvail := hc.connWindow.Load()
-				avail := connAvail
-				if stream != nil {
-					streamAvail := stream.Window.Load()
-					if streamAvail < avail {
-						avail = streamAvail
-					}
-				}
-				if avail > 0 {
-					if int64(len(chunk)) > avail {
-						chunk = chunk[:int(avail)]
-					}
-					break
-				}
-				select {
-				case <-hc.done:
-					hc.flowCond.L.Unlock()
-					goto writeEnd
-				default:
-				}
-				if time.Since(waitStart) > 30*time.Second {
-					hc.flowCond.L.Unlock()
-					goto writeEnd
-				}
-				hc.flowCond.Wait()
+			granted := hc.reserveWriteWindow(stream, len(chunk))
+			if granted <= 0 {
+				goto writeEnd
 			}
-			hc.flowCond.L.Unlock()
-
-			body = body[len(chunk):]
-
-			if hc.server.connLimiter != nil {
-				hc.server.connLimiter.ThrottleDownload(int64(len(chunk)))
-			}
-			if hc.server.globalLimiter != nil {
-				if hc.server.globalLimiter.Download != nil {
-					hc.server.globalLimiter.Download.Wait(int64(len(chunk)))
-				}
-			}
-
-			hc.connWindow.Add(-int64(len(chunk)))
-			if stream != nil {
-				stream.Window.Add(-int64(len(chunk)))
-			}
+			chunk = body[:granted]
+			body = body[granted:]
 
 			flags := byte(0)
 			if len(body) == 0 {
@@ -1013,4 +1051,8 @@ func (hc *H2Conn) writeH2Response(streamID uint32, resp *Response) {
 writeEnd:
 	*bp = enc.Buf[:0]
 	MediumBufPool.Put(bp)
+	if !queuedOwned {
+		*fbp = frameBuf[:0]
+		H2FrameBufPool.Put(fbp)
+	}
 }

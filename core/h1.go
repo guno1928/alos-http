@@ -80,28 +80,32 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 
 			if fastRoot {
 				if _, consumed, closeConn, ok := s.matchPlainRootFastRequest(appBuf); ok {
-					localReqs++
-					if localReqs&63 == 0 {
-						Stats.TotalReqs.Add(64)
-						localReqs = 0
+					if s.tryAcquireRequestSlot() {
+						localReqs++
+						if localReqs&63 == 0 {
+							Stats.TotalReqs.Add(64)
+							localReqs = 0
+						}
+						payload := s.plainRootFast.getKeepAliveTLS
+						if closeConn {
+							payload = s.plainRootFast.getCloseTLS
+						}
+						outBuf, err = encryptInnerPayloadFast(conn, writer, payload, overhead, outBuf)
+						s.releaseRequestSlot()
+						if err != nil {
+							return
+						}
+						if closeConn {
+							SendCloseNotify(conn, writer)
+							return
+						}
+						if consumed == len(appBuf) {
+							appBuf = appBuf[:0]
+						} else {
+							appBuf = appBuf[consumed:]
+						}
+						continue
 					}
-					payload := s.plainRootFast.getKeepAliveTLS
-					if closeConn {
-						payload = s.plainRootFast.getCloseTLS
-					}
-					if outBuf, err = encryptInnerPayloadFast(conn, writer, payload, overhead, outBuf); err != nil {
-						return
-					}
-					if closeConn {
-						SendCloseNotify(conn, writer)
-						return
-					}
-					if consumed == len(appBuf) {
-						appBuf = appBuf[:0]
-					} else {
-						appBuf = appBuf[consumed:]
-					}
-					continue
 				}
 			}
 
@@ -167,7 +171,7 @@ func (s *Server) ServeH1(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 			if fastDispatch {
 				handler := s.Router.Lookup(req.Method, req.Path, req)
 				handler(req, resp)
-				if maxWrite > 0 && int64(resp.BodyLen()) > maxWrite {
+				if maxWrite > 0 && int64(resp.transmittedBodyLen()) > maxWrite {
 					resp.resetFastH1()
 					resp.Status(500).String("Response Too Large")
 				}
@@ -513,6 +517,7 @@ func init() {
 func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
+	headerBodyLen := resp.headerContentLength()
 
 	buf = appendStatusLine(buf, resp.StatusCode)
 
@@ -526,9 +531,11 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 		}
 	}
 
-	buf = append(buf, "Content-Length: "...)
-	buf = appendUint(buf, int64(resp.BodyLen()))
-	buf = append(buf, '\r', '\n')
+	if headerBodyLen >= 0 {
+		buf = append(buf, "Content-Length: "...)
+		buf = appendUint(buf, int64(headerBodyLen))
+		buf = append(buf, '\r', '\n')
+	}
 
 	for i := range resp.Headers {
 		buf = append(buf, resp.Headers[i][0]...)
@@ -539,7 +546,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 
 	buf = append(buf, connKeepAlive...)
 	buf = append(buf, '\r', '\n')
-	buf = resp.appendBody(buf)
+	buf = resp.appendTransmittedBody(buf)
 
 	*bp = buf
 	return buf, bp
@@ -547,8 +554,9 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 
 func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	const maxInner = MaxRecordPayload - 1
-	body := resp.bodyBytesUnsafe()
+	body := resp.transmittedBodyBytes()
 	bodyLen := len(body)
+	headerBodyLen := resp.headerContentLength()
 	if bodyLen+256 > maxInner {
 		respData, respBP := BuildH1Response(resp)
 		err := WriteAppData(conn, writer, respData)
@@ -568,9 +576,11 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 			inner = append(inner, '\r', '\n')
 		}
 	}
-	inner = append(inner, "Content-Length: "...)
-	inner = appendUint(inner, int64(bodyLen))
-	inner = append(inner, '\r', '\n')
+	if headerBodyLen >= 0 {
+		inner = append(inner, "Content-Length: "...)
+		inner = appendUint(inner, int64(headerBodyLen))
+		inner = append(inner, '\r', '\n')
+	}
 	for i := range resp.Headers {
 		inner = append(inner, resp.Headers[i][0]...)
 		inner = append(inner, ':', ' ')

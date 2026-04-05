@@ -5,9 +5,12 @@ import (
 	"compress/gzip"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/andybalholm/brotli"
 )
 
 // CacheRule configures caching for a specific path prefix. If PathPrefix is empty
@@ -143,12 +146,9 @@ func (pc *ProxyCache) Stop() {
 }
 
 func (pc *ProxyCache) buildKey(method, host, path string) string {
-	if idx := indexByte(path, '?'); idx >= 0 {
-		path = path[:idx]
-	}
-	path = ToLowerASCII(path)
+	host = normalizeCertDomain(host)
 
-	n := len(method) + 1 + len(host) + len(path)
+	n := len(method) + 2 + len(host) + len(path)
 	var stackBuf [256]byte
 	var buf []byte
 	if n <= len(stackBuf) {
@@ -167,8 +167,107 @@ func (pc *ProxyCache) buildKey(method, host, path string) string {
 	buf = append(buf, method...)
 	buf = append(buf, '|')
 	buf = append(buf, host...)
+	buf = append(buf, '|')
 	buf = append(buf, path...)
 	return string(buf)
+}
+
+func proxyCacheRequestAllowed(req *Request) bool {
+	if req == nil {
+		return false
+	}
+	if req.Header("authorization") != "" || req.Header("cookie") != "" {
+		return false
+	}
+	if cacheControlDisablesLookup(req.Header("cache-control")) || containsTokenFold(req.Header("pragma"), "no-cache") {
+		return false
+	}
+	return true
+}
+
+func proxyCacheResponseAllowed(headers [][2]string) bool {
+	for i := range headers {
+		name := ToLowerASCII(headers[i][0])
+		value := headers[i][1]
+		switch name {
+		case "set-cookie":
+			return false
+		case "cache-control":
+			if cacheControlDisablesStorage(value) {
+				return false
+			}
+		case "pragma":
+			if containsTokenFold(value, "no-cache") {
+				return false
+			}
+		case "vary":
+			if !cacheVarySupported(value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func cacheControlDisablesLookup(value string) bool {
+	for _, token := range splitHeaderTokens(value) {
+		name, arg := splitHeaderDirective(token)
+		switch name {
+		case "no-cache", "no-store":
+			return true
+		case "max-age":
+			if arg == "0" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cacheControlDisablesStorage(value string) bool {
+	for _, token := range splitHeaderTokens(value) {
+		name, _ := splitHeaderDirective(token)
+		switch name {
+		case "no-cache", "no-store", "private":
+			return true
+		}
+	}
+	return false
+}
+
+func cacheVarySupported(value string) bool {
+	for _, token := range splitHeaderTokens(value) {
+		if token == "*" {
+			return false
+		}
+		if token != "accept-encoding" {
+			return false
+		}
+	}
+	return true
+}
+
+func splitHeaderTokens(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := parts[:0]
+	for _, part := range parts {
+		trimmed := ToLowerASCII(trimASCIISpace(part))
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func splitHeaderDirective(token string) (string, string) {
+	if idx := indexByte(token, '='); idx >= 0 {
+		return trimASCIISpace(token[:idx]), trimASCIISpace(token[idx+1:])
+	}
+	return trimASCIISpace(token), ""
 }
 
 func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, statusCode int) (time.Duration, bool) {
@@ -366,8 +465,9 @@ func (pc *ProxyCache) PurgeAll() {
 }
 
 func (pc *ProxyCache) PurgeDomain(domain string) int64 {
-	prefix1 := "GET|" + domain
-	prefix2 := "HEAD|" + domain
+	domain = normalizeCertDomain(domain)
+	prefix1 := "GET|" + domain + "|"
+	prefix2 := "HEAD|" + domain + "|"
 	var purged int64
 	pc.entries.Range(func(key string, entry *cacheEntry) bool {
 		if hasPrefix(key, prefix1) || hasPrefix(key, prefix2) {
@@ -575,7 +675,35 @@ func decompressDeflate(data []byte) ([]byte, error) {
 }
 
 func decompressBrotli(data []byte) ([]byte, error) {
-	return data, nil
+	const maxDecompressedSize = 64 << 20
+	r := brotli.NewReader(newBytesReader(data))
+	bp := LargeBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	tmp := make([]byte, 8192)
+	for {
+		n, rerr := r.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			if len(buf) > maxDecompressedSize {
+				*bp = buf[:0]
+				LargeBufPool.Put(bp)
+				return nil, ErrBodyTooLarge
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			*bp = buf[:0]
+			LargeBufPool.Put(bp)
+			return nil, rerr
+		}
+	}
+	result := make([]byte, len(buf))
+	copy(result, buf)
+	*bp = buf[:0]
+	LargeBufPool.Put(bp)
+	return result, nil
 }
 
 func removeContentEncoding(headers [][2]string) [][2]string {

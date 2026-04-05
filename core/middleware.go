@@ -84,6 +84,13 @@ type corsSnapshot struct {
 	originMap   map[string]struct{}
 }
 
+type trustedProxyMatcher struct {
+	active   bool
+	trustAll bool
+	nets     []*net.IPNet
+	ips      []net.IP
+}
+
 func newCORSSnapshot(cfg CORSConfig) *corsSnapshot {
 	snap := &corsSnapshot{
 		origins:     strings.Join(cfg.AllowOrigins, ", "),
@@ -120,6 +127,75 @@ func NewCORSEngine(cfg CORSConfig) *CORSEngine {
 
 func (ce *CORSEngine) Update(cfg CORSConfig) {
 	ce.snapshot.Store(newCORSSnapshot(cfg))
+}
+
+func newTrustedProxyMatcher(trustedProxies []string, trustAllWhenEmpty bool) trustedProxyMatcher {
+	matcher := trustedProxyMatcher{}
+	if len(trustedProxies) == 0 {
+		matcher.active = trustAllWhenEmpty
+		matcher.trustAll = trustAllWhenEmpty
+		return matcher
+	}
+	matcher.active = true
+	for _, p := range trustedProxies {
+		if _, cidr, err := net.ParseCIDR(p); err == nil {
+			matcher.nets = append(matcher.nets, cidr)
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			matcher.ips = append(matcher.ips, ip)
+		}
+	}
+	return matcher
+}
+
+func (m trustedProxyMatcher) allows(remoteAddr string) bool {
+	if !m.active {
+		return false
+	}
+	if m.trustAll {
+		return true
+	}
+	host := extractIP(remoteAddr)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range m.nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	for _, tip := range m.ips {
+		if tip.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
+	if req == nil || !matcher.allows(req.RemoteAddr) {
+		return
+	}
+	if xff := req.Header("x-forwarded-for"); xff != "" {
+		var ip string
+		if comma := indexByte(xff, ','); comma > 0 {
+			ip = trimASCIISpace(xff[:comma])
+		} else {
+			ip = trimASCIISpace(xff)
+		}
+		if isValidIP(ip) {
+			req.RemoteAddr = ip
+			return
+		}
+	}
+	if xri := req.Header("x-real-ip"); xri != "" {
+		ip := trimASCIISpace(xri)
+		if isValidIP(ip) {
+			req.RemoteAddr = ip
+		}
+	}
 }
 
 func (ce *CORSEngine) Config() CORSConfig {
@@ -342,6 +418,15 @@ func init() {
 //
 //	s.Router.Use(core.Compress(core.CompressConfig{Level: 6, MinSize: 512}))
 func Compress(cfg CompressConfig) MiddlewareFunc {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(req *Request, resp *Response) {
+			next(req, resp)
+			applyConfiguredCompression(req, resp, cfg)
+		}
+	}
+}
+
+func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig) {
 	level := cfg.Level
 	if level < 1 || level > 9 {
 		level = 6
@@ -351,55 +436,61 @@ func Compress(cfg CompressConfig) MiddlewareFunc {
 		minSize = 256
 	}
 
-	return func(next HandlerFunc) HandlerFunc {
-		return func(req *Request, resp *Response) {
-			next(req, resp)
+	if resp == nil || req == nil || resp.IsStreamed() || resp.transmittedBodyLen() < minSize {
+		return
+	}
+	if responseHasHeader(resp.Headers, "content-encoding") {
+		return
+	}
 
-			if resp.IsStreamed() || resp.BodyLen() < minSize {
-				return
-			}
+	enc := negotiateEncoding(req.Header("accept-encoding"))
+	if enc == encodingNone {
+		return
+	}
 
-			enc := negotiateEncoding(req.Header("accept-encoding"))
-			if enc == encodingNone {
-				return
-			}
+	body := resp.transmittedBodyBytes()
+	bp := LargeBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
 
-			body := resp.bodyBytesUnsafe()
-			bp := LargeBufPool.Get().(*[]byte)
-			buf := (*bp)[:0]
+	switch enc {
+	case encodingGzip:
+		gw := gzipWriterPool[level].Get().(*gzip.Writer)
+		w := newBytesWriter(&buf)
+		gw.Reset(w)
+		_, _ = gw.Write(body)
+		_ = gw.Close()
+		gzipWriterPool[level].Put(gw)
+		w.buf = nil
+		bytesWriterPool.Put(w)
+		resp.SetHeaderUnsafe("Content-Encoding", "gzip")
+	case encodingDeflate:
+		fw := deflateWriterPool[level].Get().(*flate.Writer)
+		w := newBytesWriter(&buf)
+		fw.Reset(w)
+		_, _ = fw.Write(body)
+		_ = fw.Close()
+		deflateWriterPool[level].Put(fw)
+		w.buf = nil
+		bytesWriterPool.Put(w)
+		resp.SetHeaderUnsafe("Content-Encoding", "deflate")
+	}
 
-			switch enc {
-			case encodingGzip:
-				gw := gzipWriterPool[level].Get().(*gzip.Writer)
-				w := newBytesWriter(&buf)
-				gw.Reset(w)
-				gw.Write(body)
-				gw.Close()
-				gzipWriterPool[level].Put(gw)
-				w.buf = nil
-				bytesWriterPool.Put(w)
-				resp.SetHeaderUnsafe("Content-Encoding", "gzip")
-			case encodingDeflate:
-				fw := deflateWriterPool[level].Get().(*flate.Writer)
-				w := newBytesWriter(&buf)
-				fw.Reset(w)
-				fw.Write(body)
-				fw.Close()
-				deflateWriterPool[level].Put(fw)
-				w.buf = nil
-				bytesWriterPool.Put(w)
-				resp.SetHeaderUnsafe("Content-Encoding", "deflate")
-			}
+	if len(buf) > 0 && len(buf) < len(body) {
+		resp.SetBody(buf)
+		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
+	}
 
-			if len(buf) > 0 && len(buf) < len(body) {
-				resp.SetBody(buf)
-				resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
-			}
+	*bp = buf[:0]
+	LargeBufPool.Put(bp)
+}
 
-			*bp = buf[:0]
-			LargeBufPool.Put(bp)
+func responseHasHeader(headers [][2]string, name string) bool {
+	for i := range headers {
+		if EqualFoldASCII(headers[i][0], name) {
+			return true
 		}
 	}
+	return false
 }
 
 type encodingType uint8
@@ -480,8 +571,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			tmpResp.Reset()
 			tmpResp.lazyReq = &tmpReq
 
-			var mu sync.Mutex
-			timedOut := false
+			var timedOut atomic.Bool
 
 			go func() {
 				defer func() {
@@ -496,8 +586,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			defer timer.Stop()
 			select {
 			case <-done:
-				mu.Lock()
-				if !timedOut {
+				if !timedOut.Load() {
 					resp.StatusCode = tmpResp.StatusCode
 					resp.ContentType = tmpResp.ContentType
 					resp.SetBody(tmpResp.GetBody())
@@ -509,11 +598,8 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					}
 				}
 				ResponsePool.Put(tmpResp)
-				mu.Unlock()
 			case <-timer.C:
-				mu.Lock()
-				timedOut = true
-				mu.Unlock()
+				timedOut.Store(true)
 				go func() {
 					<-done
 					tmpResp.Reset()

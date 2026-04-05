@@ -1,7 +1,28 @@
 package core
 
+// HandlerFunc is the signature for request handlers. Every route handler and
+// middleware terminal receives a Request (the incoming HTTP request) and a
+// Response (the outgoing reply builder). Write the response by calling methods
+// on resp such as resp.Status(200).String("ok").
+//
+//	srv.Router.GET("/hello", func(req *core.Request, resp *core.Response) {
+//	    resp.Status(200).String("hello world")
+//	})
 type HandlerFunc func(req *Request, resp *Response)
 
+// MiddlewareFunc wraps a HandlerFunc to add behavior before or after the
+// downstream handler runs. Return a new HandlerFunc that calls next when
+// the request should continue down the chain.
+//
+//	func MyMiddleware() core.MiddlewareFunc {
+//	    return func(next core.HandlerFunc) core.HandlerFunc {
+//	        return func(req *core.Request, resp *core.Response) {
+//	            log.Println("before")
+//	            next(req, resp)
+//	            log.Println("after")
+//	        }
+//	    }
+//	}
 type MiddlewareFunc func(HandlerFunc) HandlerFunc
 
 type node struct {

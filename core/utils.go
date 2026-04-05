@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -21,11 +22,24 @@ var (
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp4", address)
+			return dialTCP4Direct(address, timeoutFromContext(ctx, 5*time.Second))
 		},
 	}
 )
+
+func timeoutFromContext(ctx context.Context, fallback time.Duration) time.Duration {
+	if ctx == nil {
+		return fallback
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 {
+			return remaining
+		}
+		return time.Millisecond
+	}
+	return fallback
+}
 
 func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
 	now := time.Now().Unix()
@@ -73,7 +87,15 @@ func DialTCP4(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 func dialTCP4Direct(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp4", addr, timeout)
+	conn, err := dialTCP4DirectIOUring(addr, timeout)
+	if err == nil {
+		return conn, nil
+	}
+	if !errors.Is(err, ErrIOUringRequired) {
+		return nil, err
+	}
+
+	conn, err = net.DialTimeout("tcp4", addr, timeout)
 	if err != nil {
 		return nil, err
 	}

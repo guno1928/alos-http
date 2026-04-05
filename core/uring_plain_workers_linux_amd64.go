@@ -3,8 +3,10 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"runtime"
@@ -49,6 +51,7 @@ type plainWorkerConn struct {
 	fd            int
 	generation    uint16
 	state         uint8
+	tracked       bool
 	closeDone     bool
 	writeBorrowed bool
 	writeZeroCopy bool
@@ -494,8 +497,11 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 	if conn.protocol == plainConnProtoH2 {
 		return worker.processHTTP2(conn)
 	}
+	if worker.shouldHandoffHTTP2(conn) {
+		return worker.handoffHTTP2(conn)
+	}
 	if worker.maybeInitHTTP2(conn) {
-		return worker.processHTTP2(conn)
+		return worker.queueRead(conn)
 	}
 	maxRead := worker.server.config.MaxReadSize
 	if maxRead <= 0 {
@@ -503,9 +509,12 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 	}
 	for {
 		if fastResp, consumed, closeConn, ok := worker.server.matchPlainRootFastRequest(conn.readBuf[:conn.readN]); ok {
-			conn.requestCount++
-			worker.bumpReqStats()
-			return worker.queuePrebuiltResponse(conn, fastResp, !closeConn, consumed)
+			if worker.server.tryAcquireRequestSlot() {
+				conn.requestCount++
+				worker.bumpReqStats()
+				worker.server.releaseRequestSlot()
+				return worker.queuePrebuiltResponse(conn, fastResp, !closeConn, consumed)
+			}
 		}
 
 		conn.req.resetFastH1()
@@ -549,6 +558,9 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		conn.resp.resetFastH1()
 		conn.req.StreamWriter = nil
 		conn.req.conn = nil
+		conn.req.attachConn = worker.newH1RequestConnAttacher(conn, consumed)
+		conn.req.connTakenOver = false
+		conn.req.hijackReadBuf = nil
 		conn.req.server = worker.server
 		conn.req.Host = conn.req.cachedHost
 		conn.req.RemoteAddr = conn.remoteAddr
@@ -560,12 +572,21 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		} else {
 			worker.server.dispatch(&conn.req, &conn.resp)
 		}
-		if conn.req.hijacked || conn.resp.IsStreamed() {
-			conn.resp.Reset()
-			conn.resp.Status(500).String("Streaming/Hijack unsupported in plain io_uring worker backend")
-			closeConn = true
+		if conn.req.connTakenOver {
+			if conn.req.hijacked {
+				worker.releaseConnection(conn)
+				return nil
+			}
+			if conn.resp.IsStreamed() {
+				releaseStreamWriter(conn.req.StreamWriter)
+			}
+			if conn.req.conn != nil {
+				_ = conn.req.conn.Close()
+			}
+			worker.releaseConnection(conn)
+			return nil
 		}
-		if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.BodyLen()) > worker.server.config.MaxWriteSize {
+		if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
 			conn.resp.resetFastH1()
 			conn.resp.Status(500).String("Response Too Large")
 			closeConn = true
@@ -587,6 +608,75 @@ func (worker *plainUringWorker) flushReqStats() {
 		Stats.TotalReqs.Add(worker.localReqs)
 		worker.localReqs = 0
 	}
+}
+
+func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, consumed int) func(*Request) net.Conn {
+	prefix := append([]byte(nil), conn.readBuf[consumed:conn.readN]...)
+	var once sync.Once
+	return func(req *Request) net.Conn {
+		once.Do(func() {
+			if conn.fd < 0 {
+				return
+			}
+			wrapped, err := newIOUringConn(conn.fd)
+			if err != nil {
+				return
+			}
+			conn.fd = -1
+			handed := net.Conn(wrapped)
+			if len(prefix) > 0 {
+				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
+			}
+			handed = worker.server.trackHandoffConn(handed)
+			if handed == nil {
+				return
+			}
+			req.connTakenOver = true
+			req.attachConn = nil
+			req.conn = handed
+		})
+		return req.conn
+	}
+}
+
+func (worker *plainUringWorker) shouldHandoffHTTP2(conn *plainWorkerConn) bool {
+	if conn.protocol != plainConnProtoUnknown || conn.readN < H2PrefaceLen {
+		return false
+	}
+	for i := 0; i < H2PrefaceLen; i++ {
+		if conn.readBuf[i] != H2ClientPreface[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (worker *plainUringWorker) handoffHTTP2(conn *plainWorkerConn) error {
+	prefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
+	wrapped, err := newIOUringConn(conn.fd)
+	if err != nil {
+		conn.fd = -1
+		worker.releaseConnection(conn)
+		return nil
+	}
+	conn.fd = -1
+	worker.releaseConnection(conn)
+	if !worker.server.tryTrackConn() {
+		wrapped.Close()
+		return nil
+	}
+	Stats.ActiveConns.Add(1)
+	go func() {
+		defer worker.server.releaseTrackedConn()
+		defer Stats.ActiveConns.Add(-1)
+		defer wrapped.Close()
+		bridgeConn := net.Conn(wrapped)
+		if len(prefix) > 0 {
+			bridgeConn = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
+		}
+		worker.server.ServeH2Plain(bridgeConn)
+	}()
+	return nil
 }
 
 func (worker *plainUringWorker) queueResponse(conn *plainWorkerConn, keepAlive bool, consumed int) error {
@@ -747,8 +837,14 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	if conn.writeBuf == nil {
 		conn.writeBuf = make([]byte, 0, 16384)
 	}
+	if !worker.server.tryTrackConn() {
+		_ = syscall.Close(fd)
+		conn.fd = -1
+		worker.recycleConnection(conn)
+		return nil
+	}
+	conn.tracked = true
 	worker.active.Add(1)
-	worker.server.activeConns.Add(1)
 	Stats.ActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	return worker.queueRead(conn)
@@ -803,15 +899,22 @@ func (worker *plainUringWorker) finishClose(conn *plainWorkerConn) {
 }
 
 func (worker *plainUringWorker) releaseConnection(conn *plainWorkerConn) {
+	if conn.tracked {
+		worker.active.Add(-1)
+		worker.server.releaseTrackedConn()
+		Stats.ActiveConns.Add(-1)
+		conn.tracked = false
+	}
+	worker.recycleConnection(conn)
+}
+
+func (worker *plainUringWorker) recycleConnection(conn *plainWorkerConn) {
 	conn.state = plainConnStateFree
 	conn.readN = 0
 	conn.writeN = 0
 	conn.writeSent = 0
 	conn.nextFree = worker.freeHead
 	worker.freeHead = conn.index
-	worker.active.Add(-1)
-	worker.server.activeConns.Done()
-	Stats.ActiveConns.Add(-1)
 	conn.generation++
 	if conn.generation == 0 {
 		conn.generation = 1
@@ -821,6 +924,7 @@ func (worker *plainUringWorker) releaseConnection(conn *plainWorkerConn) {
 	conn.remoteAddr = ""
 	conn.protocol = plainConnProtoUnknown
 	conn.closeDone = false
+	conn.tracked = false
 	conn.writeZeroCopy = false
 	conn.zcPending = 0
 	conn.h2.reset()
@@ -942,7 +1046,7 @@ func (backend *plainUringBackend) dispatchAccepted(source *plainUringWorker, fd 
 func plainUringWorkerCount(cfg Config, maxShards int) int {
 	workers := cfg.WorkerCount
 	if workers <= 0 {
-		workers = runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2
+		workers = runtime.GOMAXPROCS(0)
 	}
 	if workers < 1 {
 		workers = 1

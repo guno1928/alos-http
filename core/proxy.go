@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+// LoadBalancerType selects the load balancing strategy used by the reverse
+// proxy when distributing requests across multiple backends.
+//
+// Available strategies:
+//   - LBRoundRobin: cycles through backends in order (default)
+//   - LBWeightedRR: round-robin weighted by BackendConfig.Weight
+//   - LBLeastConn: sends to the backend with the fewest active connections
+//   - LBIPHash: hashes the client IP to a consistent backend
+//   - LBRandom: picks a random healthy backend
 type LoadBalancerType uint8
 
 const (
@@ -391,6 +400,7 @@ type ProxyEngine struct {
 	snapshot   atomic.Pointer[proxySnapshot]
 	mu         sync.Mutex
 	stopCh     chan struct{}
+	stopOnce   sync.Once
 	OnError    ProxyErrorFunc
 	OnRequest  ProxyInterceptFunc
 	OnResponse ProxyResponseFunc
@@ -516,18 +526,23 @@ func (pe *ProxyEngine) Lookup(host string) *domainState {
 // Stop shuts down all health checkers and closes all idle backend connections
 // across every registered domain. Called automatically by Server.Shutdown.
 func (pe *ProxyEngine) Stop() {
-	close(pe.stopCh)
-	snap := pe.snapshot.Load()
-	for _, ds := range snap.domains {
-		if ds.health != nil {
-			ds.health.stop()
+	pe.stopOnce.Do(func() {
+		close(pe.stopCh)
+		if pe.Cache != nil {
+			pe.Cache.Stop()
 		}
-		for _, b := range ds.backends {
-			if b.pool != nil {
-				b.pool.close()
+		snap := pe.snapshot.Load()
+		for _, ds := range snap.domains {
+			if ds.health != nil {
+				ds.health.stop()
+			}
+			for _, b := range ds.backends {
+				if b.pool != nil {
+					b.pool.close()
+				}
 			}
 		}
-	}
+	})
 }
 
 // ListDomains returns the names of all currently registered proxy domains.

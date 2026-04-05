@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -28,6 +29,7 @@ const (
 	ioUringOpRead                    = 22
 	ioUringOpAccept                  = 13
 	ioUringOpAsyncCancel             = 14
+	ioUringOpConnect                 = 16
 	ioUringOpClose                   = 19
 	ioUringOpRecv                    = 27
 	ioUringOpSend                    = 26
@@ -503,6 +505,14 @@ func isIOUringAcceptShutdownError(err error) bool {
 	return errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ECANCELED)
 }
 
+func isIOUringConnCloseError(err error) bool {
+	return errors.Is(err, syscall.EBADF) ||
+		errors.Is(err, syscall.ECANCELED) ||
+		errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
 func isIOUringTransient(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.ECONNABORTED)
 }
@@ -565,6 +575,50 @@ func wrapConnectedConnWithIOUring(conn net.Conn) (net.Conn, error) {
 	return wrapped, nil
 }
 
+func dialTCP4DirectIOUring(addr string, timeout time.Duration) (net.Conn, error) {
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		return nil, &net.AddrError{Err: "non-IPv4 address", Addr: addr}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return nil, err
+	}
+	if port < 0 || port > 65535 {
+		return nil, &net.AddrError{Err: "invalid port", Addr: addr}
+	}
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|sockCloexec|sockNonblock, syscall.IPPROTO_TCP)
+	if err != nil {
+		return nil, err
+	}
+
+	connectRing, err := newIOUring(8)
+	if err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	defer connectRing.close()
+
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	sa := &unix.RawSockaddrInet4{Family: unix.AF_INET, Port: htons(uint16(port))}
+	copy(sa.Addr[:], ip)
+	if err := connectRing.connect(fd, unsafe.Pointer(sa), uint64(unsafe.Sizeof(*sa)), deadline); err != nil {
+		runtime.KeepAlive(sa)
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	runtime.KeepAlive(sa)
+	return newIOUringConn(fd)
+}
+
 func (c *ioUringConn) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -573,11 +627,18 @@ func (c *ioUringConn) Read(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	c.readMu.Lock()
-	defer c.readMu.Unlock()
 	if c.closed.Load() {
+		c.readMu.Unlock()
 		return 0, net.ErrClosed
 	}
-	n, err := c.readRing.recv(c.fd, p, c.readDeadline())
+	ring := c.readRing
+	if ring == nil {
+		c.readMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	n, err := ring.recv(c.fd, p, c.readDeadline())
+	err = c.normalizeIOUringConnError(err)
+	c.readMu.Unlock()
 	if errors.Is(err, errIOUringDeadlineExceeded) {
 		_ = c.Close()
 	}
@@ -592,33 +653,69 @@ func (c *ioUringConn) Write(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if c.closed.Load() {
+		c.writeMu.Unlock()
 		return 0, net.ErrClosed
 	}
-	n, err := c.writeRing.sendAll(c.fd, p, c.writeDeadline())
+	ring := c.writeRing
+	if ring == nil {
+		c.writeMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	n, err := ring.sendAll(c.fd, p, c.writeDeadline())
+	err = c.normalizeIOUringConnError(err)
+	c.writeMu.Unlock()
 	if errors.Is(err, errIOUringDeadlineExceeded) {
 		_ = c.Close()
 	}
 	return n, err
 }
 
+func (c *ioUringConn) normalizeIOUringConnError(err error) error {
+	if err == nil || errors.Is(err, errIOUringDeadlineExceeded) {
+		return err
+	}
+	if c.closed.Load() && isIOUringConnCloseError(err) {
+		return net.ErrClosed
+	}
+	return err
+}
+
 func (c *ioUringConn) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		fd := c.fd
+		readRing := c.readRing
+		writeRing := c.writeRing
+		if fd >= 0 {
+			_ = syscall.Shutdown(fd, syscall.SHUT_RDWR)
+		}
+		if readRing != nil {
+			_ = readRing.cancelFD(fd, 0)
+		}
+		if writeRing != nil && writeRing != readRing {
+			_ = writeRing.cancelFD(fd, 0)
+		}
+
+		c.readMu.Lock()
+		c.writeMu.Lock()
+
 		if c.fd >= 0 {
 			closeErr = syscall.Close(c.fd)
 			c.fd = -1
 		}
-		if c.readRing != nil {
-			c.readRing.close()
-			c.readRing = nil
+		if readRing != nil {
+			readRing.close()
 		}
-		if c.writeRing != nil {
-			c.writeRing.close()
-			c.writeRing = nil
+		if writeRing != nil && writeRing != readRing {
+			writeRing.close()
 		}
+		c.readRing = nil
+		c.writeRing = nil
+
+		c.writeMu.Unlock()
+		c.readMu.Unlock()
 		if c.onClose != nil {
 			c.onClose()
 		}
@@ -885,6 +982,20 @@ func (ring *ioUring) close() {
 		_ = syscall.Close(ring.fd)
 		ring.fd = -1
 	}
+	ring.enterFD = -1
+	ring.sqRing = nil
+	ring.cqRing = nil
+	ring.sqes = nil
+	ring.cqes = nil
+	ring.sqHead = nil
+	ring.sqTail = nil
+	ring.sqMask = nil
+	ring.sqEntries = nil
+	ring.sqFlags = nil
+	ring.sqArray = nil
+	ring.cqHead = nil
+	ring.cqTail = nil
+	ring.cqMask = nil
 }
 
 func (ring *ioUring) accept(fd int, flags uint32) (int, error) {
@@ -902,6 +1013,20 @@ func (ring *ioUring) accept(fd int, flags uint32) (int, error) {
 		return -1, syscall.Errno(-cqe.Res)
 	}
 	return int(cqe.Res), nil
+}
+
+func (ring *ioUring) connect(fd int, addr unsafe.Pointer, addrLen uint64, deadline time.Time) error {
+	if err := ring.prepConnect(fd, addr, addrLen); err != nil {
+		return err
+	}
+	cqe, err := ring.submitAndAwait(deadline)
+	if err != nil {
+		return err
+	}
+	if cqe.Res < 0 {
+		return syscall.Errno(-cqe.Res)
+	}
+	return nil
 }
 
 func (ring *ioUring) recv(fd int, buf []byte, deadline time.Time) (int, error) {
@@ -956,6 +1081,18 @@ func (ring *ioUring) prepAccept(fd int, flags uint32) error {
 	sqe.Opcode = ioUringOpAccept
 	sqe.FD = int32(fd)
 	sqe.OpFlags = flags
+	return nil
+}
+
+func (ring *ioUring) prepConnect(fd int, addr unsafe.Pointer, addrLen uint64) error {
+	sqe, err := ring.getSqe()
+	if err != nil {
+		return err
+	}
+	sqe.Opcode = ioUringOpConnect
+	sqe.FD = int32(fd)
+	sqe.Addr = uint64(uintptr(addr))
+	sqe.Off = addrLen
 	return nil
 }
 
@@ -1080,6 +1217,9 @@ func (ring *ioUring) getSqe() (*ioUringSqe, error) {
 }
 
 func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
+	if ring == nil || ring.fd < 0 || ring.sqTail == nil {
+		return 0, syscall.EBADF
+	}
 	for {
 		toSubmit := ring.localSqTail - ring.submitted
 		if toSubmit != 0 {
@@ -1218,6 +1358,9 @@ func (ring *ioUring) cancelFD(fd int, opcode uint8) error {
 }
 
 func (ring *ioUring) waitCqe() (ioUringCqe, error) {
+	if ring == nil || ring.fd < 0 || ring.cqHead == nil || ring.cqTail == nil || ring.cqMask == nil || len(ring.cqes) == 0 {
+		return ioUringCqe{}, syscall.EBADF
+	}
 	for {
 		head := atomic.LoadUint32(ring.cqHead)
 		tail := atomic.LoadUint32(ring.cqTail)
@@ -1234,6 +1377,9 @@ func (ring *ioUring) waitCqe() (ioUringCqe, error) {
 }
 
 func (ring *ioUring) peekBatch(dst []ioUringCqe) int {
+	if ring == nil || ring.cqHead == nil || ring.cqTail == nil || ring.cqMask == nil || len(ring.cqes) == 0 {
+		return 0
+	}
 	head := atomic.LoadUint32(ring.cqHead)
 	tail := atomic.LoadUint32(ring.cqTail)
 	available := int(tail - head)
@@ -1252,6 +1398,9 @@ func (ring *ioUring) peekBatch(dst []ioUringCqe) int {
 }
 
 func (ring *ioUring) tryCqe() (ioUringCqe, bool) {
+	if ring == nil || ring.cqHead == nil || ring.cqTail == nil || ring.cqMask == nil || len(ring.cqes) == 0 {
+		return ioUringCqe{}, false
+	}
 	head := atomic.LoadUint32(ring.cqHead)
 	tail := atomic.LoadUint32(ring.cqTail)
 	if head == tail {
@@ -1264,6 +1413,9 @@ func (ring *ioUring) tryCqe() (ioUringCqe, bool) {
 }
 
 func (ring *ioUring) submitAndAwait(deadline time.Time) (ioUringCqe, error) {
+	if ring == nil || ring.fd < 0 {
+		return ioUringCqe{}, syscall.EBADF
+	}
 	if _, err := ring.submitAndWait(0); err != nil {
 		return ioUringCqe{}, err
 	}
@@ -1305,4 +1457,8 @@ func byteOffsetSlice[T any](base []byte, offset uint32, length int) []T {
 		return nil
 	}
 	return unsafe.Slice((*T)(unsafe.Pointer(unsafe.SliceData(base[offset:]))), length)
+}
+
+func htons(v uint16) uint16 {
+	return v<<8 | v>>8
 }

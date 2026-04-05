@@ -90,7 +90,7 @@ func (hc *healthChecker) check(b *backend) bool {
 }
 
 func (hc *healthChecker) checkTCP(b *backend) bool {
-	conn, err := DialTCP4(b.Addr, hc.config.Timeout)
+	conn, err := dialBackendConn(b.Addr, b.TLS, b.TLSSkipVerify, hc.config.Timeout)
 	if err != nil {
 		return false
 	}
@@ -99,7 +99,7 @@ func (hc *healthChecker) checkTCP(b *backend) bool {
 }
 
 func (hc *healthChecker) checkHTTP(b *backend) bool {
-	conn, err := DialTCP4(b.Addr, hc.config.Timeout)
+	conn, err := dialBackendConn(b.Addr, b.TLS, b.TLSSkipVerify, hc.config.Timeout)
 	if err != nil {
 		return false
 	}

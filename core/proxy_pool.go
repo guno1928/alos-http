@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"crypto/tls"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,12 @@ var brPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 4096) },
 }
 
+type pooledConnDrainReader struct{}
+
+func (pooledConnDrainReader) Read(_ []byte) (int, error) { return 0, io.EOF }
+
+var pooledConnReaderSink pooledConnDrainReader
+
 func newConnPool(addr string, useTLS, tlsSkipVerify bool, maxIdle int, idleTimeout, dialTimeout time.Duration) *connPool {
 	if maxIdle <= 0 {
 		maxIdle = 32
@@ -57,11 +64,11 @@ func (cp *connPool) get() (*pooledConn, error) {
 		case pc := <-cp.ch:
 			now := time.Now()
 			if now.After(pc.idleDeadline) {
-				pc.conn.Close()
+				cp.discard(pc)
 				continue
 			}
 			if cp.useTLS && now.Sub(pc.created) > cp.idleTimeout*2 {
-				pc.conn.Close()
+				cp.discard(pc)
 				continue
 			}
 			return pc, nil
@@ -73,36 +80,24 @@ func (cp *connPool) get() (*pooledConn, error) {
 
 func (cp *connPool) put(pc *pooledConn) {
 	if cp.closed.Load() {
-		pc.conn.Close()
+		cp.discard(pc)
 		return
 	}
+	_ = pc.conn.SetDeadline(time.Time{})
 	pc.idleDeadline = time.Now().Add(cp.idleTimeout)
 	select {
 	case cp.ch <- pc:
+	case <-cp.stopCh:
+		cp.discard(pc)
 	default:
-		pc.conn.Close()
+		cp.discard(pc)
 	}
 }
 
 func (cp *connPool) dial() (*pooledConn, error) {
-	conn, err := DialTCP4(cp.addr, cp.dialTimeout)
+	conn, err := dialBackendConn(cp.addr, cp.useTLS, cp.tlsSkipVerify, cp.dialTimeout)
 	if err != nil {
 		return nil, err
-	}
-	if cp.useTLS {
-		host, _, _ := net.SplitHostPort(cp.addr)
-		tlsCfg := &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: cp.tlsSkipVerify,
-		}
-		conn.SetDeadline(time.Now().Add(cp.dialTimeout))
-		tlsConn := tls.Client(conn, tlsCfg)
-		if err := tlsConn.Handshake(); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		conn.SetDeadline(time.Time{})
-		conn = tlsConn
 	}
 	br := brPool.Get().(*bufio.Reader)
 	br.Reset(conn)
@@ -110,13 +105,32 @@ func (cp *connPool) dial() (*pooledConn, error) {
 	return &pooledConn{conn: conn, br: br, created: now, idleDeadline: now.Add(cp.idleTimeout)}, nil
 }
 
+func (cp *connPool) discard(pc *pooledConn) {
+	if pc == nil {
+		return
+	}
+	if pc.conn != nil {
+		pc.conn.Close()
+		pc.conn = nil
+	}
+	if pc.br != nil {
+		pc.br.Reset(pooledConnReaderSink)
+		brPool.Put(pc.br)
+		pc.br = nil
+	}
+}
+
 func (cp *connPool) close() {
 	cp.closeOnce.Do(func() {
 		cp.closed.Store(true)
 		close(cp.stopCh)
-		close(cp.ch)
-		for pc := range cp.ch {
-			pc.conn.Close()
+		for {
+			select {
+			case pc := <-cp.ch:
+				cp.discard(pc)
+			default:
+				return
+			}
 		}
 	})
 }
@@ -145,16 +159,44 @@ func (cp *connPool) evictStale() {
 		select {
 		case pc := <-cp.ch:
 			if now.After(pc.idleDeadline) {
-				pc.conn.Close()
+				cp.discard(pc)
 			} else {
 				select {
 				case cp.ch <- pc:
 				default:
-					pc.conn.Close()
+					cp.discard(pc)
 				}
 			}
 		default:
 			return
 		}
 	}
+}
+
+func dialBackendConn(addr string, useTLS, tlsSkipVerify bool, timeout time.Duration) (net.Conn, error) {
+	conn, err := dialProxyConn(addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if !useTLS {
+		return conn, nil
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	tlsCfg := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: tlsSkipVerify,
+	}
+	conn.SetDeadline(time.Now().Add(timeout))
+	tlsConn := tls.Client(conn, tlsCfg)
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	conn.SetDeadline(time.Time{})
+	return tlsConn, nil
 }

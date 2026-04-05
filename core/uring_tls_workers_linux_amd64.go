@@ -3,10 +3,12 @@
 package core
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"runtime"
@@ -14,8 +16,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"golang.org/x/crypto/curve25519"
 )
 
 const (
@@ -65,6 +65,7 @@ type tlsWorkerConn struct {
 	generation uint16
 	state      uint8
 	phase      uint8
+	tracked    bool
 	closeDone  bool
 
 	closeAfter    bool
@@ -152,6 +153,10 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 	}
 	if !recvMultishotSupported {
 		log.Printf("[INFO] io_uring multishot recv unavailable during startup probe, starting in classic recv mode")
+	}
+	if recvMultishotSupported {
+		log.Printf("[INFO] io_uring TLS worker handoff paths require single-owner recv state, starting in classic recv mode")
+		recvMultishotSupported = false
 	}
 	backend := &tlsUringBackend{
 		server:  s,
@@ -657,7 +662,7 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, fla
 	conn.writeSent = 0
 	conn.writeN = 0
 	conn.writeBuf = conn.writeBuf[:0]
-	if conn.closeAfter {
+	if conn.closeAfter && len(conn.plainBuf) == 0 {
 		return worker.closeConnection(conn)
 	}
 	return worker.processTLSConn(conn)
@@ -840,16 +845,8 @@ func (worker *tlsUringWorker) processClientHello(conn *tlsWorkerConn) (int, erro
 	}
 	defer serverKey.zero()
 
-	var shared [32]byte
-	curve25519.ScalarMult(&shared, &serverKey.priv, &conn.clientHello.x25519PubKeyBuf)
-	allZero := true
-	for _, b := range shared {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
+	shared, ok := deriveX25519SharedSecret(&serverKey.priv, &conn.clientHello.x25519PubKeyBuf)
+	if !ok {
 		Dbg("[%s] worker bad X25519 key share", conn.remoteAddr)
 		return tlsWorkerActionClose, nil
 	}
@@ -1004,9 +1001,9 @@ func (worker *tlsUringWorker) processClientFinished(conn *tlsWorkerConn) (int, e
 		conn.hsReader = nil
 		if conn.selectedALPN == "h2" {
 			if worker.server.IsDebug() {
-				Dbg("[%s] worker TLS handshake complete; entering native HTTP/2", conn.remoteAddr)
+				Dbg("[%s] worker TLS handshake complete; handing off to HTTP/2 shared bridge", conn.remoteAddr)
 			}
-			return worker.initHTTP2(conn)
+			return worker.handoffHTTP2(conn)
 		}
 		conn.phase = tlsConnPhaseApplication
 		Stats.H1Conns.Add(1)
@@ -1074,26 +1071,29 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	}
 	if worker.server.plainRootFast.enabled {
 		if _, consumed, closeConn, ok := worker.server.matchPlainRootFastRequest(conn.appBuf); ok {
-			worker.bumpReqStats()
-			conn.requestCount++
-			payload := worker.server.plainRootFast.getKeepAliveTLS
-			if closeConn {
-				payload = worker.server.plainRootFast.getCloseTLS
+			if worker.server.tryAcquireRequestSlot() {
+				worker.bumpReqStats()
+				conn.requestCount++
+				payload := worker.server.plainRootFast.getKeepAliveTLS
+				if closeConn {
+					payload = worker.server.plainRootFast.getCloseTLS
+				}
+				conn.closeAfter = closeConn
+				conn.writeBuf = appendTLSInnerRecord(conn.writeBuf[:0], conn.appWriter, payload)
+				conn.writeN = len(conn.writeBuf)
+				conn.writeSent = 0
+				worker.compactAppBuffer(conn, consumed)
+				worker.server.releaseRequestSlot()
+				if conn.writeN == 0 {
+					return tlsWorkerActionClose, nil
+				}
+				conn.state = tlsConnStateWriting
+				conn.writeZeroCopy = false
+				if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend()); err != nil {
+					return tlsWorkerActionClose, nil
+				}
+				return tlsWorkerActionWrote, nil
 			}
-			conn.closeAfter = closeConn
-			conn.writeBuf = appendTLSInnerRecord(conn.writeBuf[:0], conn.appWriter, payload)
-			conn.writeN = len(conn.writeBuf)
-			conn.writeSent = 0
-			worker.compactAppBuffer(conn, consumed)
-			if conn.writeN == 0 {
-				return tlsWorkerActionClose, nil
-			}
-			conn.state = tlsConnStateWriting
-			conn.writeZeroCopy = false
-			if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN], worker.shouldPollFirstSend()); err != nil {
-				return tlsWorkerActionClose, nil
-			}
-			return tlsWorkerActionWrote, nil
 		}
 	}
 
@@ -1134,12 +1134,15 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	conn.resp.resetFastH1()
 	conn.req.StreamWriter = nil
 	conn.req.conn = nil
+	conn.req.attachConn = worker.newH1RequestConnAttacher(conn, consumed)
+	conn.req.connTakenOver = false
 	conn.req.server = worker.server
 	conn.req.Host = conn.req.cachedHost
 	conn.req.RemoteAddr = conn.remoteAddr
 	conn.req.tlsReader = nil
 	conn.req.tlsWriter = nil
 	conn.req.hdrBuf = nil
+	conn.req.hijackReadBuf = nil
 	conn.resp.SetSW(nil)
 	conn.resp.lazyReq = &conn.req
 	if worker.server.fastDispatch.Load() {
@@ -1148,12 +1151,21 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	} else {
 		worker.server.dispatch(&conn.req, &conn.resp)
 	}
-	if conn.req.hijacked || conn.resp.IsStreamed() {
-		conn.resp.Reset()
-		conn.resp.Status(500).String("Streaming/Hijack unsupported in TLS io_uring worker backend")
-		closeConn = true
+	if conn.req.connTakenOver {
+		if conn.req.hijacked {
+			worker.releaseConnection(conn)
+			return tlsWorkerActionHanded, nil
+		}
+		if conn.resp.IsStreamed() {
+			releaseStreamWriter(conn.req.StreamWriter)
+		}
+		if conn.req.conn != nil {
+			_ = conn.req.conn.Close()
+		}
+		worker.releaseConnection(conn)
+		return tlsWorkerActionHanded, nil
 	}
-	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.BodyLen()) > worker.server.config.MaxWriteSize {
+	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
 		conn.resp.resetFastH1()
 		conn.resp.Status(500).String("Response Too Large")
 		closeConn = true
@@ -1199,6 +1211,42 @@ func (worker *tlsUringWorker) flushReqStats() {
 	if worker.localReqs > 0 {
 		Stats.TotalReqs.Add(worker.localReqs)
 		worker.localReqs = 0
+	}
+}
+
+func (worker *tlsUringWorker) newH1RequestConnAttacher(conn *tlsWorkerConn, consumed int) func(*Request) net.Conn {
+	rawPrefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
+	decryptedPrefix := append([]byte(nil), conn.appBuf[consumed:]...)
+	reader := conn.appReader
+	writer := conn.appWriter
+	var once sync.Once
+	return func(req *Request) net.Conn {
+		once.Do(func() {
+			if conn.fd < 0 {
+				return
+			}
+			wrapped, err := newIOUringConn(conn.fd)
+			if err != nil {
+				return
+			}
+			conn.fd = -1
+			req.tlsReader = reader
+			req.tlsWriter = writer
+			req.hdrBuf = make([]byte, 5)
+			req.hijackReadBuf = append([]byte(nil), decryptedPrefix...)
+			handed := net.Conn(wrapped)
+			if len(rawPrefix) > 0 {
+				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(rawPrefix), wrapped)}
+			}
+			handed = worker.server.trackHandoffConn(handed)
+			if handed == nil {
+				return
+			}
+			req.connTakenOver = true
+			req.attachConn = nil
+			req.conn = handed
+		})
+		return req.conn
 	}
 }
 
@@ -1354,8 +1402,14 @@ func (worker *tlsUringWorker) tryAttachAccepted(fd int, now int64) (bool, error)
 	if remote != nil {
 		conn.remoteAddr = remote.String()
 	}
+	if !worker.server.tryTrackConn() {
+		_ = syscall.Close(fd)
+		conn.fd = -1
+		worker.recycleConnection(conn)
+		return false, nil
+	}
+	conn.tracked = true
 	worker.active.Add(1)
-	worker.server.activeConns.Add(1)
 	Stats.ActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	if err := worker.queueRead(conn); err != nil {
@@ -1445,6 +1499,16 @@ func (worker *tlsUringWorker) finishClose(conn *tlsWorkerConn) {
 }
 
 func (worker *tlsUringWorker) releaseConnection(conn *tlsWorkerConn) {
+	if conn.tracked {
+		worker.active.Add(-1)
+		worker.server.releaseTrackedConn()
+		Stats.ActiveConns.Add(-1)
+		conn.tracked = false
+	}
+	worker.recycleConnection(conn)
+}
+
+func (worker *tlsUringWorker) recycleConnection(conn *tlsWorkerConn) {
 	conn.state = tlsConnStateFree
 	conn.phase = tlsConnPhaseClientHello
 	conn.readN = 0
@@ -1454,9 +1518,6 @@ func (worker *tlsUringWorker) releaseConnection(conn *tlsWorkerConn) {
 	conn.writeSent = 0
 	conn.nextFree = worker.freeHead
 	worker.freeHead = conn.index
-	worker.active.Add(-1)
-	worker.server.activeConns.Done()
-	Stats.ActiveConns.Add(-1)
 	conn.generation++
 	if conn.generation == 0 {
 		conn.generation = 1
@@ -1467,6 +1528,7 @@ func (worker *tlsUringWorker) releaseConnection(conn *tlsWorkerConn) {
 	conn.selectedALPN = ""
 	conn.expectedFinN = 0
 	conn.closeDone = false
+	conn.tracked = false
 	conn.writeZeroCopy = false
 	conn.zcPending = 0
 	conn.hsReader = nil
@@ -1768,9 +1830,31 @@ func (worker *tlsUringWorker) handoffTLSFallback(conn *tlsWorkerConn) (int, erro
 	}
 	conn.fd = -1
 	worker.releaseConnection(conn)
-	worker.server.activeConns.Add(1)
+	if !worker.server.tryTrackConn() {
+		wrapped.Close()
+		return tlsWorkerActionHanded, nil
+	}
 	go worker.server.serveTLSConnWithPrefix(wrapped, prefix)
 	return tlsWorkerActionHanded, nil
+}
+
+func (worker *tlsUringWorker) handoffHTTP2(conn *tlsWorkerConn) (int, error) {
+	prefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
+	reader := conn.appReader
+	writer := conn.appWriter
+
+	sharedConn := newTLSWorkerSharedConn(worker, conn, prefix)
+	conn.readN = 0
+	conn.readBuf = conn.readBuf[:0]
+	conn.phase = tlsConnPhaseH2Bridge
+	Stats.H2Conns.Add(1)
+
+	go func() {
+		defer sharedConn.Close()
+		worker.server.ServeH2(sharedConn, reader, writer, make([]byte, 5))
+	}()
+
+	return tlsWorkerActionNeedRead, nil
 }
 
 func nextTLSRecord(buf []byte) (byte, []byte, int, bool, error) {

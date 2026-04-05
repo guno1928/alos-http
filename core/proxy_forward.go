@@ -14,7 +14,8 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 		return false
 	}
 
-	if pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") {
+	cacheAllowed := pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") && proxyCacheRequestAllowed(req)
+	if cacheAllowed {
 		entry, hit := pe.Cache.Get(req.Method, host, req.Path, req.Header("accept-encoding"))
 		if hit {
 			pe.Cache.ServeCached(entry, req, resp)
@@ -37,27 +38,24 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 
 	clientIP := extractIP(req.RemoteAddr)
 	baseHeaders := append(make([][2]string, 0, len(req.Headers)), req.Headers...)
+	if len(ds.backends) == 0 {
+		resp.Status(502).String("No healthy backend available")
+		return true
+	}
 
-	tried := uint64(0)
+	tried := make([]bool, len(ds.backends))
 	maxRetries := ds.config.MaxRetries
-	if maxRetries > len(ds.backends) {
-		maxRetries = len(ds.backends)
+	if maxRetries > len(ds.backends)-1 {
+		maxRetries = len(ds.backends) - 1
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		idx := ds.balancer.pick(ds.backends, clientIP)
+		idx := pickRetryBackend(ds, clientIP, tried)
 		if idx < 0 {
 			resp.Status(502).String("No healthy backend available")
 			return true
 		}
-
-		if idx < 64 {
-			bit := uint64(1) << uint(idx)
-			if tried&bit != 0 {
-				continue
-			}
-			tried |= bit
-		}
+		tried[idx] = true
 
 		b := ds.backends[idx]
 		attemptReq := *req
@@ -101,22 +99,37 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 				ClientAddr: req.RemoteAddr,
 				Method:     req.Method,
 				Path:       req.Path,
-				Attempt:    attempt,
+				Attempt:    attempt + 1,
 				Err:        err,
 			})
 		}
 
-		Dbg("[PROXY] backend %s attempt %d failed: %v", b.Addr, attempt, err)
+		Dbg("[PROXY] backend %s attempt %d failed: %v", b.Addr, attempt+1, err)
 	}
 
 	resp.Status(502).String("All backends failed")
 	return true
 }
 
+func pickRetryBackend(ds *domainState, clientIP string, tried []bool) int {
+	idx := ds.balancer.pick(ds.backends, clientIP)
+	if idx >= 0 && idx < len(tried) && !tried[idx] {
+		return idx
+	}
+	for i := range ds.backends {
+		if tried[i] || !ds.backends[i].Healthy.Load() {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
 func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
 	if isWebSocket(req) {
 		return pe.forwardWebSocket(req, resp, b, cfg)
 	}
+	cacheAllowed := pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") && proxyCacheRequestAllowed(req)
 
 	pc, err := b.pool.get()
 	if err != nil {
@@ -133,7 +146,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 	*bp = buf[:0]
 	LargeBufPool.Put(bp)
 	if err != nil {
-		pc.conn.Close()
+		b.pool.discard(pc)
 		return err
 	}
 
@@ -143,7 +156,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 
 	statusCode, contentType, contentLength, isChunked, keepAlive, headers, err := parseHTTPResponse(pc.br)
 	if err != nil {
-		pc.conn.Close()
+		b.pool.discard(pc)
 		return err
 	}
 
@@ -191,7 +204,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			body = make([]byte, contentLength)
 			_, err := io.ReadFull(pc.br, body)
 			if err != nil {
-				pc.conn.Close()
+				b.pool.discard(pc)
 				return err
 			}
 			bufOK = true
@@ -208,12 +221,14 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			resp.SetBody(body)
 
 			host := stripPort(req.Host)
-			pe.Cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+			if cacheAllowed && proxyCacheResponseAllowed(headers) {
+				pe.Cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+			}
 
 			if keepAlive {
 				b.pool.put(pc)
 			} else {
-				pc.conn.Close()
+				b.pool.discard(pc)
 			}
 			return nil
 		}
@@ -232,13 +247,13 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			bodyBuf := make([]byte, contentLength)
 			_, err := io.ReadFull(pc.br, bodyBuf)
 			if err != nil {
-				pc.conn.Close()
+				b.pool.discard(pc)
 				return err
 			}
 			resp.SetBody(bodyBuf)
 		}
 
-		if pe.Cache != nil {
+		if cacheAllowed && proxyCacheResponseAllowed(headers) {
 			host := stripPort(req.Host)
 			if manualCache {
 				pe.Cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody(), manualTTL, manualMaxHits, manualCompress, manualCompressMin)
@@ -250,14 +265,17 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 		if keepAlive {
 			b.pool.put(pc)
 		} else {
-			pc.conn.Close()
+			b.pool.discard(pc)
 		}
 		return nil
 	}
 
 	sw := req.StreamWriter
 	if sw == nil {
-		pc.conn.Close()
+		sw = resp.ensureSW()
+	}
+	if sw == nil {
+		b.pool.discard(pc)
 		resp.Status(502).String("Streaming not available")
 		return nil
 	}
@@ -265,7 +283,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 	respHeaders := make([][2]string, len(headers))
 	copy(respHeaders, headers)
 	if err := sw.WriteHeader(statusCode, respHeaders, contentType); err != nil {
-		pc.conn.Close()
+		b.pool.discard(pc)
 		return err
 	}
 
@@ -285,7 +303,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 
 	sw.Close()
 	resp.SetStreamer(sw)
-	pc.conn.Close()
+	b.pool.discard(pc)
 	if err != nil {
 		Dbg("[PROXY] streaming response aborted after headers for %s %s via %s: %v", req.Method, req.Path, b.Addr, err)
 	}
@@ -495,11 +513,9 @@ func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *Domain
 	}
 
 	if !hasUserAgent {
-		buf = append(buf, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"...)
+		_ = hasUserAgent
 	}
-	if !hasAccept {
-		buf = append(buf, "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"...)
-	}
+	_ = hasAccept
 
 	buf = append(buf, "Accept-Encoding: identity\r\n"...)
 
@@ -643,7 +659,7 @@ func isWebSocket(req *Request) bool {
 }
 
 func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
-	backendConn, err := DialTCP4(b.Addr, cfg.ConnectTimeout)
+	backendConn, err := dialBackendConn(b.Addr, b.TLS, b.TLSSkipVerify, cfg.ConnectTimeout)
 	if err != nil {
 		return err
 	}
@@ -727,8 +743,8 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 
 func isHopByHop(name string) bool {
 	switch name {
-	case "keep-alive", "proxy-authenticate", "proxy-authorization",
-		"te", "trailer", "transfer-encoding":
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
 	}
 	return false

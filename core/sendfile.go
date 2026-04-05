@@ -1,6 +1,8 @@
 package core
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -205,6 +207,13 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 		limiter = NewTokenBucket(cfg.rateLimit, burst)
 	}
 
+	if sent, err := trySendFileFastPath(sw, f, fi.Size(), limiter); sent {
+		if err != nil {
+			return err
+		}
+		return sw.Close()
+	}
+
 	bp := FileReadBufPool.Get().(*[]byte)
 	buf := *bp
 	defer FileReadBufPool.Put(bp)
@@ -220,7 +229,10 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 			}
 		}
 		if readErr != nil {
-			break
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return readErr
 		}
 	}
 	return sw.Close()

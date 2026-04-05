@@ -90,6 +90,22 @@ func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
 	return true
 }
 
+// BandwidthConfig sets per-connection or global bandwidth limits in megabits
+// per second. MaxUploadRate limits inbound data, MaxDownloadRate limits outbound
+// data, and BurstSize controls the token bucket burst allowance. Pass this
+// in Config.ConnBandwidth for per-connection limits or Config.GlobalBandwidth
+// for server-wide limits.
+//
+//	cfg := core.Config{
+//	    ConnBandwidth: core.BandwidthConfig{
+//	        MaxUploadRate:   100,
+//	        MaxDownloadRate: 200,
+//	        BurstSize:       50,
+//	    },
+//	    GlobalBandwidth: core.BandwidthConfig{
+//	        MaxDownloadRate: 1000,
+//	    },
+//	}
 type BandwidthConfig struct {
 	MaxUploadRate   int64
 	MaxDownloadRate int64

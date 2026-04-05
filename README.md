@@ -1,6 +1,8 @@
 # ALOS HTTP - go web framework with io_uring support
 
-ALOS HTTP is newly released, so if you find a bug or rough edge, please open a GitHub issue.
+> **Work in progress.** ALOS HTTP is still under active development and bugs may be present. If you find a bug or rough edge, please open a GitHub issue.
+>
+> **Join the Discord:** [https://alos.gg/discord](https://alos.gg/discord)
 
 Based on the project's current published benchmark suite, ALOS HTTP is the fastest web framework currently available right now.
 
@@ -28,6 +30,19 @@ ALOS HTTP focuses on a different part of the stack than most Go web frameworks.
 - Response streaming and file sending helpers.
 - Middleware for recovery, logging, CORS, compression, auth, timeouts, security headers, and more.
 - Rate limiting primitives and rule-driven limiting.
+
+### Full io_uring Coverage
+
+On Linux amd64 with a supported kernel, the following paths run entirely through `io_uring`:
+
+- **TCP accept** — all inbound connections are accepted via `io_uring` submission queues.
+- **TLS record I/O** — TLS read and write operations (both plaintext and encrypted record framing) are dispatched through `io_uring`.
+- **Plain HTTP I/O** — non-TLS HTTP/1.1 and HTTP/2 read/write paths use `io_uring` directly.
+- **Reverse proxy egress** — outbound connections to backends (dial, send, receive) go through dedicated proxy `io_uring` rings.
+- **Sendfile** — static file serving uses `io_uring`-backed splice/sendfile operations where the kernel supports it.
+- **HTTP/2 framing** — HTTP/2 frame reads and writes on both the ingress and shared-bridge proxy paths use `io_uring`.
+
+In short, every network I/O syscall in the hot path (accept, read, write, connect, sendfile) is submitted through `io_uring` rather than the traditional `epoll` + blocking-syscall model.
 
 Search-friendly summary:
 

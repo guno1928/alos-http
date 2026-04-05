@@ -23,6 +23,19 @@ func generateX25519Keypair() (x25519Keypair, error) {
 	return kp, nil
 }
 
+func deriveX25519SharedSecret(priv, peer *[32]byte) ([32]byte, bool) {
+	var shared [32]byte
+	secret, err := curve25519.X25519(priv[:], peer[:])
+	if err != nil {
+		return shared, false
+	}
+	copy(shared[:], secret)
+	for i := range secret {
+		secret[i] = 0
+	}
+	return shared, true
+}
+
 func (kp *x25519Keypair) zero() {
 	for i := range kp.priv {
 		kp.priv[i] = 0

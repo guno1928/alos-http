@@ -500,6 +500,76 @@ func (worker *tlsUringWorker) processHTTP2DecodedHeaders(conn *tlsWorkerConn, st
 		return tlsWorkerActionWrote, true
 	}
 
+	if endStream && worker.server.h2RootFast.enabled && matchIndexedH2FastRootHeaderBlock(headerBlock) {
+		if worker.server.tryAcquireRequestSlot() {
+			st.lastStreamID = streamID
+			if worker.server.logRequests.Load() {
+				log.Printf("[H2] stream %d: GET / (native fast)", streamID)
+			}
+			Stats.TotalReqs.Add(1)
+			if len(conn.plainBuf) == 0 && len(worker.server.h2RootFast.tlsInner) > 0 && !tlsHTTP2WriteInFlight(conn) {
+				conn.closeAfter = false
+				conn.writeBuf = appendFastH2RootTLSRecord(conn.writeBuf[:0], conn.appWriter, worker.server.h2RootFast, streamID, &conn.innerScratch)
+				conn.writeN = len(conn.writeBuf)
+				conn.writeSent = 0
+				if conn.writeN == 0 {
+					worker.server.releaseRequestSlot()
+					return tlsWorkerActionClose, true
+				}
+				conn.state = tlsConnStateWriting
+				if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+					worker.server.releaseRequestSlot()
+					return tlsWorkerActionClose, true
+				}
+				worker.server.releaseRequestSlot()
+				return tlsWorkerActionWrote, false
+			}
+			conn.plainBuf = appendFastH2RootResponse(conn.plainBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+			worker.server.releaseRequestSlot()
+			return tlsWorkerActionWrote, false
+		}
+	}
+
+	if endStream && worker.server.h2RootFast.enabled {
+		meta, ok, err := st.decoder.DecodeFastRootRequest(headerBlock)
+		if err != nil {
+			if worker.server.IsDebug() {
+				Dbg("[%s] worker HTTP/2 meta decode failed stream=%d err=%v", conn.remoteAddr, streamID, err)
+			}
+			conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrCompression)
+			return tlsWorkerActionWrote, false
+		}
+		if ok {
+			if worker.server.tryAcquireRequestSlot() {
+				st.lastStreamID = streamID
+				if worker.server.logRequests.Load() {
+					log.Printf("[H2] stream %d: %s %s (native fast meta)", streamID, meta.method, meta.path)
+				}
+				Stats.TotalReqs.Add(1)
+				if len(conn.plainBuf) == 0 && len(worker.server.h2RootFast.tlsInner) > 0 && !tlsHTTP2WriteInFlight(conn) {
+					conn.closeAfter = false
+					conn.writeBuf = appendFastH2RootTLSRecord(conn.writeBuf[:0], conn.appWriter, worker.server.h2RootFast, streamID, &conn.innerScratch)
+					conn.writeN = len(conn.writeBuf)
+					conn.writeSent = 0
+					if conn.writeN == 0 {
+						worker.server.releaseRequestSlot()
+						return tlsWorkerActionClose, true
+					}
+					conn.state = tlsConnStateWriting
+					if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+						worker.server.releaseRequestSlot()
+						return tlsWorkerActionClose, true
+					}
+					worker.server.releaseRequestSlot()
+					return tlsWorkerActionWrote, false
+				}
+				conn.plainBuf = appendFastH2RootResponse(conn.plainBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+				worker.server.releaseRequestSlot()
+				return tlsWorkerActionWrote, false
+			}
+		}
+	}
+
 	headers, meta, err := st.decoder.DecodeIntoRequest(st.headersBuf[:0], headerBlock)
 	st.headersBuf = headers[:0]
 	if err != nil {
@@ -513,27 +583,33 @@ func (worker *tlsUringWorker) processHTTP2DecodedHeaders(conn *tlsWorkerConn, st
 		Dbg("[%s] worker HTTP/2 decoded headers stream=%d method=%q path=%q authority=%q headers=%d endStream=%v", conn.remoteAddr, streamID, meta.method, meta.path, meta.authority, len(headers), endStream)
 	}
 	if endStream && worker.server.h2RootFast.enabled && meta.method == "GET" && meta.path == "/" {
-		st.lastStreamID = streamID
-		if worker.server.logRequests.Load() {
-			log.Printf("[H2] stream %d: %s %s (native fast)", streamID, meta.method, meta.path)
-		}
-		Stats.TotalReqs.Add(1)
-		if len(conn.plainBuf) == 0 && len(worker.server.h2RootFast.tlsInner) > 0 {
-			conn.closeAfter = false
-			conn.writeBuf = appendFastH2RootTLSRecord(conn.writeBuf[:0], conn.appWriter, worker.server.h2RootFast, streamID, &conn.innerScratch)
-			conn.writeN = len(conn.writeBuf)
-			conn.writeSent = 0
-			if conn.writeN == 0 {
-				return tlsWorkerActionClose, true
+		if worker.server.tryAcquireRequestSlot() {
+			st.lastStreamID = streamID
+			if worker.server.logRequests.Load() {
+				log.Printf("[H2] stream %d: %s %s (native fast)", streamID, meta.method, meta.path)
 			}
-			conn.state = tlsConnStateWriting
-			if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
-				return tlsWorkerActionClose, true
+			Stats.TotalReqs.Add(1)
+			if len(conn.plainBuf) == 0 && len(worker.server.h2RootFast.tlsInner) > 0 && !tlsHTTP2WriteInFlight(conn) {
+				conn.closeAfter = false
+				conn.writeBuf = appendFastH2RootTLSRecord(conn.writeBuf[:0], conn.appWriter, worker.server.h2RootFast, streamID, &conn.innerScratch)
+				conn.writeN = len(conn.writeBuf)
+				conn.writeSent = 0
+				if conn.writeN == 0 {
+					worker.server.releaseRequestSlot()
+					return tlsWorkerActionClose, true
+				}
+				conn.state = tlsConnStateWriting
+				if err := worker.ring.prepSendUserWithFlags(conn.fd, conn.writeBuf[:conn.writeN], tlsEncodeUserData(tlsUringOpWrite, int(conn.index), conn.generation), worker.shouldPollFirstSend()); err != nil {
+					worker.server.releaseRequestSlot()
+					return tlsWorkerActionClose, true
+				}
+				worker.server.releaseRequestSlot()
+				return tlsWorkerActionWrote, false
 			}
+			conn.plainBuf = appendFastH2RootResponse(conn.plainBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+			worker.server.releaseRequestSlot()
 			return tlsWorkerActionWrote, false
 		}
-		conn.plainBuf = appendFastH2RootResponse(conn.plainBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
-		return tlsWorkerActionWrote, false
 	}
 	if len(headers) > 128 {
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrEnhanceYourCalm)
@@ -573,6 +649,10 @@ func (worker *tlsUringWorker) processHTTP2DecodedHeaders(conn *tlsWorkerConn, st
 	return tlsWorkerActionContinue, false
 }
 
+func tlsHTTP2WriteInFlight(conn *tlsWorkerConn) bool {
+	return conn.state == tlsConnStateWriting || conn.writeSent < conn.writeN
+}
+
 func (worker *tlsUringWorker) handleHTTP2Data(conn *tlsWorkerConn, streamID uint32, frameFlags byte, payload []byte) (int, bool) {
 	st := &conn.h2
 	if streamID == 0 {
@@ -594,6 +674,7 @@ func (worker *tlsUringWorker) handleHTTP2Data(conn *tlsWorkerConn, streamID uint
 		return tlsWorkerActionWrote, false
 	}
 
+	frameConsumed := len(payload)
 	if frameFlags&H2FlagPadded != 0 {
 		if len(payload) == 0 {
 			conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrProtocol)
@@ -608,7 +689,7 @@ func (worker *tlsUringWorker) handleHTTP2Data(conn *tlsWorkerConn, streamID uint
 		payload = payload[:len(payload)-padLen]
 	}
 
-	consumed := int64(len(payload))
+	consumed := int64(frameConsumed)
 	st.recvConnWindow -= consumed
 	if st.recvConnWindow < 0 {
 		conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf, st.lastStreamID, H2ErrFlowControl)
@@ -622,7 +703,7 @@ func (worker *tlsUringWorker) handleHTTP2Data(conn *tlsWorkerConn, streamID uint
 		return tlsWorkerActionWrote, false
 	}
 
-	consumedWindow := uint32(len(payload))
+	consumedWindow := uint32(frameConsumed)
 	st.pendingConnWindow += consumedWindow
 	if st.pendingConnWindow > H2ConnectionWindowSize/2 {
 		connUpdate := st.pendingConnWindow
@@ -732,13 +813,13 @@ func (worker *tlsUringWorker) dispatchHTTP2Stream(conn *tlsWorkerConn, streamID 
 		conn.resp.Reset()
 		conn.resp.Status(500).String("Streaming/Hijack unsupported in native TLS io_uring HTTP/2 backend")
 	}
-	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.BodyLen()) > worker.server.config.MaxWriteSize {
+	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
 		conn.resp.Reset()
 		conn.resp.Status(500).String("Response Too Large")
 	}
 
 	conn.plainBuf = appendH2ResponseFrames(conn.plainBuf, streamID, &conn.resp, st.maxFrameSize)
-	bodyLen := int64(conn.resp.BodyLen())
+	bodyLen := int64(conn.resp.transmittedBodyLen())
 	if bodyLen > 0 {
 		streamWindow := stream.Window.Load()
 		if bodyLen > st.connWindow || bodyLen > streamWindow {
@@ -774,6 +855,15 @@ func (worker *tlsUringWorker) flushHTTP2Frames(conn *tlsWorkerConn, closeAfter b
 		}
 		return tlsWorkerActionContinue, nil
 	}
+	if tlsHTTP2WriteInFlight(conn) {
+		if closeAfter {
+			conn.closeAfter = true
+		}
+		if worker.server.IsDebug() {
+			Dbg("[%s] worker HTTP/2 deferring flush while write in flight bytes=%d closeAfter=%v", conn.remoteAddr, len(conn.plainBuf), closeAfter)
+		}
+		return tlsWorkerActionContinue, nil
+	}
 	if worker.server.IsDebug() {
 		Dbg("[%s] worker HTTP/2 flushing %d plain bytes closeAfter=%v", conn.remoteAddr, len(conn.plainBuf), closeAfter)
 	}
@@ -781,7 +871,7 @@ func (worker *tlsUringWorker) flushHTTP2Frames(conn *tlsWorkerConn, closeAfter b
 }
 
 func (worker *tlsUringWorker) queueH2Frames(conn *tlsWorkerConn, closeAfter bool) (int, error) {
-	conn.closeAfter = closeAfter
+	conn.closeAfter = conn.closeAfter || closeAfter
 	conn.writeBuf = buildTLSAppDataRecords(conn.writeBuf[:0], conn.appWriter, conn.plainBuf, &conn.innerScratch)
 	conn.plainBuf = conn.plainBuf[:0]
 	conn.writeN = len(conn.writeBuf)
@@ -956,19 +1046,9 @@ func appendH2ResponseFrames(dst []byte, streamID uint32, resp *Response, maxFram
 	bp := MediumBufPool.Get().(*[]byte)
 	enc := HpackEncoder{}
 	enc.Reset((*bp)[:0])
-	enc.EncodeStatus(resp.StatusCode)
-	if resp.ContentType != "" {
-		enc.EncodeHeader("content-type", resp.ContentType)
-	}
-	var clBuf [20]byte
-	clStr := appendUint(clBuf[:0], int64(resp.BodyLen()))
-	enc.EncodeHeader("content-length", UnsafeString(clStr))
-	for i := range resp.Headers {
-		enc.EncodeHeader(resp.Headers[i][0], resp.Headers[i][1])
-	}
-	enc.EncodeHeader("server", "ALOS")
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers)
 
-	body := resp.bodyBytesUnsafe()
+	body := resp.transmittedBodyBytes()
 	if len(body) == 0 {
 		dst = appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, enc.Buf)
 		*bp = enc.Buf[:0]

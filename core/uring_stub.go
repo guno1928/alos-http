@@ -2,7 +2,10 @@
 
 package core
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 func (s *Server) tryServeWithIOUringPlainWorkers(listeners []net.Listener) (bool, error) {
 	return false, nil
@@ -18,4 +21,8 @@ func ioUringListenerCount(configured int) int {
 
 func wrapConnectedConnWithIOUring(conn net.Conn) (net.Conn, error) {
 	return conn, nil
+}
+
+func dialTCP4DirectIOUring(addr string, timeout time.Duration) (net.Conn, error) {
+	return nil, ErrIOUringRequired
 }

@@ -74,23 +74,27 @@ func (s *Server) ServeH1Plain(conn net.Conn) {
 		for {
 			if fastRoot {
 				if fastResp, consumed, closeConn, ok := s.matchPlainRootFastRequest(readBuf); ok {
-					localReqs++
-					if localReqs&63 == 0 {
-						Stats.TotalReqs.Add(64)
-						localReqs = 0
+					if s.tryAcquireRequestSlot() {
+						localReqs++
+						if localReqs&63 == 0 {
+							Stats.TotalReqs.Add(64)
+							localReqs = 0
+						}
+						err := writeFull(conn, fastResp)
+						s.releaseRequestSlot()
+						if err != nil {
+							return
+						}
+						if closeConn {
+							return
+						}
+						if consumed == len(readBuf) {
+							readBuf = readBuf[:0]
+						} else {
+							readBuf = readBuf[consumed:]
+						}
+						continue
 					}
-					if err := writeFull(conn, fastResp); err != nil {
-						return
-					}
-					if closeConn {
-						return
-					}
-					if consumed == len(readBuf) {
-						readBuf = readBuf[:0]
-					} else {
-						readBuf = readBuf[consumed:]
-					}
-					continue
 				}
 			}
 
@@ -186,7 +190,7 @@ func (s *Server) ServeH1Plain(conn net.Conn) {
 			if fastDispatch {
 				handler := s.Router.Lookup(req.Method, req.Path, req)
 				handler(req, resp)
-				if maxWrite > 0 && int64(resp.BodyLen()) > maxWrite {
+				if maxWrite > 0 && int64(resp.transmittedBodyLen()) > maxWrite {
 					resp.resetFastH1()
 					resp.Status(500).String("Response Too Large")
 				}
@@ -253,13 +257,15 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		}
 	}
 
-	bodyLen := resp.BodyLen()
-	if bodyLen < 256 {
-		dst = append(dst, smallCL[bodyLen]...)
-	} else {
-		dst = append(dst, "Content-Length: "...)
-		dst = appendUint(dst, int64(bodyLen))
-		dst = append(dst, '\r', '\n')
+	bodyLen := resp.headerContentLength()
+	if bodyLen >= 0 {
+		if bodyLen < 256 {
+			dst = append(dst, smallCL[bodyLen]...)
+		} else {
+			dst = append(dst, "Content-Length: "...)
+			dst = appendUint(dst, int64(bodyLen))
+			dst = append(dst, '\r', '\n')
+		}
 	}
 
 	for i := range resp.Headers {
@@ -276,7 +282,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 	}
 	dst = append(dst, '\r', '\n')
 	if includeBody {
-		dst = resp.appendBody(dst)
+		dst = resp.appendTransmittedBody(dst)
 	}
 	return dst
 }

@@ -259,6 +259,41 @@ func (worker *plainUringWorker) processHTTP2DecodedHeaders(conn *plainWorkerConn
 		return tlsWorkerActionWrote, true
 	}
 
+	if endStream && worker.server.h2RootFast.enabled && matchIndexedH2FastRootHeaderBlock(headerBlock) {
+		if worker.server.tryAcquireRequestSlot() {
+			st.lastStreamID = streamID
+			if worker.server.logRequests.Load() {
+				log.Printf("[H2C] stream %d: GET / (native fast)", streamID)
+			}
+			Stats.TotalReqs.Add(1)
+			conn.closeAfter = false
+			conn.writeBuf = appendFastH2RootResponse(conn.writeBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+			worker.server.releaseRequestSlot()
+			return tlsWorkerActionWrote, false
+		}
+	}
+
+	if endStream && worker.server.h2RootFast.enabled {
+		meta, ok, err := st.decoder.DecodeFastRootRequest(headerBlock)
+		if err != nil {
+			conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrCompression)
+			return tlsWorkerActionWrote, false
+		}
+		if ok {
+			if worker.server.tryAcquireRequestSlot() {
+				st.lastStreamID = streamID
+				if worker.server.logRequests.Load() {
+					log.Printf("[H2C] stream %d: %s %s (native fast meta)", streamID, meta.method, meta.path)
+				}
+				Stats.TotalReqs.Add(1)
+				conn.closeAfter = false
+				conn.writeBuf = appendFastH2RootResponse(conn.writeBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+				worker.server.releaseRequestSlot()
+				return tlsWorkerActionWrote, false
+			}
+		}
+	}
+
 	headers, meta, err := st.decoder.DecodeIntoRequest(st.headersBuf[:0], headerBlock)
 	st.headersBuf = headers[:0]
 	if err != nil {
@@ -266,14 +301,17 @@ func (worker *plainUringWorker) processHTTP2DecodedHeaders(conn *plainWorkerConn
 		return tlsWorkerActionWrote, false
 	}
 	if endStream && worker.server.h2RootFast.enabled && meta.method == "GET" && meta.path == "/" {
-		st.lastStreamID = streamID
-		if worker.server.logRequests.Load() {
-			log.Printf("[H2C] stream %d: %s %s (native fast)", streamID, meta.method, meta.path)
+		if worker.server.tryAcquireRequestSlot() {
+			st.lastStreamID = streamID
+			if worker.server.logRequests.Load() {
+				log.Printf("[H2C] stream %d: %s %s (native fast)", streamID, meta.method, meta.path)
+			}
+			Stats.TotalReqs.Add(1)
+			conn.closeAfter = false
+			conn.writeBuf = appendFastH2RootResponse(conn.writeBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
+			worker.server.releaseRequestSlot()
+			return tlsWorkerActionWrote, false
 		}
-		Stats.TotalReqs.Add(1)
-		conn.closeAfter = false
-		conn.writeBuf = appendFastH2RootResponse(conn.writeBuf, worker.server.h2RootFast, streamID, int(st.maxFrameSize))
-		return tlsWorkerActionWrote, false
 	}
 	if len(headers) > 128 {
 		conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrEnhanceYourCalm)
@@ -327,6 +365,7 @@ func (worker *plainUringWorker) handleHTTP2Data(conn *plainWorkerConn, streamID 
 		conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrStreamClosed)
 		return tlsWorkerActionWrote, false
 	}
+	frameConsumed := len(payload)
 	if frameFlags&H2FlagPadded != 0 {
 		if len(payload) == 0 {
 			conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrProtocol)
@@ -341,7 +380,7 @@ func (worker *plainUringWorker) handleHTTP2Data(conn *plainWorkerConn, streamID 
 		payload = payload[:len(payload)-padLen]
 	}
 
-	consumed := int64(len(payload))
+	consumed := int64(frameConsumed)
 	st.recvConnWindow -= consumed
 	if st.recvConnWindow < 0 {
 		conn.writeBuf = appendH2GoAwayFrame(conn.writeBuf, st.lastStreamID, H2ErrFlowControl)
@@ -355,7 +394,7 @@ func (worker *plainUringWorker) handleHTTP2Data(conn *plainWorkerConn, streamID 
 		return tlsWorkerActionWrote, false
 	}
 
-	consumedWindow := uint32(len(payload))
+	consumedWindow := uint32(frameConsumed)
 	st.pendingConnWindow += consumedWindow
 	if st.pendingConnWindow > H2ConnectionWindowSize/2 {
 		connUpdate := st.pendingConnWindow
@@ -453,14 +492,14 @@ func (worker *plainUringWorker) dispatchHTTP2Stream(conn *plainWorkerConn, strea
 		conn.resp.Reset()
 		conn.resp.Status(500).String("Streaming/Hijack unsupported in plain io_uring HTTP/2 backend")
 	}
-	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.BodyLen()) > worker.server.config.MaxWriteSize {
+	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
 		conn.resp.Reset()
 		conn.resp.Status(500).String("Response Too Large")
 	}
 
 	start := len(conn.writeBuf)
 	conn.writeBuf = appendH2ResponseFrames(conn.writeBuf, streamID, &conn.resp, st.maxFrameSize)
-	bodyLen := int64(conn.resp.BodyLen())
+	bodyLen := int64(conn.resp.transmittedBodyLen())
 	if bodyLen > 0 {
 		streamWindow := stream.Window.Load()
 		if bodyLen > st.connWindow || bodyLen > streamWindow {

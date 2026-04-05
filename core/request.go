@@ -71,6 +71,9 @@ type Request struct {
 	cachedWSVer     string
 	headerCacheMask uint32
 	server          *Server
+	attachConn      func(*Request) net.Conn
+	connTakenOver   bool
+	hijackReadBuf   []byte
 }
 
 const (
@@ -119,6 +122,9 @@ func (r *Request) Reset() {
 	r.cachedWSVer = ""
 	r.headerCacheMask = 0
 	r.server = nil
+	r.attachConn = nil
+	r.connTakenOver = false
+	r.hijackReadBuf = nil
 }
 
 func (r *Request) resetFastH1() {
@@ -139,6 +145,19 @@ func (r *Request) resetFastH1() {
 	r.cachedWSKey = ""
 	r.cachedWSVer = ""
 	r.headerCacheMask = 0
+	r.attachConn = nil
+	r.connTakenOver = false
+	r.hijackReadBuf = nil
+}
+
+func (r *Request) ensureConn() net.Conn {
+	if r.conn != nil {
+		return r.conn
+	}
+	if r.attachConn == nil {
+		return nil
+	}
+	return r.attachConn(r)
 }
 
 func (r *Request) cacheHeaderLookup(bit uint32, slot *string, name string) string {
@@ -170,6 +189,9 @@ func (r *Request) cacheHeaderLookup(bit uint32, slot *string, name string) strin
 func (r *Request) HijackConn() net.Conn {
 	r.hijacked = true
 	if r.conn == nil {
+		r.ensureConn()
+	}
+	if r.conn == nil {
 		return nil
 	}
 	if r.tlsReader != nil && r.tlsWriter != nil {
@@ -177,10 +199,11 @@ func (r *Request) HijackConn() net.Conn {
 			return nil
 		}
 		return &aead13Conn{
-			conn:   r.conn,
-			reader: r.tlsReader,
-			writer: r.tlsWriter,
-			hdrBuf: r.hdrBuf,
+			conn:    r.conn,
+			reader:  r.tlsReader,
+			writer:  r.tlsWriter,
+			hdrBuf:  r.hdrBuf,
+			readBuf: append([]byte(nil), r.hijackReadBuf...),
 		}
 	}
 	return r.conn

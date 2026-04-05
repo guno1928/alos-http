@@ -66,17 +66,32 @@ func (r *Response) ensureSW() StreamWriter {
 	if r.sw != nil {
 		return r.sw
 	}
-	if r.lazyReq == nil || r.lazyReq.server == nil || r.lazyReq.conn == nil {
+	if r.lazyReq == nil || r.lazyReq.server == nil {
 		return nil
 	}
 	req := r.lazyReq
+	if req.conn == nil {
+		req.ensureConn()
+	}
+	if req.conn == nil {
+		return nil
+	}
 	var sw StreamWriter
 	if req.tlsWriter != nil {
 		sw = req.server.NewH1StreamWriter(req.conn, req.tlsWriter)
 	} else {
 		sw = req.server.NewPlainH1StreamWriter(req.conn)
 	}
+	if req.connTakenOver {
+		switch writer := sw.(type) {
+		case *H1StreamWriter:
+			writer.closeAfter = true
+		case *PlainH1StreamWriter:
+			writer.closeAfter = true
+		}
+	}
 	req.StreamWriter = sw
+	bindRequestMethodToStreamWriter(sw, req.Method)
 	r.sw = sw
 	return sw
 }
@@ -242,6 +257,65 @@ func (r *Response) BodyLen() int {
 		return len(r.bodyString)
 	}
 	return len(r.body)
+}
+
+func responseBodyDisposition(method string, statusCode int) (suppressBody bool, omitContentLength bool) {
+	if statusCode >= 100 && statusCode < 200 {
+		return true, true
+	}
+	switch statusCode {
+	case 204, 205:
+		return true, true
+	case 304:
+		suppressBody = true
+	}
+	if method != "" {
+		if EqualFoldASCII(method, "HEAD") {
+			suppressBody = true
+		}
+		if statusCode >= 200 && statusCode < 300 && EqualFoldASCII(method, "CONNECT") {
+			return true, true
+		}
+	}
+	return suppressBody, omitContentLength
+}
+
+func (r *Response) headerContentLength() int {
+	method := ""
+	if r.lazyReq != nil {
+		method = r.lazyReq.Method
+	}
+	_, omitContentLength := responseBodyDisposition(method, r.StatusCode)
+	if omitContentLength {
+		return -1
+	}
+	return r.BodyLen()
+}
+
+func (r *Response) transmittedBodyLen() int {
+	method := ""
+	if r.lazyReq != nil {
+		method = r.lazyReq.Method
+	}
+	suppressBody, _ := responseBodyDisposition(method, r.StatusCode)
+	if suppressBody {
+		return 0
+	}
+	return r.BodyLen()
+}
+
+func (r *Response) transmittedBodyBytes() []byte {
+	if r.transmittedBodyLen() == 0 {
+		return nil
+	}
+	return r.bodyBytesUnsafe()
+}
+
+func (r *Response) appendTransmittedBody(dst []byte) []byte {
+	if r.transmittedBodyLen() == 0 {
+		return dst
+	}
+	return r.appendBody(dst)
 }
 
 func (r *Response) SetStreamer(sw StreamWriter) {

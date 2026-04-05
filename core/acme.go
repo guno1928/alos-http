@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,10 +9,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +30,7 @@ import (
 //	cfg := core.Config{
 //	    ACME: &core.ACMEConfig{
 //	        Email:    "admin@example.com",
-//	        CacheDir: "/var/certs",
+//	        CacheDir: "/etc/letsencrypt",
 //	        Domains:  []string{"example.com", "www.example.com"},
 //	    },
 //	}
@@ -42,6 +45,7 @@ const (
 	acmeRetryInterval   = 5 * time.Minute
 	acmeRetryMax        = 3
 	acmeLongWait        = 24 * time.Hour
+	acmeAuthzRetryMax   = 5
 	acmeRenewBefore     = 30 * 24 * time.Hour
 	acmeRenewCheckEvery = 6 * time.Hour
 )
@@ -85,22 +89,22 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = "/etc/letsencrypt"
 	}
+	if err := os.MkdirAll(cfg.CacheDir, 0700); err != nil {
+		acmePrintf("[ACME] failed to create ACME work dir %s: %v", cfg.CacheDir, err)
+	}
 	directoryURL := acme.LetsEncryptURL
 	if cfg.ACMENode != "" {
 		directoryURL = cfg.ACMENode
 	}
-
-	for _, sub := range []string{"live", "archive", "renewal"} {
-		dir := filepath.Join(cfg.CacheDir, sub)
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			acmePrintf("[ACME] failed to create dir %s: %v", dir, err)
-		}
+	if err := ensureCertbotLayout(cfg.CacheDir); err != nil {
+		acmePrintf("[ACME] failed to initialize Certbot-style storage under %s: %v", cfg.CacheDir, err)
 	}
 
 	challengeDir := filepath.Join(cfg.CacheDir, ".well-known", "acme-challenge")
 	if err := os.MkdirAll(challengeDir, 0700); err != nil {
 		acmePrintf("[ACME] failed to create challenge dir %s: %v", challengeDir, err)
 	}
+	acmePrintf("[ACME] cert persistence enabled; cache dir: %s", cfg.CacheDir)
 	acmePrintf("[ACME] challenge dir: %s", challengeDir)
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -354,34 +358,61 @@ func (ai *acmeIntegration) initialObtainAll() {
 	}
 }
 
-func (ai *acmeIntegration) tryLoadCached(domain string) bool {
-	certPath := filepath.Join(ai.cacheDir, "live", domain, "fullchain.pem")
-	keyPath := filepath.Join(ai.cacheDir, "live", domain, "privkey.pem")
+func ensureCertbotLayout(cacheDir string) error {
+	for _, dir := range []string{
+		filepath.Join(cacheDir, "live"),
+		filepath.Join(cacheDir, "archive"),
+		filepath.Join(cacheDir, "renewal"),
+	} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(filepath.Join(cacheDir, "live", "README"), []byte(certbotLiveREADME(true)), 0644)
+}
 
-	certPEM, err := os.ReadFile(certPath)
+func certbotLiveREADME(isBaseDir bool) string {
+	prefix := ""
+	if isBaseDir {
+		prefix = "[cert name]/"
+	}
+	return fmt.Sprintf("This directory contains your keys and certificates.\n\n%sprivkey.pem  : the private key for your certificate.\n%sfullchain.pem: the certificate file used in most server software.\n%schain.pem    : used for OCSP stapling support.\n%scert.pem     : the server certificate only.\n\nWARNING: DO NOT MOVE OR RENAME THESE FILES!\n         Certbot-style tools expect these files to remain here.\n", prefix, prefix, prefix, prefix)
+}
+
+func (ai *acmeIntegration) certbotLiveDir(domain string) string {
+	return filepath.Join(ai.cacheDir, "live", domain)
+}
+
+func (ai *acmeIntegration) certbotArchiveDir(domain string) string {
+	return filepath.Join(ai.cacheDir, "archive", domain)
+}
+
+func (ai *acmeIntegration) certbotRenewalPath(domain string) string {
+	return filepath.Join(ai.cacheDir, "renewal", domain+".conf")
+}
+
+func (ai *acmeIntegration) tryLoadCached(domain string) bool {
+	fullchainPath := filepath.Join(ai.certbotLiveDir(domain), "fullchain.pem")
+	privkeyPath := filepath.Join(ai.certbotLiveDir(domain), "privkey.pem")
+
+	certPEM, err := os.ReadFile(fullchainPath)
 	if err != nil {
-		acmePrintf("[ACME] no cached cert for %s at %s", domain, certPath)
 		return false
 	}
-	keyPEM, err := os.ReadFile(keyPath)
+	keyPEM, err := os.ReadFile(privkeyPath)
 	if err != nil {
-		acmePrintf("[ACME] no cached key for %s at %s", domain, keyPath)
+		acmePrintf("[ACME] cached lineage for %s missing private key at %s: %v", domain, privkeyPath, err)
 		return false
 	}
 
 	entry, err := NewCertEntryFromPEM(domain, certPEM, keyPEM, CertACME)
 	if err != nil {
-		acmePrintf("[ACME] cached cert for %s failed to parse: %v", domain, err)
+		acmePrintf("[ACME] failed to parse cached cert for %s: %v", domain, err)
 		return false
 	}
-
-	leaf, err := x509.ParseCertificate(entry.ChainDER[0])
+	leaf, err := validatePersistedACMECert(domain, entry)
 	if err != nil {
-		acmePrintf("[ACME] cached cert for %s failed to parse leaf: %v", domain, err)
-		return false
-	}
-	if time.Until(leaf.NotAfter) < 0 {
-		acmePrintf("[ACME] cached cert for %s expired on %s, will re-obtain", domain, leaf.NotAfter.Format("2006-01-02"))
+		acmePrintf("[ACME] cached cert for %s rejected: %v", domain, err)
 		return false
 	}
 
@@ -390,9 +421,182 @@ func (ai *acmeIntegration) tryLoadCached(domain string) bool {
 		ai.server.certStore.SetDefault(ai.server.config.DefaultDomain)
 	}
 	ai.server.rebuildFallbackTLSConfig()
-	daysLeft := int(time.Until(leaf.NotAfter).Hours() / 24)
-	acmePrintf("[ACME] loaded cached cert for %s (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
+	acmePrintf("[ACME] loaded cached cert for %s from %s (expires %s)", domain, fullchainPath, leaf.NotAfter.Format("2006-01-02 15:04:05"))
 	return true
+}
+
+func validatePersistedACMECert(domain string, entry *CertEntry) (*x509.Certificate, error) {
+	if entry == nil || len(entry.ChainDER) == 0 {
+		return nil, &staticError{"persisted ACME lineage is empty"}
+	}
+	leaf, err := x509.ParseCertificate(entry.ChainDER[0])
+	if err != nil {
+		return nil, err
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return nil, err
+	}
+	if time.Now().After(leaf.NotAfter) {
+		return nil, &staticError{"persisted ACME certificate has expired"}
+	}
+	if bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
+		return nil, &staticError{"persisted ACME certificate is self-signed"}
+	}
+	return leaf, nil
+}
+
+func nextArchiveVersion(archiveDir string) (int, error) {
+	entries, err := os.ReadDir(archiveDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 1, nil
+		}
+		return 0, err
+	}
+	maxVersion := 0
+	for _, entry := range entries {
+		version := archiveVersionFromName(entry.Name())
+		if version > maxVersion {
+			maxVersion = version
+		}
+	}
+	return maxVersion + 1, nil
+}
+
+func archiveVersionFromName(name string) int {
+	if !strings.HasSuffix(name, ".pem") {
+		return 0
+	}
+	base := strings.TrimSuffix(name, ".pem")
+	for _, prefix := range []string{"cert", "chain", "fullchain", "privkey"} {
+		if !strings.HasPrefix(base, prefix) {
+			continue
+		}
+		version, err := strconv.Atoi(base[len(prefix):])
+		if err != nil || version < 1 {
+			return 0
+		}
+		return version
+	}
+	return 0
+}
+
+func writeLiveSymlink(livePath, archivePath string) error {
+	if err := os.Remove(livePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	relTarget, err := filepath.Rel(filepath.Dir(livePath), archivePath)
+	if err != nil {
+		return err
+	}
+	return os.Symlink(relTarget, livePath)
+}
+
+func writeRenewalConfig(path, archiveDir, liveDir, directoryURL, webrootPath string) error {
+	content := fmt.Sprintf("version = 1.0.0\narchive_dir = %s\ncert = %s\nprivkey = %s\nchain = %s\nfullchain = %s\n\n[renewalparams]\nauthenticator = webroot\nserver = %s\nkey_type = ecdsa\nwebroot_path = %s\n",
+		archiveDir,
+		filepath.Join(liveDir, "cert.pem"),
+		filepath.Join(liveDir, "privkey.pem"),
+		filepath.Join(liveDir, "chain.pem"),
+		filepath.Join(liveDir, "fullchain.pem"),
+		directoryURL,
+		webrootPath,
+	)
+	return os.WriteFile(path, []byte(content), 0600)
+}
+
+func (ai *acmeIntegration) saveCertbotLineage(domain string, certPEM, chainPEM, fullchainPEM, keyPEM []byte) error {
+	liveDir := ai.certbotLiveDir(domain)
+	archiveDir := ai.certbotArchiveDir(domain)
+	if err := os.MkdirAll(liveDir, 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(archiveDir, 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(ai.certbotRenewalPath(domain)), 0700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(liveDir, "README"), []byte(certbotLiveREADME(false)), 0644); err != nil {
+		return err
+	}
+
+	version, err := nextArchiveVersion(archiveDir)
+	if err != nil {
+		return err
+	}
+
+	archiveTargets := map[string]string{
+		"cert":      filepath.Join(archiveDir, fmt.Sprintf("cert%d.pem", version)),
+		"chain":     filepath.Join(archiveDir, fmt.Sprintf("chain%d.pem", version)),
+		"fullchain": filepath.Join(archiveDir, fmt.Sprintf("fullchain%d.pem", version)),
+		"privkey":   filepath.Join(archiveDir, fmt.Sprintf("privkey%d.pem", version)),
+	}
+	if err := os.WriteFile(archiveTargets["cert"], certPEM, 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(archiveTargets["chain"], chainPEM, 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(archiveTargets["fullchain"], fullchainPEM, 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(archiveTargets["privkey"], keyPEM, 0600); err != nil {
+		return err
+	}
+
+	for kind, archivePath := range archiveTargets {
+		if err := writeLiveSymlink(filepath.Join(liveDir, kind+".pem"), archivePath); err != nil {
+			return err
+		}
+	}
+
+	return writeRenewalConfig(ai.certbotRenewalPath(domain), archiveDir, liveDir, ai.client.DirectoryURL, ai.cacheDir)
+}
+
+func isTransientACMEAuthorizationLookupError(err error) bool {
+	acmeErr, ok := err.(*acme.Error)
+	if !ok {
+		return false
+	}
+	if acmeErr.StatusCode != 404 && acmeErr.StatusCode != 400 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(acmeErr.Detail), "no such authorization")
+}
+
+func (ai *acmeIntegration) getAuthorizationWithRetry(ctx context.Context, orderURL, domain string, authzIndex int, authzURL string) (*acme.Authorization, error) {
+	currentURL := authzURL
+	for attempt := 1; attempt <= acmeAuthzRetryMax; attempt++ {
+		authz, err := ai.client.GetAuthorization(ctx, currentURL)
+		if err == nil {
+			return authz, nil
+		}
+		if !isTransientACMEAuthorizationLookupError(err) || attempt == acmeAuthzRetryMax {
+			return nil, err
+		}
+
+		acmePrintf("[ACME] authorization for %s not ready yet (attempt %d/%d): %v", domain, attempt, acmeAuthzRetryMax, err)
+		if orderURL != "" {
+			order, orderErr := ai.client.GetOrder(ctx, orderURL)
+			if orderErr != nil {
+				acmePrintf("[ACME] failed to refresh order %s while waiting for authorization: %v", orderURL, orderErr)
+			} else if authzIndex >= 0 && authzIndex < len(order.AuthzURLs) && order.AuthzURLs[authzIndex] != "" && order.AuthzURLs[authzIndex] != currentURL {
+				acmePrintf("[ACME] authorization URL for %s updated: %s -> %s", domain, currentURL, order.AuthzURLs[authzIndex])
+				currentURL = order.AuthzURLs[authzIndex]
+			}
+		}
+
+		delay := time.Duration(attempt) * 500 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, &staticError{"authorization lookup retries exhausted"}
 }
 
 func (ai *acmeIntegration) obtainWithRetry(domain string) {
@@ -464,11 +668,11 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		acmePrintf("[ACME] authorize order failed for %s: %v", domain, err)
 		return err
 	}
-	acmePrintf("[ACME] order created, %d authorization(s)", len(order.AuthzURLs))
+	acmePrintf("[ACME] order created: status=%s authz=%d url=%s", order.Status, len(order.AuthzURLs), order.URI)
 
 	for i, authzURL := range order.AuthzURLs {
 		acmePrintf("[ACME] processing authorization %d/%d: %s", i+1, len(order.AuthzURLs), authzURL)
-		authz, err := ai.client.GetAuthorization(ctx, authzURL)
+		authz, err := ai.getAuthorizationWithRetry(ctx, order.URI, domain, i, authzURL)
 		if err != nil {
 			acmePrintf("[ACME] get authorization failed: %v", err)
 			return err
@@ -531,6 +735,16 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		ai.cleanupChallenge(domain, chal.Token)
 	}
 
+	if order.URI != "" {
+		acmePrintf("[ACME] waiting for order %s to become ready...", order.URI)
+		order, err = ai.client.WaitOrder(ctx, order.URI)
+		if err != nil {
+			acmePrintf("[ACME] order wait failed for %s: %v", domain, err)
+			return err
+		}
+		acmePrintf("[ACME] order ready for %s: status=%s", domain, order.Status)
+	}
+
 	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
@@ -555,6 +769,11 @@ func (ai *acmeIntegration) obtain(domain string) error {
 	for _, d := range der {
 		certBuf = append(certBuf, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: d})...)
 	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der[0]})
+	var chainPEM []byte
+	for _, d := range der[1:] {
+		chainPEM = append(chainPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: d})...)
+	}
 
 	keyBytes, err := x509.MarshalECPrivateKey(certKey)
 	if err != nil {
@@ -567,85 +786,19 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		acmePrintf("[ACME] failed to parse obtained cert for %s: %v", domain, err)
 		return err
 	}
+	if err := ai.saveCertbotLineage(domain, certPEM, chainPEM, certBuf, keyPEM); err != nil {
+		acmePrintf("[ACME] WARNING: failed to persist cert lineage for %s under %s: %v", domain, ai.cacheDir, err)
+	} else {
+		acmePrintf("[ACME] persisted cert lineage for %s under %s", domain, ai.certbotLiveDir(domain))
+	}
 	ai.server.certStore.AddCert(entry)
 	if ai.server.config.DefaultDomain != "" {
 		ai.server.certStore.SetDefault(ai.server.config.DefaultDomain)
 	}
 	ai.server.rebuildFallbackTLSConfig()
 
-	liveDir := filepath.Join(ai.cacheDir, "live", domain)
-	archiveDir := filepath.Join(ai.cacheDir, "archive", domain)
-	for _, d := range []string{liveDir, archiveDir} {
-		if err := os.MkdirAll(d, 0700); err != nil {
-			acmePrintf("[ACME] WARNING: failed to create dir %s: %v", d, err)
-		}
-	}
-
-	archiveCert := filepath.Join(archiveDir, "fullchain1.pem")
-	archiveKey := filepath.Join(archiveDir, "privkey1.pem")
-	if err := os.WriteFile(archiveCert, certBuf, 0644); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save archived cert to %s: %v", archiveCert, err)
-	}
-	if err := os.WriteFile(archiveKey, keyPEM, 0600); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save archived key to %s: %v", archiveKey, err)
-	}
-
-	certPath := filepath.Join(liveDir, "fullchain.pem")
-	keyPath := filepath.Join(liveDir, "privkey.pem")
-	chainPath := filepath.Join(liveDir, "chain.pem")
-	certOnlyPath := filepath.Join(liveDir, "cert.pem")
-
-	if err := os.WriteFile(certPath, certBuf, 0644); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save cert to %s: %v", certPath, err)
-	} else {
-		acmePrintf("[ACME] saved cert to %s", certPath)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save key to %s: %v", keyPath, err)
-	} else {
-		acmePrintf("[ACME] saved key to %s", keyPath)
-	}
-
-	var leafPEM, chainPEMData []byte
-	rest := certBuf
-	first := true
-	for len(rest) > 0 {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		encoded := pem.EncodeToMemory(block)
-		if first {
-			leafPEM = encoded
-			first = false
-		} else {
-			chainPEMData = append(chainPEMData, encoded...)
-		}
-	}
-	if err := os.WriteFile(certOnlyPath, leafPEM, 0644); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save leaf cert to %s: %v", certOnlyPath, err)
-	}
-	if err := os.WriteFile(chainPath, chainPEMData, 0644); err != nil {
-		acmePrintf("[ACME] WARNING: failed to save chain cert to %s: %v", chainPath, err)
-	}
-
-	renewalConf := filepath.Join(ai.cacheDir, "renewal", domain+".conf")
-	renewalData := "# ALOS auto-generated renewal config\n" +
-		"[renewalparams]\n" +
-		"account = alos-managed\n" +
-		"authenticator = http-01\n" +
-		"server = " + ai.client.DirectoryURL + "\n" +
-		"\n[[ webroot ]]\n" +
-		"[[webroot_map]]\n" +
-		domain + " = " + ai.challengeDir + "\n"
-	if err := os.WriteFile(renewalConf, []byte(renewalData), 0644); err != nil {
-		acmePrintf("[ACME] WARNING: failed to write renewal config to %s: %v", renewalConf, err)
-	} else {
-		acmePrintf("[ACME] wrote renewal config to %s", renewalConf)
-	}
-
 	leaf, _ := x509.ParseCertificate(der[0])
+	acmePrintf("[ACME] installed fresh in-memory cert for %s", domain)
 	if leaf != nil {
 		acmePrintf("[ACME] OBTAINED cert for %s (expires %s, issuer: %s)", domain, leaf.NotAfter.Format("2006-01-02 15:04:05"), leaf.Issuer.CommonName)
 	} else {
@@ -660,6 +813,15 @@ func (ai *acmeIntegration) cleanupChallenge(domain, token string) {
 	if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
 		acmePrintf("[ACME] WARNING: failed to remove challenge file %s: %v", tokenFile, err)
 	}
+}
+
+func (ai *acmeIntegration) renewDomainOnce(domain string) {
+	if err := ai.obtain(domain); err != nil {
+		acmePrintf("[ACME] renewal FAILED for %s: %v", domain, err)
+		acmePrintf("[ACME] renewal for %s will retry on the next scheduled check in %s", domain, acmeRenewCheckEvery)
+		return
+	}
+	acmePrintf("[ACME] renewal SUCCEEDED for %s", domain)
 }
 
 func (ai *acmeIntegration) renewAll() {
@@ -681,11 +843,7 @@ func (ai *acmeIntegration) renewAll() {
 			continue
 		}
 		acmePrintf("[ACME] cert for %s NEEDS RENEWAL (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
-		if err := ai.obtain(domain); err != nil {
-			acmePrintf("[ACME] renewal FAILED for %s: %v", domain, err)
-		} else {
-			acmePrintf("[ACME] renewal SUCCEEDED for %s", domain)
-		}
+		ai.renewDomainOnce(domain)
 	}
 	acmePrintf("[ACME] renewal check complete")
 }
@@ -703,10 +861,10 @@ func (ai *acmeIntegration) addDomain(domain string) {
 	ai.domainMu.Unlock()
 
 	acmePrintf("[ACME] added domain %s for ACME management", domain)
+	if ai.tryLoadCached(domain) {
+		return
+	}
 	go func() {
-		if ai.tryLoadCached(domain) {
-			return
-		}
 		ai.obtainWithRetry(domain)
 	}()
 }
