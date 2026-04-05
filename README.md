@@ -184,7 +184,9 @@ func main() {
 
 ALOS HTTP has a built-in finetuner for Linux amd64. It benchmarks a set of worker and listener combinations on your machine, applies the best result automatically, and prints the full sweep at the end.
 
-With the current default sweep it takes about 3 minutes to fully complete the raw benchmark runs, plus a little extra startup and shutdown time between runs.
+With the current default sweep it takes about 6 minutes to fully complete the raw benchmark runs, plus a little extra startup and shutdown time between runs.
+
+this only has to be ran ONCE per machine to find the best tune.
 
 ```go
 if err := srv.FineTune(); err != nil {
