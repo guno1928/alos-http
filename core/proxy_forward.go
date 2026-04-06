@@ -14,11 +14,12 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 		return false
 	}
 
-	cacheAllowed := pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") && proxyCacheRequestAllowed(req)
-	if cacheAllowed {
-		entry, hit := pe.Cache.Get(req.Method, host, req.Path, req.Header("accept-encoding"))
+	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
+	cache := pe.Cache
+	if cache != nil && cacheableMethod {
+		entry, hit := cache.Get(req.Method, host, req.Path, req)
 		if hit {
-			pe.Cache.ServeCached(entry, req, resp)
+			cache.ServeCached(entry, req, resp)
 			if pe.OnResponse != nil {
 				pr := &ProxyResponse{
 					Domain:     ds.config.Domain,
@@ -30,6 +31,7 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 					Headers:    resp.Headers,
 				}
 				pe.OnResponse(pr)
+				resp.Status(pr.StatusCode)
 				resp.Headers = pr.Headers
 			}
 			return true
@@ -129,7 +131,9 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 	if isWebSocket(req) {
 		return pe.forwardWebSocket(req, resp, b, cfg)
 	}
-	cacheAllowed := pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") && proxyCacheRequestAllowed(req)
+	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
+	autoCacheAllowed := cacheableMethod && proxyCacheRequestAllowed(req)
+	cache := pe.Cache
 
 	pc, err := b.pool.get()
 	if err != nil {
@@ -180,17 +184,22 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 		headers = pr.Headers
 		statusCode = pr.StatusCode
 
-		if pr.cacheRequested && pe.Cache != nil {
-			manualCache = true
-			manualTTL = pr.cacheTTL
-			manualMaxHits = pr.cacheMaxHits
-			manualCompress = pr.cacheCompress
-			manualCompressMin = pr.cacheCompressMin
+		if pr.cacheRequested && cacheableMethod {
+			if cache == nil {
+				cache = pe.ensureCache()
+			}
+			if cache != nil {
+				manualCache = true
+				manualTTL = pr.cacheTTL
+				manualMaxHits = pr.cacheMaxHits
+				manualCompress = pr.cacheCompress
+				manualCompressMin = pr.cacheCompressMin
+			}
 		}
 	}
 
 	if manualCache && (isChunked || contentLength > 65536) {
-		cacheMax := pe.Cache.config.Load().MaxEntrySize
+		cacheMax := cache.config.Load().MaxEntrySize
 		if cacheMax <= 0 {
 			cacheMax = 4 << 20
 		}
@@ -221,8 +230,8 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			resp.SetBody(body)
 
 			host := stripPort(req.Host)
-			if cacheAllowed && proxyCacheResponseAllowed(headers) {
-				pe.Cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+			if manualCache && cache != nil {
+				cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
 			}
 
 			if keepAlive {
@@ -253,13 +262,12 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			resp.SetBody(bodyBuf)
 		}
 
-		if cacheAllowed && proxyCacheResponseAllowed(headers) {
+		if manualCache && cache != nil {
 			host := stripPort(req.Host)
-			if manualCache {
-				pe.Cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody(), manualTTL, manualMaxHits, manualCompress, manualCompressMin)
-			} else {
-				pe.Cache.Put(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody())
-			}
+			cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody(), manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+		} else if autoCacheAllowed && cache != nil && proxyCacheResponseAllowed(headers) {
+			host := stripPort(req.Host)
+			cache.Put(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody())
 		}
 
 		if keepAlive {

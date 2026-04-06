@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/guno1928/alosmap"
 )
 
 type dnsCacheEntry struct {
@@ -17,7 +18,7 @@ type dnsCacheEntry struct {
 }
 
 var (
-	dnsCache    sync.Map
+	dnsCache    = alosmap.New(alosmap.WithoutCleanup())
 	dnsTTL      = int64(60)
 	dnsResolver = &net.Resolver{
 		PreferGo: true,

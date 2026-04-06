@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/guno1928/alosmap"
 )
 
 type CertSource uint8
@@ -61,20 +63,16 @@ type CertInfo struct {
 	Source CertSource
 }
 
-type certSnapshot struct {
-	byDomain map[string]*CertEntry
-	defEntry *CertEntry
-}
-
 type CertStore struct {
-	snapshot atomic.Pointer[certSnapshot]
+	certs    *alosmap.Map
+	defEntry atomic.Pointer[CertEntry]
 	mu       sync.Mutex
 }
 
 func NewCertStore() *CertStore {
-	cs := &CertStore{}
-	snap := &certSnapshot{byDomain: make(map[string]*CertEntry, 4)}
-	cs.snapshot.Store(snap)
+	cs := &CertStore{
+		certs: alosmap.New(alosmap.WithoutCleanup()),
+	}
 	return cs
 }
 
@@ -85,14 +83,13 @@ func normalizeCertDomain(domain string) string {
 }
 
 func (cs *CertStore) Lookup(serverName string) *CertEntry {
-	snap := cs.snapshot.Load()
 	serverName = normalizeCertDomain(serverName)
 	if serverName != "" {
-		if entry, ok := snap.byDomain[serverName]; ok {
-			return entry
+		if v, ok := cs.certs.Load(serverName); ok {
+			return v.(*CertEntry)
 		}
 	}
-	return snap.defEntry
+	return cs.defEntry.Load()
 }
 
 func (entry *CertEntry) initCachedHandshake() {
@@ -136,63 +133,42 @@ func (entry *CertEntry) CachedEECert(alpn string) []byte {
 func (cs *CertStore) AddCert(entry *CertEntry) {
 	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
-	cs.mu.Lock()
-	old := cs.snapshot.Load()
-	newMap := make(map[string]*CertEntry, len(old.byDomain)+1)
-	for k, v := range old.byDomain {
-		newMap[k] = v
+	cs.certs.Store(entry.Domain, entry)
+	if cs.defEntry.Load() == nil {
+		cs.defEntry.CompareAndSwap(nil, entry)
 	}
-	newMap[entry.Domain] = entry
-	snap := &certSnapshot{byDomain: newMap, defEntry: old.defEntry}
-	if snap.defEntry == nil {
-		snap.defEntry = entry
-	}
-	cs.snapshot.Store(snap)
-	cs.mu.Unlock()
 }
 
 func (cs *CertStore) RemoveCert(domain string) {
 	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
-	old := cs.snapshot.Load()
-	newMap := make(map[string]*CertEntry, len(old.byDomain))
-	for k, v := range old.byDomain {
-		if k != domain {
-			newMap[k] = v
-		}
+	cs.certs.Delete(domain)
+	if def := cs.defEntry.Load(); def != nil && def.Domain == domain {
+		cs.defEntry.Store(nil)
+		cs.certs.Range(func(_ string, v any) bool {
+			cs.defEntry.Store(v.(*CertEntry))
+			return false
+		})
 	}
-	snap := &certSnapshot{byDomain: newMap, defEntry: old.defEntry}
-	if snap.defEntry != nil && snap.defEntry.Domain == domain {
-		snap.defEntry = nil
-		for _, v := range newMap {
-			snap.defEntry = v
-			break
-		}
-	}
-	cs.snapshot.Store(snap)
 	cs.mu.Unlock()
 }
 
 func (cs *CertStore) SetDefault(domain string) {
 	domain = normalizeCertDomain(domain)
-	cs.mu.Lock()
-	old := cs.snapshot.Load()
-	entry, ok := old.byDomain[domain]
+	v, ok := cs.certs.Load(domain)
 	if !ok {
-		cs.mu.Unlock()
 		return
 	}
-	snap := &certSnapshot{byDomain: old.byDomain, defEntry: entry}
-	cs.snapshot.Store(snap)
-	cs.mu.Unlock()
+	cs.defEntry.Store(v.(*CertEntry))
 }
 
 func (cs *CertStore) ListCerts() []CertInfo {
-	snap := cs.snapshot.Load()
-	out := make([]CertInfo, 0, len(snap.byDomain))
-	for _, e := range snap.byDomain {
+	var out []CertInfo
+	cs.certs.Range(func(_ string, v any) bool {
+		e := v.(*CertEntry)
 		out = append(out, CertInfo{Domain: e.Domain, Source: e.Source})
-	}
+		return true
+	})
 	return out
 }
 

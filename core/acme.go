@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/guno1928/alosmap"
 	"golang.org/x/crypto/acme"
 )
 
@@ -63,7 +64,7 @@ type acmeIntegration struct {
 	domainMu    sync.Mutex
 	initialOnce sync.Once
 
-	challenges sync.Map
+	challenges *alosmap.Map
 
 	localIPs atomic.Pointer[[]net.IP]
 	stop     chan struct{}
@@ -120,6 +121,7 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 		acmeNode:     cfg.ACMENode,
 		challengeDir: challengeDir,
 		domains:      cfg.Domains,
+		challenges:   alosmap.New(alosmap.WithoutCleanup()),
 		stop:         make(chan struct{}),
 		client: &acme.Client{
 			Key:          key,
@@ -275,7 +277,7 @@ func (ai *acmeIntegration) HandleHTTP01(path string) ([]byte, bool) {
 	acmePrintf("[ACME] HTTP-01 challenge request: token=%s", token)
 
 	var found *acmeChallenge
-	ai.challenges.Range(func(_, val any) bool {
+	ai.challenges.Range(func(_ string, val any) bool {
 		ch := val.(*acmeChallenge)
 		if ch.token == token {
 			found = ch
@@ -826,25 +828,26 @@ func (ai *acmeIntegration) renewDomainOnce(domain string) {
 
 func (ai *acmeIntegration) renewAll() {
 	acmePrintf("[ACME] renewal check started")
-	snap := ai.server.certStore.snapshot.Load()
-	for domain, entry := range snap.byDomain {
+	ai.server.certStore.certs.Range(func(domain string, v any) bool {
+		entry := v.(*CertEntry)
 		if entry.Source != CertACME {
-			continue
+			return true
 		}
 		leaf, err := x509.ParseCertificate(entry.ChainDER[0])
 		if err != nil {
 			acmePrintf("[ACME] failed to parse cert for %s during renewal check: %v", domain, err)
-			continue
+			return true
 		}
 		remaining := time.Until(leaf.NotAfter)
 		daysLeft := int(remaining.Hours() / 24)
 		if remaining > acmeRenewBefore {
 			acmePrintf("[ACME] cert for %s OK (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
-			continue
+			return true
 		}
 		acmePrintf("[ACME] cert for %s NEEDS RENEWAL (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
 		ai.renewDomainOnce(domain)
-	}
+		return true
+	})
 	acmePrintf("[ACME] renewal check complete")
 }
 

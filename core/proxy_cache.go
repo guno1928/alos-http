@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
+	"github.com/guno1928/alosmap"
 )
 
 // CacheRule configures caching for a specific path prefix. If PathPrefix is empty
@@ -78,6 +79,7 @@ type cacheEntry struct {
 	gzipBody    []byte
 	createdAt   int64
 	expiresAt   int64
+	manual      bool
 	hits        atomic.Uint64
 	maxHits     uint64
 	bodyLen     int32
@@ -85,7 +87,7 @@ type cacheEntry struct {
 }
 
 type ProxyCache struct {
-	entries      *ShardedMap[string, *cacheEntry]
+	entries      *alosmap.Map
 	config       atomic.Pointer[ProxyCacheConfig]
 	totalBytes   atomic.Int64
 	totalEntries atomic.Int64
@@ -113,7 +115,7 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	}
 
 	pc := &ProxyCache{
-		entries: NewShardedMap[string, *cacheEntry](StringHash),
+		entries: alosmap.New(alosmap.WithoutCleanup()),
 		stopCh:  make(chan struct{}),
 	}
 	level := cfg.CompressLevel
@@ -322,10 +324,15 @@ func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, st
 	return 0, false
 }
 
-func (pc *ProxyCache) Get(method, host, path, acceptEncoding string) (*cacheEntry, bool) {
+func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry, bool) {
 	key := pc.buildKey(method, host, path)
-	entry, ok := pc.entries.Load(key)
+	v, ok := pc.entries.Load(key)
 	if !ok {
+		pc.totalMisses.Add(1)
+		return nil, false
+	}
+	entry := v.(*cacheEntry)
+	if !entry.manual && !proxyCacheRequestAllowed(req) {
 		pc.totalMisses.Add(1)
 		return nil, false
 	}
@@ -363,7 +370,7 @@ func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][
 	if !ok {
 		return
 	}
-	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1)
+	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false)
 }
 
 func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int) {
@@ -371,10 +378,10 @@ func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, heade
 	if cfg.MaxEntrySize > 0 && int64(len(body)) > cfg.MaxEntrySize {
 		return
 	}
-	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen)
+	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, true)
 }
 
-func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int) {
+func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, manual bool) {
 	bodyLen := int64(len(body))
 	if cfg.MaxEntrySize > 0 && bodyLen > cfg.MaxEntrySize {
 		return
@@ -400,6 +407,7 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		body:        bodyCopy,
 		createdAt:   now,
 		expiresAt:   now + int64(ttl),
+		manual:      manual,
 		maxHits:     maxHits,
 		bodyLen:     int32(len(bodyCopy)),
 	}
@@ -430,7 +438,8 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 	key := pc.buildKey(method, host, path)
 
-	if old, exists := pc.entries.Load(key); exists {
+	if v, exists := pc.entries.Load(key); exists {
+		old := v.(*cacheEntry)
 		pc.totalBytes.Add(-int64(old.bodyLen) - int64(old.gzipLen))
 	} else {
 		pc.totalEntries.Add(1)
@@ -446,7 +455,8 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 func (pc *ProxyCache) Purge(method, host, path string) bool {
 	key := pc.buildKey(method, host, path)
-	if entry, ok := pc.entries.Load(key); ok {
+	if v, ok := pc.entries.Load(key); ok {
+		entry := v.(*cacheEntry)
 		pc.entries.Delete(key)
 		pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 		pc.totalEntries.Add(-1)
@@ -456,7 +466,7 @@ func (pc *ProxyCache) Purge(method, host, path string) bool {
 }
 
 func (pc *ProxyCache) PurgeAll() {
-	pc.entries.Range(func(key string, entry *cacheEntry) bool {
+	pc.entries.Range(func(key string, _ any) bool {
 		pc.entries.Delete(key)
 		return true
 	})
@@ -469,7 +479,8 @@ func (pc *ProxyCache) PurgeDomain(domain string) int64 {
 	prefix1 := "GET|" + domain + "|"
 	prefix2 := "HEAD|" + domain + "|"
 	var purged int64
-	pc.entries.Range(func(key string, entry *cacheEntry) bool {
+	pc.entries.Range(func(key string, val any) bool {
+		entry := val.(*cacheEntry)
 		if hasPrefix(key, prefix1) || hasPrefix(key, prefix2) {
 			pc.entries.Delete(key)
 			pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
@@ -538,7 +549,8 @@ func (pc *ProxyCache) evictLoop() {
 
 func (pc *ProxyCache) evictExpired() {
 	now := CoarseNanotime()
-	pc.entries.Range(func(key string, entry *cacheEntry) bool {
+	pc.entries.Range(func(key string, val any) bool {
+		entry := val.(*cacheEntry)
 		if now > entry.expiresAt {
 			pc.entries.Delete(key)
 			pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
@@ -558,7 +570,8 @@ func (pc *ProxyCache) evictOldest() {
 		size      int64
 	}
 	candidates := make([]candidate, 0, 64)
-	pc.entries.Range(func(key string, entry *cacheEntry) bool {
+	pc.entries.Range(func(key string, val any) bool {
+		entry := val.(*cacheEntry)
 		candidates = append(candidates, candidate{
 			key:       key,
 			createdAt: entry.createdAt,

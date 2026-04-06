@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/alosmap"
 )
 
 // LoadBalancerType selects the load balancing strategy used by the reverse
@@ -208,7 +210,10 @@ func WithCompressMinLen(n int) CacheOption {
 // Pass 0 for maxHits to keep the entry alive until TTL expiration only.
 //
 // Optional CacheOption values control gzip pre-compression of the cached body.
-// By default, a gzip copy is stored for responses >= 512 bytes.
+// By default, a gzip copy is stored for responses >= 512 bytes. CacheThis is
+// an explicit override: it bypasses the automatic shared-cache heuristics that
+// normally skip requests with Cookie or Authorization headers and provisions a
+// default cache if one has not been configured yet.
 //
 //	// Cache for 10 minutes, unlimited hits
 //	pr.CacheThis(10*time.Minute, 0)
@@ -218,6 +223,9 @@ func WithCompressMinLen(n int) CacheOption {
 //
 //	// Cache without pre-compression
 //	pr.CacheThis(5*time.Minute, 0, core.WithPreCompress(false))
+//
+// If no proxy cache has been configured yet, the first CacheThis call lazily
+// provisions one with DefaultProxyCacheConfig.
 func (pr *ProxyResponse) CacheThis(ttl time.Duration, maxHits uint64, opts ...CacheOption) {
 	o := cacheOpts{preCompress: true, compressMinLen: -1}
 	for _, fn := range opts {
@@ -380,10 +388,6 @@ type domainState struct {
 	health   *healthChecker
 }
 
-type proxySnapshot struct {
-	domains map[string]*domainState
-}
-
 // ProxyEngine is the core reverse-proxy component that routes incoming TLS
 // connections to upstream backends based on the SNI domain. It manages connection
 // pools, load balancing, health checking, and optional response caching across
@@ -397,7 +401,7 @@ type proxySnapshot struct {
 // ProxyEngine is created internally by the Server. Use Server.OnProxyError,
 // Server.OnProxyRequest, and Server.OnProxyResponse to register callbacks.
 type ProxyEngine struct {
-	snapshot   atomic.Pointer[proxySnapshot]
+	domains    *alosmap.Map
 	mu         sync.Mutex
 	stopCh     chan struct{}
 	stopOnce   sync.Once
@@ -411,10 +415,24 @@ type ProxyEngine struct {
 // internally by Server.New — you typically don't need to call it directly.
 func NewProxyEngine() *ProxyEngine {
 	pe := &ProxyEngine{
-		stopCh: make(chan struct{}),
+		domains: alosmap.New(alosmap.WithoutCleanup()),
+		stopCh:  make(chan struct{}),
 	}
-	pe.snapshot.Store(&proxySnapshot{domains: make(map[string]*domainState)})
 	return pe
+}
+
+func (pe *ProxyEngine) ensureCache() *ProxyCache {
+	if pe.Cache != nil {
+		return pe.Cache
+	}
+
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	if pe.Cache == nil {
+		pe.Cache = NewProxyCache(DefaultProxyCacheConfig())
+	}
+	return pe.Cache
 }
 
 // AddDomain registers or replaces a domain configuration. If a domain with the
@@ -438,9 +456,8 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	old := pe.snapshot.Load()
-
-	if prev, ok := old.domains[cfg.Domain]; ok {
+	if v, ok := pe.domains.Load(cfg.Domain); ok {
+		prev := v.(*domainState)
 		if prev.health != nil {
 			prev.health.stop()
 		}
@@ -475,12 +492,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 		ds.health.start()
 	}
 
-	newDomains := make(map[string]*domainState, len(old.domains)+1)
-	for k, v := range old.domains {
-		newDomains[k] = v
-	}
-	newDomains[cfg.Domain] = ds
-	pe.snapshot.Store(&proxySnapshot{domains: newDomains})
+	pe.domains.Store(cfg.Domain, ds)
 
 	log.Printf("[PROXY] domain %s configured (%d backends, lb=%d)", cfg.Domain, len(backends), cfg.LoadBalancer)
 }
@@ -493,11 +505,11 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	old := pe.snapshot.Load()
-	prev, ok := old.domains[domain]
+	v, ok := pe.domains.Load(domain)
 	if !ok {
 		return
 	}
+	prev := v.(*domainState)
 
 	if prev.health != nil {
 		prev.health.stop()
@@ -508,19 +520,16 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 		}
 	}
 
-	newDomains := make(map[string]*domainState, len(old.domains))
-	for k, v := range old.domains {
-		if k != domain {
-			newDomains[k] = v
-		}
-	}
-	pe.snapshot.Store(&proxySnapshot{domains: newDomains})
+	pe.domains.Delete(domain)
 	log.Printf("[PROXY] domain %s removed", domain)
 }
 
 func (pe *ProxyEngine) Lookup(host string) *domainState {
-	snap := pe.snapshot.Load()
-	return snap.domains[normalizeCertDomain(host)]
+	v, ok := pe.domains.Load(normalizeCertDomain(host))
+	if !ok {
+		return nil
+	}
+	return v.(*domainState)
 }
 
 // Stop shuts down all health checkers and closes all idle backend connections
@@ -531,8 +540,8 @@ func (pe *ProxyEngine) Stop() {
 		if pe.Cache != nil {
 			pe.Cache.Stop()
 		}
-		snap := pe.snapshot.Load()
-		for _, ds := range snap.domains {
+		pe.domains.Range(func(_ string, val any) bool {
+			ds := val.(*domainState)
 			if ds.health != nil {
 				ds.health.stop()
 			}
@@ -541,17 +550,18 @@ func (pe *ProxyEngine) Stop() {
 					b.pool.close()
 				}
 			}
-		}
+			return true
+		})
 	})
 }
 
 // ListDomains returns the names of all currently registered proxy domains.
 // The order is non-deterministic.
 func (pe *ProxyEngine) ListDomains() []string {
-	snap := pe.snapshot.Load()
-	out := make([]string, 0, len(snap.domains))
-	for k := range snap.domains {
-		out = append(out, k)
-	}
+	var out []string
+	pe.domains.Range(func(key string, _ any) bool {
+		out = append(out, key)
+		return true
+	})
 	return out
 }
