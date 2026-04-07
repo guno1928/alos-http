@@ -92,7 +92,7 @@ type RateLimitEngine struct {
 // the background cleanup goroutine. Call Stop when the engine is no longer needed.
 func NewRateLimitEngine() *RateLimitEngine {
 	rle := &RateLimitEngine{
-		clients: alosmap.New(alosmap.WithoutCleanup()),
+		clients: alosmap.New(alosmap.WithCapacity(10000), alosmap.WithoutCleanup()),
 		stopCh:  make(chan struct{}),
 	}
 	empty := make([]compiledRule, 0)
@@ -220,11 +220,11 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 	now := CoarseNanotime()
 
 	var entry *rlEntry
-	v, ok := rle.clients.Load(key)
+	v, ok := rle.clients.Load(alosmap.S(key))
 	if !ok {
 		newEntry := &rlEntry{}
 		newEntry.reset.Store(now + cr.rule.Window.Nanoseconds())
-		v, _ = rle.clients.LoadOrStore(key, newEntry)
+		v, _ = rle.clients.LoadOrStore(alosmap.S(key), newEntry)
 	}
 	entry = v.(*rlEntry)
 
@@ -271,8 +271,8 @@ func (rle *RateLimitEngine) cleanupLoop() {
 			return
 		case <-ticker.C:
 			now := CoarseNanotime()
-			var stale []string
-			rle.clients.Range(func(key string, val any) bool {
+			var stale []alosmap.Key
+			rle.clients.Range(func(key alosmap.Key, val any) bool {
 				entry := val.(*rlEntry)
 				resetAt := entry.reset.Load()
 				blockedUntil := entry.blocked.Load()

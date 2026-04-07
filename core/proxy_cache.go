@@ -115,7 +115,7 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	}
 
 	pc := &ProxyCache{
-		entries: alosmap.New(alosmap.WithoutCleanup()),
+		entries: alosmap.New(alosmap.WithCapacity(10000), alosmap.WithoutCleanup()),
 		stopCh:  make(chan struct{}),
 	}
 	level := cfg.CompressLevel
@@ -326,7 +326,7 @@ func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, st
 
 func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry, bool) {
 	key := pc.buildKey(method, host, path)
-	v, ok := pc.entries.Load(key)
+	v, ok := pc.entries.Load(alosmap.S(key))
 	if !ok {
 		pc.totalMisses.Add(1)
 		return nil, false
@@ -345,7 +345,7 @@ func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry,
 			pc.totalHits.Add(1)
 			return entry, true
 		}
-		pc.entries.Delete(key)
+		pc.entries.Delete(alosmap.S(key))
 		pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 		pc.totalEntries.Add(-1)
 		pc.totalMisses.Add(1)
@@ -356,7 +356,7 @@ func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry,
 	pc.totalHits.Add(1)
 
 	if entry.maxHits > 0 && entry.hits.Load() >= entry.maxHits {
-		pc.entries.Delete(key)
+		pc.entries.Delete(alosmap.S(key))
 		pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 		pc.totalEntries.Add(-1)
 	}
@@ -438,14 +438,14 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 	key := pc.buildKey(method, host, path)
 
-	if v, exists := pc.entries.Load(key); exists {
+	if v, exists := pc.entries.Load(alosmap.S(key)); exists {
 		old := v.(*cacheEntry)
 		pc.totalBytes.Add(-int64(old.bodyLen) - int64(old.gzipLen))
 	} else {
 		pc.totalEntries.Add(1)
 	}
 
-	pc.entries.Store(key, entry)
+	pc.entries.Store(alosmap.S(key), entry)
 	pc.totalBytes.Add(bodyLen)
 
 	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
@@ -455,9 +455,9 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 func (pc *ProxyCache) Purge(method, host, path string) bool {
 	key := pc.buildKey(method, host, path)
-	if v, ok := pc.entries.Load(key); ok {
+	if v, ok := pc.entries.Load(alosmap.S(key)); ok {
 		entry := v.(*cacheEntry)
-		pc.entries.Delete(key)
+		pc.entries.Delete(alosmap.S(key))
 		pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 		pc.totalEntries.Add(-1)
 		return true
@@ -466,10 +466,7 @@ func (pc *ProxyCache) Purge(method, host, path string) bool {
 }
 
 func (pc *ProxyCache) PurgeAll() {
-	pc.entries.Range(func(key string, _ any) bool {
-		pc.entries.Delete(key)
-		return true
-	})
+	pc.entries.Clear()
 	pc.totalBytes.Store(0)
 	pc.totalEntries.Store(0)
 }
@@ -479,9 +476,10 @@ func (pc *ProxyCache) PurgeDomain(domain string) int64 {
 	prefix1 := "GET|" + domain + "|"
 	prefix2 := "HEAD|" + domain + "|"
 	var purged int64
-	pc.entries.Range(func(key string, val any) bool {
+	pc.entries.Range(func(key alosmap.Key, val any) bool {
 		entry := val.(*cacheEntry)
-		if hasPrefix(key, prefix1) || hasPrefix(key, prefix2) {
+		keyStr := key.StringVal()
+		if hasPrefix(keyStr, prefix1) || hasPrefix(keyStr, prefix2) {
 			pc.entries.Delete(key)
 			pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 			pc.totalEntries.Add(-1)
@@ -549,7 +547,7 @@ func (pc *ProxyCache) evictLoop() {
 
 func (pc *ProxyCache) evictExpired() {
 	now := CoarseNanotime()
-	pc.entries.Range(func(key string, val any) bool {
+	pc.entries.Range(func(key alosmap.Key, val any) bool {
 		entry := val.(*cacheEntry)
 		if now > entry.expiresAt {
 			pc.entries.Delete(key)
@@ -565,12 +563,12 @@ func (pc *ProxyCache) evictOldest() {
 	target := cfg.MaxTotalBytes * 90 / 100
 
 	type candidate struct {
-		key       string
+		key       alosmap.Key
 		createdAt int64
 		size      int64
 	}
 	candidates := make([]candidate, 0, 64)
-	pc.entries.Range(func(key string, val any) bool {
+	pc.entries.Range(func(key alosmap.Key, val any) bool {
 		entry := val.(*cacheEntry)
 		candidates = append(candidates, candidate{
 			key:       key,

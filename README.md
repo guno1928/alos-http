@@ -81,6 +81,39 @@ Why that matters for ALOS HTTP:
 
 In practice that means ALOS HTTP can lean harder into Linux-native networking paths for plain HTTP, TLS, and HTTP/2.
 
+## Testing
+
+in the testallnow directory, there are a variety of tests and benchmarks for ALOS HTTP.
+=== SUMMARY ===
+Test Results: 360 passed, 0 failed, 360 total
+
+compression               15/15
+concurrency               14/14
+connections               10/10
+cookies                   10/10
+errors                    10/10
+h2                        21/21
+headers                   20/20
+methods                   15/15
+middleware                25/25
+redirects                 10/10
+request                   20/20
+response                  25/25
+routing                   25/25
+static                    15/15
+status-codes              15/15
+streaming                 15/15
+tls                       15/15
+websocket                 20/20
+xproto-static             15/15
+xproto-stream             20/20
+xproto-upload             10/10
+xproto-ws                 15/15
+
+Cleaning up container...
+
+ALL 300 TESTS PASSED
+
 ## Benchmarks
 
 If you want to see full benchmarks, go to:

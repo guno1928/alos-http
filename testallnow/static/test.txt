@@ -1,0 +1,3 @@
+This is a plain text file for static file serving tests.
+It contains multiple lines of content.
+Line 3 here.

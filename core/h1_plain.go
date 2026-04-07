@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/guno1928/alosmap"
 )
 
 func (s *Server) ServeH1Plain(conn net.Conn) {
@@ -603,7 +605,7 @@ func (s *Server) ServeH2Plain(conn net.Conn) {
 		server:            s,
 		decoder:           NewHpackDecoder(),
 		initialWindowSize: H2DefaultWindowSize,
-		streams:           NewShardedMap[uint32, *H2Stream](Uint32Hash),
+		streams:           alosmap.New(alosmap.WithCapacity(256), alosmap.WithoutCleanup()),
 		writeCh:           make(chan WriteRequest, 512),
 		done:              make(chan struct{}),
 		decryptBuf:        make([]byte, 0, MaxRecordSize),

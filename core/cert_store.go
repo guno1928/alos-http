@@ -71,7 +71,7 @@ type CertStore struct {
 
 func NewCertStore() *CertStore {
 	cs := &CertStore{
-		certs: alosmap.New(alosmap.WithoutCleanup()),
+		certs: alosmap.New(alosmap.WithCapacity(32), alosmap.WithoutCleanup()),
 	}
 	return cs
 }
@@ -85,7 +85,7 @@ func normalizeCertDomain(domain string) string {
 func (cs *CertStore) Lookup(serverName string) *CertEntry {
 	serverName = normalizeCertDomain(serverName)
 	if serverName != "" {
-		if v, ok := cs.certs.Load(serverName); ok {
+		if v, ok := cs.certs.Load(alosmap.S(serverName)); ok {
 			return v.(*CertEntry)
 		}
 	}
@@ -133,7 +133,7 @@ func (entry *CertEntry) CachedEECert(alpn string) []byte {
 func (cs *CertStore) AddCert(entry *CertEntry) {
 	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
-	cs.certs.Store(entry.Domain, entry)
+	cs.certs.Store(alosmap.S(entry.Domain), entry)
 	if cs.defEntry.Load() == nil {
 		cs.defEntry.CompareAndSwap(nil, entry)
 	}
@@ -142,10 +142,10 @@ func (cs *CertStore) AddCert(entry *CertEntry) {
 func (cs *CertStore) RemoveCert(domain string) {
 	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
-	cs.certs.Delete(domain)
+	cs.certs.Delete(alosmap.S(domain))
 	if def := cs.defEntry.Load(); def != nil && def.Domain == domain {
 		cs.defEntry.Store(nil)
-		cs.certs.Range(func(_ string, v any) bool {
+		cs.certs.Range(func(_ alosmap.Key, v any) bool {
 			cs.defEntry.Store(v.(*CertEntry))
 			return false
 		})
@@ -155,7 +155,7 @@ func (cs *CertStore) RemoveCert(domain string) {
 
 func (cs *CertStore) SetDefault(domain string) {
 	domain = normalizeCertDomain(domain)
-	v, ok := cs.certs.Load(domain)
+	v, ok := cs.certs.Load(alosmap.S(domain))
 	if !ok {
 		return
 	}
@@ -164,7 +164,7 @@ func (cs *CertStore) SetDefault(domain string) {
 
 func (cs *CertStore) ListCerts() []CertInfo {
 	var out []CertInfo
-	cs.certs.Range(func(_ string, v any) bool {
+	cs.certs.Range(func(_ alosmap.Key, v any) bool {
 		e := v.(*CertEntry)
 		out = append(out, CertInfo{Domain: e.Domain, Source: e.Source})
 		return true

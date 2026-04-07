@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/alosmap"
 )
 
 const (
@@ -25,7 +27,7 @@ type H2Conn struct {
 	maxFrameSize      atomic.Uint32
 	lastStreamID      atomic.Uint32
 	initialWindowSize uint32
-	streams           *ShardedMap[uint32, *H2Stream]
+	streams           *alosmap.Map
 	writeCh           chan WriteRequest
 	done              chan struct{}
 	dispatchWg        sync.WaitGroup
@@ -113,7 +115,7 @@ func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 		server:            s,
 		decoder:           NewHpackDecoder(),
 		initialWindowSize: H2DefaultWindowSize,
-		streams:           NewShardedMap[uint32, *H2Stream](Uint32Hash),
+		streams:           alosmap.New(alosmap.WithCapacity(256), alosmap.WithoutCleanup()),
 		writeCh:           make(chan WriteRequest, 512),
 		done:              make(chan struct{}),
 		decryptBuf:        make([]byte, 0, MaxRecordSize),
@@ -464,7 +466,8 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 			}
 			hc.flowCond.Broadcast()
 		} else {
-			if stream, ok := hc.streams.Load(f.StreamID); ok {
+			if v, ok := hc.streams.Load(alosmap.I(int64(f.StreamID))); ok {
+				stream := v.(*H2Stream)
 				newWin := stream.Window.Add(int64(inc))
 				if newWin > 2147483647 {
 					hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrFlowControl))
@@ -499,9 +502,10 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 			hc.sendGoAway(H2ErrFrameSize)
 			return
 		}
-		if stream, ok := hc.streams.Load(f.StreamID); ok {
+		if v, ok := hc.streams.Load(alosmap.I(int64(f.StreamID))); ok {
+			stream := v.(*H2Stream)
 			stream.State.Store(StreamClosed)
-			hc.streams.Delete(f.StreamID)
+			hc.streams.Delete(alosmap.I(int64(f.StreamID)))
 			hc.activeStreams.Add(-1)
 			stream.Reset()
 			StreamPool.Put(stream)
@@ -548,10 +552,11 @@ func (hc *H2Conn) processSettings(payload []byte) {
 			oldSize := hc.initialWindowSize
 			delta := int64(val) - int64(oldSize)
 			hc.initialWindowSize = val
-			hc.streams.Range(func(id uint32, stream *H2Stream) bool {
+			hc.streams.Range(func(_ alosmap.Key, val any) bool {
+				stream := val.(*H2Stream)
 				newWindow := stream.Window.Load() + delta
 				if newWindow > 2147483647 {
-					hc.enqueueWrite(H2WriteRSTStream(nil, id, H2ErrFlowControl))
+					hc.enqueueWrite(H2WriteRSTStream(nil, stream.ID, H2ErrFlowControl))
 					return true
 				}
 				stream.Window.Store(newWindow)
@@ -695,7 +700,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		return
 	}
 
-	if _, exists := hc.streams.Load(streamID); exists {
+	if _, exists := hc.streams.Load(alosmap.I(int64(streamID))); exists {
 		hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrProtocol))
 		return
 	}
@@ -716,7 +721,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		}
 	}
 
-	hc.streams.Store(streamID, stream)
+	hc.streams.Store(alosmap.I(int64(streamID)), stream)
 	hc.activeStreams.Add(1)
 
 	if endStream {
@@ -757,10 +762,11 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 		hc.sendGoAway(H2ErrProtocol)
 		return
 	}
-	stream, ok := hc.streams.Load(f.StreamID)
+	v, ok := hc.streams.Load(alosmap.I(int64(f.StreamID)))
 	if !ok {
 		return
 	}
+	stream := v.(*H2Stream)
 
 	if stream.State.Load() >= StreamHalfClosed {
 		hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrStreamClosed))
@@ -794,7 +800,7 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 	maxBody := hc.server.config.MaxBodySize
 	if maxBody > 0 && int64(len(stream.Body)) > maxBody {
 		hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrCancel))
-		hc.streams.Delete(f.StreamID)
+		hc.streams.Delete(alosmap.I(int64(f.StreamID)))
 		hc.activeStreams.Add(-1)
 		stream.Reset()
 		StreamPool.Put(stream)
@@ -866,7 +872,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 
 	if resp.IsStreamed() {
 		stream.State.Store(StreamClosed)
-		hc.streams.Delete(stream.ID)
+		hc.streams.Delete(alosmap.I(int64(stream.ID)))
 		hc.activeStreams.Add(-1)
 		stream.Reset()
 		StreamPool.Put(stream)
@@ -881,7 +887,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	hc.writeH2Response(stream.ID, resp)
 
 	stream.State.Store(StreamClosed)
-	hc.streams.Delete(stream.ID)
+	hc.streams.Delete(alosmap.I(int64(stream.ID)))
 	hc.activeStreams.Add(-1)
 	stream.Reset()
 	StreamPool.Put(stream)
@@ -1000,7 +1006,10 @@ func (hc *H2Conn) writeH2Response(streamID uint32, resp *Response) {
 	headerPayload := enc.Buf
 
 	body := resp.transmittedBodyBytes()
-	stream, _ := hc.streams.Load(streamID)
+	var stream *H2Stream
+	if v, ok := hc.streams.Load(alosmap.I(int64(streamID))); ok {
+		stream = v.(*H2Stream)
+	}
 	fbp := H2FrameBufPool.Get().(*[]byte)
 	frameBuf := (*fbp)[:0]
 	queuedOwned := false

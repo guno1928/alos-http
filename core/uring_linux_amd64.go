@@ -5,6 +5,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"runtime"
@@ -1044,6 +1045,9 @@ func (ring *ioUring) recv(fd int, buf []byte, deadline time.Time) (int, error) {
 				continue
 			}
 			return 0, err
+		}
+		if cqe.Res == 0 {
+			return 0, io.EOF
 		}
 		return int(cqe.Res), nil
 	}

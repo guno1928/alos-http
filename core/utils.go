@@ -12,13 +12,12 @@ import (
 )
 
 type dnsCacheEntry struct {
-	ips     []net.IP
-	expires int64
-	idx     atomic.Uint32
+	ips []net.IP
+	idx atomic.Uint32
 }
 
 var (
-	dnsCache    = alosmap.New(alosmap.WithoutCleanup())
+	dnsCache    = alosmap.New(alosmap.WithCapacity(1024), alosmap.WithCleanupInterval(30*time.Second))
 	dnsTTL      = int64(60)
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
@@ -43,14 +42,11 @@ func timeoutFromContext(ctx context.Context, fallback time.Duration) time.Durati
 }
 
 func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
-	now := time.Now().Unix()
-	if v, ok := dnsCache.Load(host); ok {
+	if v, ok := dnsCache.Load(alosmap.S(host)); ok {
 		entry := v.(*dnsCacheEntry)
-		if now < atomic.LoadInt64(&entry.expires) {
-			ips := entry.ips
-			idx := entry.idx.Add(1)
-			return ips[int(idx)%len(ips)], nil
-		}
+		ips := entry.ips
+		idx := entry.idx.Add(1)
+		return ips[int(idx)%len(ips)], nil
 	}
 
 	ips, err := dnsResolver.LookupIP(ctx, "ip4", host)
@@ -59,8 +55,7 @@ func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
 	}
 
 	entry := &dnsCacheEntry{ips: ips}
-	atomic.StoreInt64(&entry.expires, now+dnsTTL)
-	dnsCache.Store(host, entry)
+	dnsCache.StoreWithTTL(alosmap.S(host), entry, time.Duration(dnsTTL)*time.Second)
 
 	return ips[0], nil
 }

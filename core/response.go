@@ -62,6 +62,22 @@ func (r *Response) resetFastH1() {
 
 func (r *Response) SetSW(sw StreamWriter) { r.sw = sw }
 
+// EnsureStreamWriter returns a StreamWriter for the current response, creating
+// one lazily if needed. On io_uring paths this takes over the connection fd so
+// the caller can use chunked/streaming writes. Returns nil if a StreamWriter
+// cannot be obtained (e.g. the connection is already gone).
+//
+//	sw := resp.EnsureStreamWriter()
+//	if sw != nil {
+//	    sw.WriteHeader(200, nil, "text/plain")
+//	    resp.SetStreamer(sw)
+//	    sw.WriteChunk([]byte("hello"))
+//	    sw.Close()
+//	}
+func (r *Response) EnsureStreamWriter() StreamWriter {
+	return r.ensureSW()
+}
+
 func (r *Response) ensureSW() StreamWriter {
 	if r.sw != nil {
 		return r.sw

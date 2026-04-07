@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5FC11B35A"
+const wsGUID = "258EAFA5-E914-47DA-95CA-5AB5DC11650B"
 
 const (
 	wsOpContinuation byte = 0x0

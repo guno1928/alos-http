@@ -1,0 +1,2522 @@
+[
+  {
+    "id": 1,
+    "category": "methods",
+    "name": "GET basic",
+    "pass": true,
+    "duration_ns": 689952
+  },
+  {
+    "id": 2,
+    "category": "methods",
+    "name": "POST basic",
+    "pass": true,
+    "duration_ns": 252910
+  },
+  {
+    "id": 3,
+    "category": "methods",
+    "name": "PUT basic",
+    "pass": true,
+    "duration_ns": 163481
+  },
+  {
+    "id": 4,
+    "category": "methods",
+    "name": "DELETE basic",
+    "pass": true,
+    "duration_ns": 135576
+  },
+  {
+    "id": 5,
+    "category": "methods",
+    "name": "PATCH basic",
+    "pass": true,
+    "duration_ns": 180182
+  },
+  {
+    "id": 6,
+    "category": "methods",
+    "name": "HEAD returns no body",
+    "pass": true,
+    "duration_ns": 178721
+  },
+  {
+    "id": 7,
+    "category": "methods",
+    "name": "HEAD X-Head-Test header",
+    "pass": true,
+    "duration_ns": 151546
+  },
+  {
+    "id": 8,
+    "category": "methods",
+    "name": "OPTIONS Allow header",
+    "pass": true,
+    "duration_ns": 205432
+  },
+  {
+    "id": 9,
+    "category": "methods",
+    "name": "ANY matches GET",
+    "pass": true,
+    "duration_ns": 157218
+  },
+  {
+    "id": 10,
+    "category": "methods",
+    "name": "ANY matches POST",
+    "pass": true,
+    "duration_ns": 140246
+  },
+  {
+    "id": 11,
+    "category": "methods",
+    "name": "ANY matches PUT",
+    "pass": true,
+    "duration_ns": 122344
+  },
+  {
+    "id": 12,
+    "category": "methods",
+    "name": "ANY matches DELETE",
+    "pass": true,
+    "duration_ns": 153059
+  },
+  {
+    "id": 13,
+    "category": "methods",
+    "name": "POST with body content-type",
+    "pass": true,
+    "duration_ns": 174338
+  },
+  {
+    "id": 14,
+    "category": "methods",
+    "name": "POST empty body",
+    "pass": true,
+    "duration_ns": 205515
+  },
+  {
+    "id": 15,
+    "category": "methods",
+    "name": "PATCH with JSON body",
+    "pass": true,
+    "duration_ns": 147261
+  },
+  {
+    "id": 16,
+    "category": "routing",
+    "name": "Root path /",
+    "pass": true,
+    "duration_ns": 184841
+  },
+  {
+    "id": 17,
+    "category": "routing",
+    "name": "Named param :id",
+    "pass": true,
+    "duration_ns": 134726
+  },
+  {
+    "id": 18,
+    "category": "routing",
+    "name": "Named param string value",
+    "pass": true,
+    "duration_ns": 165545
+  },
+  {
+    "id": 19,
+    "category": "routing",
+    "name": "Multiple named params",
+    "pass": true,
+    "duration_ns": 117223
+  },
+  {
+    "id": 20,
+    "category": "routing",
+    "name": "Catch-all wildcard",
+    "pass": true,
+    "duration_ns": 144677
+  },
+  {
+    "id": 21,
+    "category": "routing",
+    "name": "Catch-all single segment",
+    "pass": true,
+    "duration_ns": 242539
+  },
+  {
+    "id": 22,
+    "category": "routing",
+    "name": "Nested static path",
+    "pass": true,
+    "duration_ns": 138132
+  },
+  {
+    "id": 23,
+    "category": "routing",
+    "name": "Priority static over param",
+    "pass": true,
+    "duration_ns": 125069
+  },
+  {
+    "id": 24,
+    "category": "routing",
+    "name": "Param when not matching static",
+    "pass": true,
+    "duration_ns": 168796
+  },
+  {
+    "id": 25,
+    "category": "routing",
+    "name": "Custom 404 handler",
+    "pass": true,
+    "duration_ns": 120252
+  },
+  {
+    "id": 26,
+    "category": "routing",
+    "name": "Custom 405 handler",
+    "pass": true,
+    "duration_ns": 150256
+  },
+  {
+    "id": 27,
+    "category": "routing",
+    "name": "Deep nested path",
+    "pass": true,
+    "duration_ns": 185202
+  },
+  {
+    "id": 28,
+    "category": "routing",
+    "name": "Same path GET vs POST GET",
+    "pass": true,
+    "duration_ns": 121610
+  },
+  {
+    "id": 29,
+    "category": "routing",
+    "name": "Same path GET vs POST POST",
+    "pass": true,
+    "duration_ns": 123591
+  },
+  {
+    "id": 30,
+    "category": "routing",
+    "name": "Long path segment",
+    "pass": true,
+    "duration_ns": 187091
+  },
+  {
+    "id": 31,
+    "category": "routing",
+    "name": "Param numeric value",
+    "pass": true,
+    "duration_ns": 126911
+  },
+  {
+    "id": 32,
+    "category": "routing",
+    "name": "Param with special chars",
+    "pass": true,
+    "duration_ns": 124663
+  },
+  {
+    "id": 33,
+    "category": "routing",
+    "name": "Multiple params first",
+    "pass": true,
+    "duration_ns": 166571
+  },
+  {
+    "id": 34,
+    "category": "routing",
+    "name": "Multiple params second",
+    "pass": true,
+    "duration_ns": 192155
+  },
+  {
+    "id": 35,
+    "category": "routing",
+    "name": "Catch-all deep nesting",
+    "pass": true,
+    "duration_ns": 175764
+  },
+  {
+    "id": 36,
+    "category": "routing",
+    "name": "404 for truly missing path",
+    "pass": true,
+    "duration_ns": 148372
+  },
+  {
+    "id": 37,
+    "category": "routing",
+    "name": "GET static returns 200",
+    "pass": true,
+    "duration_ns": 513096
+  },
+  {
+    "id": 38,
+    "category": "routing",
+    "name": "Param with dots",
+    "pass": true,
+    "duration_ns": 414938
+  },
+  {
+    "id": 39,
+    "category": "routing",
+    "name": "Catch-all with extension",
+    "pass": true,
+    "duration_ns": 180554
+  },
+  {
+    "id": 40,
+    "category": "routing",
+    "name": "Param empty-like segment",
+    "pass": true,
+    "duration_ns": 134968
+  },
+  {
+    "id": 41,
+    "category": "request",
+    "name": "Echo body preserves content",
+    "pass": true,
+    "duration_ns": 165333
+  },
+  {
+    "id": 42,
+    "category": "request",
+    "name": "Echo JSON body",
+    "pass": true,
+    "duration_ns": 235038
+  },
+  {
+    "id": 43,
+    "category": "request",
+    "name": "Echo binary body",
+    "pass": true,
+    "duration_ns": 177397
+  },
+  {
+    "id": 44,
+    "category": "request",
+    "name": "Header echo Content-Type",
+    "pass": true,
+    "duration_ns": 250415
+  },
+  {
+    "id": 45,
+    "category": "request",
+    "name": "Header echo Accept",
+    "pass": true,
+    "duration_ns": 239466
+  },
+  {
+    "id": 46,
+    "category": "request",
+    "name": "Header echo User-Agent",
+    "pass": true,
+    "duration_ns": 193447
+  },
+  {
+    "id": 47,
+    "category": "request",
+    "name": "Header echo Authorization",
+    "pass": true,
+    "duration_ns": 156248
+  },
+  {
+    "id": 48,
+    "category": "request",
+    "name": "Header echo custom X-header",
+    "pass": true,
+    "duration_ns": 226420
+  },
+  {
+    "id": 49,
+    "category": "request",
+    "name": "PUT echo body",
+    "pass": true,
+    "duration_ns": 162007
+  },
+  {
+    "id": 50,
+    "category": "request",
+    "name": "POST 1KB body",
+    "pass": true,
+    "duration_ns": 205481
+  },
+  {
+    "id": 51,
+    "category": "request",
+    "name": "POST 100KB body",
+    "pass": true,
+    "duration_ns": 575093
+  },
+  {
+    "id": 52,
+    "category": "request",
+    "name": "POST 1MB body",
+    "pass": true,
+    "duration_ns": 2019199
+  },
+  {
+    "id": 53,
+    "category": "request",
+    "name": "Echo preserves content-type",
+    "pass": true,
+    "duration_ns": 121522
+  },
+  {
+    "id": 54,
+    "category": "request",
+    "name": "JSON validate valid",
+    "pass": true,
+    "duration_ns": 2003160
+  },
+  {
+    "id": 55,
+    "category": "request",
+    "name": "JSON validate invalid",
+    "pass": true,
+    "duration_ns": 634813
+  },
+  {
+    "id": 56,
+    "category": "request",
+    "name": "POST multipart-like body",
+    "pass": true,
+    "duration_ns": 2728892
+  },
+  {
+    "id": 57,
+    "category": "request",
+    "name": "Echo UTF-8 body",
+    "pass": true,
+    "duration_ns": 233374
+  },
+  {
+    "id": 58,
+    "category": "request",
+    "name": "Echo newlines in body",
+    "pass": true,
+    "duration_ns": 227080
+  },
+  {
+    "id": 59,
+    "category": "request",
+    "name": "Header echo multiple custom",
+    "pass": true,
+    "duration_ns": 347141
+  },
+  {
+    "id": 60,
+    "category": "request",
+    "name": "POST 5MB body",
+    "pass": true,
+    "duration_ns": 48244812
+  },
+  {
+    "id": 61,
+    "category": "response",
+    "name": "Status 200 default",
+    "pass": true,
+    "duration_ns": 165173
+  },
+  {
+    "id": 62,
+    "category": "response",
+    "name": "Status 201 Created",
+    "pass": true,
+    "duration_ns": 498417
+  },
+  {
+    "id": 63,
+    "category": "response",
+    "name": "Status 204 No Content",
+    "pass": true,
+    "duration_ns": 491345
+  },
+  {
+    "id": 64,
+    "category": "response",
+    "name": "Status 301 redirect",
+    "pass": true,
+    "duration_ns": 154082
+  },
+  {
+    "id": 65,
+    "category": "response",
+    "name": "Status 400 bad request",
+    "pass": true,
+    "duration_ns": 584588
+  },
+  {
+    "id": 66,
+    "category": "response",
+    "name": "Status 404 not found",
+    "pass": true,
+    "duration_ns": 430172
+  },
+  {
+    "id": 67,
+    "category": "response",
+    "name": "Status 500 error",
+    "pass": true,
+    "duration_ns": 686605
+  },
+  {
+    "id": 68,
+    "category": "response",
+    "name": "String response type",
+    "pass": true,
+    "duration_ns": 793889
+  },
+  {
+    "id": 69,
+    "category": "response",
+    "name": "HTML response type",
+    "pass": true,
+    "duration_ns": 157900
+  },
+  {
+    "id": 70,
+    "category": "response",
+    "name": "HTML content-type",
+    "pass": true,
+    "duration_ns": 261959
+  },
+  {
+    "id": 71,
+    "category": "response",
+    "name": "Bytes response type",
+    "pass": true,
+    "duration_ns": 677798
+  },
+  {
+    "id": 72,
+    "category": "response",
+    "name": "JSON response content-type",
+    "pass": true,
+    "duration_ns": 205140
+  },
+  {
+    "id": 73,
+    "category": "response",
+    "name": "JSON response valid",
+    "pass": true,
+    "duration_ns": 456379
+  },
+  {
+    "id": 74,
+    "category": "response",
+    "name": "JSONString valid",
+    "pass": true,
+    "duration_ns": 165874
+  },
+  {
+    "id": 75,
+    "category": "response",
+    "name": "JSONMarshal struct",
+    "pass": true,
+    "duration_ns": 955065
+  },
+  {
+    "id": 76,
+    "category": "response",
+    "name": "SetHeader custom",
+    "pass": true,
+    "duration_ns": 142952
+  },
+  {
+    "id": 77,
+    "category": "response",
+    "name": "SetHeader multiple",
+    "pass": true,
+    "duration_ns": 456689
+  },
+  {
+    "id": 78,
+    "category": "response",
+    "name": "SetHeader Cache-Control",
+    "pass": true,
+    "duration_ns": 388910
+  },
+  {
+    "id": 79,
+    "category": "response",
+    "name": "SetHeader ETag",
+    "pass": true,
+    "duration_ns": 409208
+  },
+  {
+    "id": 80,
+    "category": "response",
+    "name": "Empty body 204",
+    "pass": true,
+    "duration_ns": 343062
+  },
+  {
+    "id": 81,
+    "category": "response",
+    "name": "Large 1MB body",
+    "pass": true,
+    "duration_ns": 5941274
+  },
+  {
+    "id": 82,
+    "category": "response",
+    "name": "JSON array response",
+    "pass": true,
+    "duration_ns": 1010131
+  },
+  {
+    "id": 83,
+    "category": "response",
+    "name": "JSON nested response",
+    "pass": true,
+    "duration_ns": 637722
+  },
+  {
+    "id": 84,
+    "category": "response",
+    "name": "Response body with special chars",
+    "pass": true,
+    "duration_ns": 173041
+  },
+  {
+    "id": 85,
+    "category": "response",
+    "name": "Status 503 Service Unavailable",
+    "pass": true,
+    "duration_ns": 147248
+  },
+  {
+    "id": 86,
+    "category": "status-codes",
+    "name": "Status 200 OK",
+    "pass": true,
+    "duration_ns": 596355
+  },
+  {
+    "id": 87,
+    "category": "status-codes",
+    "name": "Status 201 Created",
+    "pass": true,
+    "duration_ns": 399408
+  },
+  {
+    "id": 88,
+    "category": "status-codes",
+    "name": "Status 202 Accepted",
+    "pass": true,
+    "duration_ns": 420110
+  },
+  {
+    "id": 89,
+    "category": "status-codes",
+    "name": "Status 204 No Content",
+    "pass": true,
+    "duration_ns": 520358
+  },
+  {
+    "id": 90,
+    "category": "status-codes",
+    "name": "Status 301 Moved",
+    "pass": true,
+    "duration_ns": 348233
+  },
+  {
+    "id": 91,
+    "category": "status-codes",
+    "name": "Status 302 Found",
+    "pass": true,
+    "duration_ns": 487938
+  },
+  {
+    "id": 92,
+    "category": "status-codes",
+    "name": "Status 304 Not Modified",
+    "pass": true,
+    "duration_ns": 404087
+  },
+  {
+    "id": 93,
+    "category": "status-codes",
+    "name": "Status 307 Temp Redirect",
+    "pass": true,
+    "duration_ns": 149114
+  },
+  {
+    "id": 94,
+    "category": "status-codes",
+    "name": "Status 400 Bad Request",
+    "pass": true,
+    "duration_ns": 399048
+  },
+  {
+    "id": 95,
+    "category": "status-codes",
+    "name": "Status 401 Unauthorized",
+    "pass": true,
+    "duration_ns": 559144
+  },
+  {
+    "id": 96,
+    "category": "status-codes",
+    "name": "Status 403 Forbidden",
+    "pass": true,
+    "duration_ns": 467429
+  },
+  {
+    "id": 97,
+    "category": "status-codes",
+    "name": "Status 404 Not Found",
+    "pass": true,
+    "duration_ns": 459352
+  },
+  {
+    "id": 98,
+    "category": "status-codes",
+    "name": "Status 405 Method Not Allowed",
+    "pass": true,
+    "duration_ns": 466969
+  },
+  {
+    "id": 99,
+    "category": "status-codes",
+    "name": "Status 500 Internal Error",
+    "pass": true,
+    "duration_ns": 456997
+  },
+  {
+    "id": 100,
+    "category": "status-codes",
+    "name": "Status 503 Service Unavailable",
+    "pass": true,
+    "duration_ns": 392868
+  },
+  {
+    "id": 101,
+    "category": "headers",
+    "name": "Set single header",
+    "pass": true,
+    "duration_ns": 470395
+  },
+  {
+    "id": 102,
+    "category": "headers",
+    "name": "Content-Type text/plain",
+    "pass": true,
+    "duration_ns": 505081
+  },
+  {
+    "id": 103,
+    "category": "headers",
+    "name": "Content-Type application/json",
+    "pass": true,
+    "duration_ns": 576426
+  },
+  {
+    "id": 104,
+    "category": "headers",
+    "name": "Content-Type text/html",
+    "pass": true,
+    "duration_ns": 373610
+  },
+  {
+    "id": 105,
+    "category": "headers",
+    "name": "Server header present",
+    "pass": true,
+    "duration_ns": 341368
+  },
+  {
+    "id": 106,
+    "category": "headers",
+    "name": "Security X-Frame-Options",
+    "pass": true,
+    "duration_ns": 468250
+  },
+  {
+    "id": 107,
+    "category": "headers",
+    "name": "Security X-Content-Type-Options",
+    "pass": true,
+    "duration_ns": 391856
+  },
+  {
+    "id": 108,
+    "category": "headers",
+    "name": "Security X-XSS-Protection",
+    "pass": true,
+    "duration_ns": 377016
+  },
+  {
+    "id": 109,
+    "category": "headers",
+    "name": "Security HSTS",
+    "pass": true,
+    "duration_ns": 383812
+  },
+  {
+    "id": 110,
+    "category": "headers",
+    "name": "Security Referrer-Policy",
+    "pass": true,
+    "duration_ns": 342690
+  },
+  {
+    "id": 111,
+    "category": "headers",
+    "name": "Cache-Control header",
+    "pass": true,
+    "duration_ns": 406774
+  },
+  {
+    "id": 112,
+    "category": "headers",
+    "name": "ETag header",
+    "pass": true,
+    "duration_ns": 409899
+  },
+  {
+    "id": 113,
+    "category": "headers",
+    "name": "Custom header round-trip",
+    "pass": true,
+    "duration_ns": 566957
+  },
+  {
+    "id": 114,
+    "category": "headers",
+    "name": "Multiple Accept values",
+    "pass": true,
+    "duration_ns": 157018
+  },
+  {
+    "id": 115,
+    "category": "headers",
+    "name": "Long header value",
+    "pass": true,
+    "duration_ns": 238715
+  },
+  {
+    "id": 116,
+    "category": "headers",
+    "name": "Empty header value",
+    "pass": true,
+    "duration_ns": 125167
+  },
+  {
+    "id": 117,
+    "category": "headers",
+    "name": "Case insensitive header names",
+    "pass": true,
+    "duration_ns": 401063
+  },
+  {
+    "id": 118,
+    "category": "headers",
+    "name": "Connection header present",
+    "pass": true,
+    "duration_ns": 164499
+  },
+  {
+    "id": 119,
+    "category": "headers",
+    "name": "Content-Length numeric",
+    "pass": true,
+    "duration_ns": 419472
+  },
+  {
+    "id": 120,
+    "category": "headers",
+    "name": "JSON marshal content-type",
+    "pass": true,
+    "duration_ns": 459503
+  },
+  {
+    "id": 121,
+    "category": "compression",
+    "name": "Gzip compress text",
+    "pass": true,
+    "duration_ns": 1119299
+  },
+  {
+    "id": 122,
+    "category": "compression",
+    "name": "Gzip decompresses correctly",
+    "pass": true,
+    "duration_ns": 746708
+  },
+  {
+    "id": 123,
+    "category": "compression",
+    "name": "Deflate compress",
+    "pass": true,
+    "duration_ns": 1084762
+  },
+  {
+    "id": 124,
+    "category": "compression",
+    "name": "No compression without Accept-Encoding",
+    "pass": true,
+    "duration_ns": 529828
+  },
+  {
+    "id": 125,
+    "category": "compression",
+    "name": "Small body not compressed",
+    "pass": true,
+    "duration_ns": 1367148
+  },
+  {
+    "id": 126,
+    "category": "compression",
+    "name": "Content-Encoding header present",
+    "pass": true,
+    "duration_ns": 1037393
+  },
+  {
+    "id": 127,
+    "category": "compression",
+    "name": "Gzip JSON response",
+    "pass": true,
+    "duration_ns": 1835631
+  },
+  {
+    "id": 128,
+    "category": "compression",
+    "name": "Gzip HTML response",
+    "pass": true,
+    "duration_ns": 408696
+  },
+  {
+    "id": 129,
+    "category": "compression",
+    "name": "Compressed smaller than original",
+    "pass": true,
+    "duration_ns": 774353
+  },
+  {
+    "id": 130,
+    "category": "compression",
+    "name": "Vary Accept-Encoding header",
+    "pass": true,
+    "duration_ns": 257378
+  },
+  {
+    "id": 131,
+    "category": "compression",
+    "name": "Accept-Encoding gzip,deflate",
+    "pass": true,
+    "duration_ns": 1399142
+  },
+  {
+    "id": 132,
+    "category": "compression",
+    "name": "Identity encoding",
+    "pass": true,
+    "duration_ns": 538439
+  },
+  {
+    "id": 133,
+    "category": "compression",
+    "name": "Gzip large text",
+    "pass": true,
+    "duration_ns": 624882
+  },
+  {
+    "id": 134,
+    "category": "compression",
+    "name": "Repeated compress requests",
+    "pass": true,
+    "duration_ns": 4430903
+  },
+  {
+    "id": 135,
+    "category": "compression",
+    "name": "Compress does not break status",
+    "pass": true,
+    "duration_ns": 903478
+  },
+  {
+    "id": 136,
+    "category": "middleware",
+    "name": "Recovery catches panic",
+    "pass": true,
+    "duration_ns": 464352
+  },
+  {
+    "id": 137,
+    "category": "middleware",
+    "name": "Recovery returns 500",
+    "pass": true,
+    "duration_ns": 520900
+  },
+  {
+    "id": 138,
+    "category": "middleware",
+    "name": "Recovery does not crash server",
+    "pass": true,
+    "duration_ns": 840765
+  },
+  {
+    "id": 139,
+    "category": "middleware",
+    "name": "RequestID adds header",
+    "pass": true,
+    "duration_ns": 213260
+  },
+  {
+    "id": 140,
+    "category": "middleware",
+    "name": "RequestID unique per request",
+    "pass": true,
+    "duration_ns": 1169012
+  },
+  {
+    "id": 141,
+    "category": "middleware",
+    "name": "CORS preflight OPTIONS",
+    "pass": true,
+    "duration_ns": 414497
+  },
+  {
+    "id": 142,
+    "category": "middleware",
+    "name": "CORS Allow-Origin header",
+    "pass": true,
+    "duration_ns": 182969
+  },
+  {
+    "id": 143,
+    "category": "middleware",
+    "name": "CORS Allow-Methods header",
+    "pass": true,
+    "duration_ns": 441911
+  },
+  {
+    "id": 144,
+    "category": "middleware",
+    "name": "CORS Allow-Headers header",
+    "pass": true,
+    "duration_ns": 233453
+  },
+  {
+    "id": 145,
+    "category": "middleware",
+    "name": "CORS Allow-Credentials",
+    "pass": true,
+    "duration_ns": 522233
+  },
+  {
+    "id": 146,
+    "category": "middleware",
+    "name": "CORS Max-Age header",
+    "pass": true,
+    "duration_ns": 394410
+  },
+  {
+    "id": 147,
+    "category": "middleware",
+    "name": "CORS wrong origin blocked",
+    "pass": true,
+    "duration_ns": 186376
+  },
+  {
+    "id": 148,
+    "category": "middleware",
+    "name": "Security headers all present",
+    "pass": true,
+    "duration_ns": 422162
+  },
+  {
+    "id": 149,
+    "category": "middleware",
+    "name": "Security HSTS with subdomains",
+    "pass": true,
+    "duration_ns": 453082
+  },
+  {
+    "id": 150,
+    "category": "middleware",
+    "name": "Security nosniff",
+    "pass": true,
+    "duration_ns": 368192
+  },
+  {
+    "id": 151,
+    "category": "middleware",
+    "name": "Middleware doesn't break response",
+    "pass": true,
+    "duration_ns": 342710
+  },
+  {
+    "id": 152,
+    "category": "middleware",
+    "name": "Multiple panics handled",
+    "pass": true,
+    "duration_ns": 1022184
+  },
+  {
+    "id": 153,
+    "category": "middleware",
+    "name": "Security XSS Protection",
+    "pass": true,
+    "duration_ns": 344246
+  },
+  {
+    "id": 154,
+    "category": "middleware",
+    "name": "Security Referrer Policy",
+    "pass": true,
+    "duration_ns": 447900
+  },
+  {
+    "id": 155,
+    "category": "middleware",
+    "name": "CORS expose headers",
+    "pass": true,
+    "duration_ns": 366597
+  },
+  {
+    "id": 156,
+    "category": "middleware",
+    "name": "Recovery then normal request",
+    "pass": true,
+    "duration_ns": 2777732
+  },
+  {
+    "id": 157,
+    "category": "middleware",
+    "name": "CORS no origin no headers",
+    "pass": true,
+    "duration_ns": 221942
+  },
+  {
+    "id": 158,
+    "category": "middleware",
+    "name": "CORS preflight returns 200",
+    "pass": true,
+    "duration_ns": 505851
+  },
+  {
+    "id": 159,
+    "category": "middleware",
+    "name": "Security frame options DENY",
+    "pass": true,
+    "duration_ns": 161959
+  },
+  {
+    "id": 160,
+    "category": "websocket",
+    "name": "Upgrade handshake 101",
+    "pass": true,
+    "duration_ns": 589720
+  },
+  {
+    "id": 161,
+    "category": "websocket",
+    "name": "Send text message",
+    "pass": true,
+    "duration_ns": 690991
+  },
+  {
+    "id": 162,
+    "category": "websocket",
+    "name": "Echo text round-trip",
+    "pass": true,
+    "duration_ns": 540007
+  },
+  {
+    "id": 163,
+    "category": "websocket",
+    "name": "Echo binary round-trip",
+    "pass": true,
+    "duration_ns": 586400
+  },
+  {
+    "id": 164,
+    "category": "websocket",
+    "name": "Multiple text messages",
+    "pass": true,
+    "duration_ns": 908377
+  },
+  {
+    "id": 165,
+    "category": "websocket",
+    "name": "Large text message",
+    "pass": true,
+    "duration_ns": 658781
+  },
+  {
+    "id": 166,
+    "category": "websocket",
+    "name": "Large binary message",
+    "pass": true,
+    "duration_ns": 1282638
+  },
+  {
+    "id": 167,
+    "category": "websocket",
+    "name": "Close handshake",
+    "pass": true,
+    "duration_ns": 425760
+  },
+  {
+    "id": 168,
+    "category": "websocket",
+    "name": "Sequential connections",
+    "pass": true,
+    "duration_ns": 1209259
+  },
+  {
+    "id": 169,
+    "category": "websocket",
+    "name": "Binary 1KB message",
+    "pass": true,
+    "duration_ns": 463912
+  },
+  {
+    "id": 170,
+    "category": "websocket",
+    "name": "Text UTF-8 content",
+    "pass": true,
+    "duration_ns": 472278
+  },
+  {
+    "id": 171,
+    "category": "websocket",
+    "name": "Rapid fire messages",
+    "pass": true,
+    "duration_ns": 832483
+  },
+  {
+    "id": 172,
+    "category": "websocket",
+    "name": "Empty text message",
+    "pass": true,
+    "duration_ns": 737442
+  },
+  {
+    "id": 173,
+    "category": "websocket",
+    "name": "Empty binary message",
+    "pass": true,
+    "duration_ns": 495351
+  },
+  {
+    "id": 174,
+    "category": "websocket",
+    "name": "Text then binary",
+    "pass": true,
+    "duration_ns": 636160
+  },
+  {
+    "id": 175,
+    "category": "websocket",
+    "name": "Multiple connections simultaneous",
+    "pass": true,
+    "duration_ns": 40227357
+  },
+  {
+    "id": 176,
+    "category": "websocket",
+    "name": "100KB binary payload",
+    "pass": true,
+    "duration_ns": 1549695
+  },
+  {
+    "id": 177,
+    "category": "websocket",
+    "name": "Interleaved text messages",
+    "pass": true,
+    "duration_ns": 827454
+  },
+  {
+    "id": 178,
+    "category": "websocket",
+    "name": "Connection after close",
+    "pass": true,
+    "duration_ns": 101318652
+  },
+  {
+    "id": 179,
+    "category": "static",
+    "name": "Serve HTML file",
+    "pass": true,
+    "duration_ns": 910411
+  },
+  {
+    "id": 180,
+    "category": "static",
+    "name": "Serve CSS file",
+    "pass": true,
+    "duration_ns": 530759
+  },
+  {
+    "id": 181,
+    "category": "static",
+    "name": "Serve JS file",
+    "pass": true,
+    "duration_ns": 569770
+  },
+  {
+    "id": 182,
+    "category": "static",
+    "name": "Serve PNG file",
+    "pass": true,
+    "duration_ns": 604530
+  },
+  {
+    "id": 183,
+    "category": "static",
+    "name": "Serve JSON file",
+    "pass": true,
+    "duration_ns": 462413
+  },
+  {
+    "id": 184,
+    "category": "static",
+    "name": "Serve TXT file",
+    "pass": true,
+    "duration_ns": 577695
+  },
+  {
+    "id": 185,
+    "category": "static",
+    "name": "HTML MIME type",
+    "pass": true,
+    "duration_ns": 586479
+  },
+  {
+    "id": 186,
+    "category": "static",
+    "name": "CSS MIME type",
+    "pass": true,
+    "duration_ns": 539135
+  },
+  {
+    "id": 187,
+    "category": "static",
+    "name": "JS MIME type",
+    "pass": true,
+    "duration_ns": 560135
+  },
+  {
+    "id": 188,
+    "category": "static",
+    "name": "PNG MIME type",
+    "pass": true,
+    "duration_ns": 442171
+  },
+  {
+    "id": 189,
+    "category": "static",
+    "name": "Path traversal blocked",
+    "pass": true,
+    "duration_ns": 356768
+  },
+  {
+    "id": 190,
+    "category": "static",
+    "name": "Non-existent file 404",
+    "pass": true,
+    "duration_ns": 412000
+  },
+  {
+    "id": 191,
+    "category": "static",
+    "name": "Static file content-length",
+    "pass": true,
+    "duration_ns": 503171
+  },
+  {
+    "id": 192,
+    "category": "static",
+    "name": "Repeated static requests",
+    "pass": true,
+    "duration_ns": 2143375
+  },
+  {
+    "id": 193,
+    "category": "static",
+    "name": "JSON static file content",
+    "pass": true,
+    "duration_ns": 658242
+  },
+  {
+    "id": 194,
+    "category": "streaming",
+    "name": "Stream chunks received",
+    "pass": true,
+    "duration_ns": 485622
+  },
+  {
+    "id": 195,
+    "category": "streaming",
+    "name": "Stream all 5 chunks",
+    "pass": true,
+    "duration_ns": 438353
+  },
+  {
+    "id": 196,
+    "category": "streaming",
+    "name": "Stream status 200",
+    "pass": true,
+    "duration_ns": 373189
+  },
+  {
+    "id": 197,
+    "category": "streaming",
+    "name": "Stream X-Stream header",
+    "pass": true,
+    "duration_ns": 386005
+  },
+  {
+    "id": 198,
+    "category": "streaming",
+    "name": "SSE event format",
+    "pass": true,
+    "duration_ns": 401483
+  },
+  {
+    "id": 199,
+    "category": "streaming",
+    "name": "SSE data field",
+    "pass": true,
+    "duration_ns": 428806
+  },
+  {
+    "id": 200,
+    "category": "streaming",
+    "name": "SSE multiple events",
+    "pass": true,
+    "duration_ns": 406796
+  },
+  {
+    "id": 201,
+    "category": "streaming",
+    "name": "SSE JSON data",
+    "pass": true,
+    "duration_ns": 554432
+  },
+  {
+    "id": 202,
+    "category": "streaming",
+    "name": "SSE content-type",
+    "pass": true,
+    "duration_ns": 444797
+  },
+  {
+    "id": 203,
+    "category": "streaming",
+    "name": "Large stream 400KB",
+    "pass": true,
+    "duration_ns": 1540748
+  },
+  {
+    "id": 204,
+    "category": "streaming",
+    "name": "Stream content-type octet",
+    "pass": true,
+    "duration_ns": 515651
+  },
+  {
+    "id": 205,
+    "category": "streaming",
+    "name": "Stream repeated requests",
+    "pass": true,
+    "duration_ns": 1305412
+  },
+  {
+    "id": 206,
+    "category": "streaming",
+    "name": "SSE double newline separator",
+    "pass": true,
+    "duration_ns": 434575
+  },
+  {
+    "id": 207,
+    "category": "streaming",
+    "name": "Stream does not hang",
+    "pass": true,
+    "duration_ns": 472485
+  },
+  {
+    "id": 208,
+    "category": "streaming",
+    "name": "Large stream content correct",
+    "pass": true,
+    "duration_ns": 1847976
+  },
+  {
+    "id": 209,
+    "category": "h2",
+    "name": "H2 GET request",
+    "pass": true,
+    "duration_ns": 454485
+  },
+  {
+    "id": 210,
+    "category": "h2",
+    "name": "H2 POST request",
+    "pass": true,
+    "duration_ns": 308967
+  },
+  {
+    "id": 211,
+    "category": "h2",
+    "name": "H2 uses HTTP/2 protocol",
+    "pass": true,
+    "duration_ns": 310693
+  },
+  {
+    "id": 212,
+    "category": "h2",
+    "name": "H2 status 201",
+    "pass": true,
+    "duration_ns": 353580
+  },
+  {
+    "id": 213,
+    "category": "h2",
+    "name": "H2 status 404",
+    "pass": true,
+    "duration_ns": 306092
+  },
+  {
+    "id": 214,
+    "category": "h2",
+    "name": "H2 custom headers",
+    "pass": true,
+    "duration_ns": 403438
+  },
+  {
+    "id": 215,
+    "category": "h2",
+    "name": "H2 JSON response",
+    "pass": true,
+    "duration_ns": 367828
+  },
+  {
+    "id": 216,
+    "category": "h2",
+    "name": "H2 large response",
+    "pass": true,
+    "duration_ns": 6111460
+  },
+  {
+    "id": 217,
+    "category": "h2",
+    "name": "H2 echo body",
+    "pass": true,
+    "duration_ns": 586364
+  },
+  {
+    "id": 218,
+    "category": "h2",
+    "name": "H2 routing params",
+    "pass": true,
+    "duration_ns": 324173
+  },
+  {
+    "id": 219,
+    "category": "h2",
+    "name": "H2 routing catch-all",
+    "pass": true,
+    "duration_ns": 316154
+  },
+  {
+    "id": 220,
+    "category": "h2",
+    "name": "H2 concurrent requests",
+    "pass": true,
+    "duration_ns": 956179
+  },
+  {
+    "id": 221,
+    "category": "h2",
+    "name": "H2 PUT method",
+    "pass": true,
+    "duration_ns": 289762
+  },
+  {
+    "id": 222,
+    "category": "h2",
+    "name": "H2 DELETE method",
+    "pass": true,
+    "duration_ns": 286744
+  },
+  {
+    "id": 223,
+    "category": "h2",
+    "name": "H2 204 No Content",
+    "pass": true,
+    "duration_ns": 252827
+  },
+  {
+    "id": 224,
+    "category": "h2",
+    "name": "H2 500 Error",
+    "pass": true,
+    "duration_ns": 254429
+  },
+  {
+    "id": 225,
+    "category": "h2",
+    "name": "H2 content-type json",
+    "pass": true,
+    "duration_ns": 255225
+  },
+  {
+    "id": 226,
+    "category": "h2",
+    "name": "H2 content-type html",
+    "pass": true,
+    "duration_ns": 250285
+  },
+  {
+    "id": 227,
+    "category": "h2",
+    "name": "H2 upload body",
+    "pass": true,
+    "duration_ns": 279623
+  },
+  {
+    "id": 228,
+    "category": "h2",
+    "name": "H2 multiple sequential",
+    "pass": true,
+    "duration_ns": 1366316
+  },
+  {
+    "id": 229,
+    "category": "tls",
+    "name": "TLS connection established",
+    "pass": true,
+    "duration_ns": 1170855
+  },
+  {
+    "id": 230,
+    "category": "tls",
+    "name": "TLS GET request",
+    "pass": true,
+    "duration_ns": 139606
+  },
+  {
+    "id": 231,
+    "category": "tls",
+    "name": "TLS POST request",
+    "pass": true,
+    "duration_ns": 156402
+  },
+  {
+    "id": 232,
+    "category": "tls",
+    "name": "TLS response headers",
+    "pass": true,
+    "duration_ns": 185633
+  },
+  {
+    "id": 233,
+    "category": "tls",
+    "name": "TLS status codes",
+    "pass": true,
+    "duration_ns": 967034
+  },
+  {
+    "id": 234,
+    "category": "tls",
+    "name": "TLS large response",
+    "pass": true,
+    "duration_ns": 15797342
+  },
+  {
+    "id": 235,
+    "category": "tls",
+    "name": "TLS JSON response",
+    "pass": true,
+    "duration_ns": 295117
+  },
+  {
+    "id": 236,
+    "category": "tls",
+    "name": "TLS echo body",
+    "pass": true,
+    "duration_ns": 313652
+  },
+  {
+    "id": 237,
+    "category": "tls",
+    "name": "TLS routing params",
+    "pass": true,
+    "duration_ns": 238308
+  },
+  {
+    "id": 238,
+    "category": "tls",
+    "name": "TLS concurrent",
+    "pass": true,
+    "duration_ns": 1916958
+  },
+  {
+    "id": 239,
+    "category": "tls",
+    "name": "TLS repeated connections",
+    "pass": true,
+    "duration_ns": 4267193
+  },
+  {
+    "id": 240,
+    "category": "tls",
+    "name": "TLS upload body",
+    "pass": true,
+    "duration_ns": 962530
+  },
+  {
+    "id": 241,
+    "category": "tls",
+    "name": "HTTPS H1 fallback",
+    "pass": true,
+    "duration_ns": 916912
+  },
+  {
+    "id": 242,
+    "category": "tls",
+    "name": "TLS WebSocket upgrade",
+    "pass": true,
+    "duration_ns": 1134066
+  },
+  {
+    "id": 243,
+    "category": "tls",
+    "name": "TLS static file",
+    "pass": true,
+    "duration_ns": 383691
+  },
+  {
+    "id": 244,
+    "category": "cookies",
+    "name": "Set-Cookie header present",
+    "pass": true,
+    "duration_ns": 612203
+  },
+  {
+    "id": 245,
+    "category": "cookies",
+    "name": "Cookie name=value",
+    "pass": true,
+    "duration_ns": 529047
+  },
+  {
+    "id": 246,
+    "category": "cookies",
+    "name": "Cookie HttpOnly",
+    "pass": true,
+    "duration_ns": 445708
+  },
+  {
+    "id": 247,
+    "category": "cookies",
+    "name": "Cookie Secure",
+    "pass": true,
+    "duration_ns": 399699
+  },
+  {
+    "id": 248,
+    "category": "cookies",
+    "name": "Cookie SameSite",
+    "pass": true,
+    "duration_ns": 392788
+  },
+  {
+    "id": 249,
+    "category": "cookies",
+    "name": "Cookie Path",
+    "pass": true,
+    "duration_ns": 512109
+  },
+  {
+    "id": 250,
+    "category": "cookies",
+    "name": "Cookie round-trip",
+    "pass": true,
+    "duration_ns": 458667
+  },
+  {
+    "id": 251,
+    "category": "cookies",
+    "name": "Multiple cookies set",
+    "pass": true,
+    "duration_ns": 207894
+  },
+  {
+    "id": 252,
+    "category": "cookies",
+    "name": "Cookie get empty",
+    "pass": true,
+    "duration_ns": 440197
+  },
+  {
+    "id": 253,
+    "category": "cookies",
+    "name": "Cookie multiple values",
+    "pass": true,
+    "duration_ns": 198027
+  },
+  {
+    "id": 254,
+    "category": "redirects",
+    "name": "301 redirect",
+    "pass": true,
+    "duration_ns": 217242
+  },
+  {
+    "id": 255,
+    "category": "redirects",
+    "name": "302 redirect",
+    "pass": true,
+    "duration_ns": 442954
+  },
+  {
+    "id": 256,
+    "category": "redirects",
+    "name": "307 redirect",
+    "pass": true,
+    "duration_ns": 422913
+  },
+  {
+    "id": 257,
+    "category": "redirects",
+    "name": "308 redirect",
+    "pass": true,
+    "duration_ns": 328034
+  },
+  {
+    "id": 258,
+    "category": "redirects",
+    "name": "Redirect Location header",
+    "pass": true,
+    "duration_ns": 386204
+  },
+  {
+    "id": 259,
+    "category": "redirects",
+    "name": "Redirect has body",
+    "pass": true,
+    "duration_ns": 407806
+  },
+  {
+    "id": 260,
+    "category": "redirects",
+    "name": "Multiple redirect codes",
+    "pass": true,
+    "duration_ns": 1234759
+  },
+  {
+    "id": 261,
+    "category": "redirects",
+    "name": "301 not followed",
+    "pass": true,
+    "duration_ns": 414426
+  },
+  {
+    "id": 262,
+    "category": "redirects",
+    "name": "302 not followed",
+    "pass": true,
+    "duration_ns": 375405
+  },
+  {
+    "id": 263,
+    "category": "redirects",
+    "name": "Redirect repeated requests",
+    "pass": true,
+    "duration_ns": 3016684
+  },
+  {
+    "id": 264,
+    "category": "connections",
+    "name": "Keep-alive connection reuse",
+    "pass": true,
+    "duration_ns": 1201095
+  },
+  {
+    "id": 265,
+    "category": "connections",
+    "name": "Connection close honored",
+    "pass": true,
+    "duration_ns": 386635
+  },
+  {
+    "id": 266,
+    "category": "connections",
+    "name": "Concurrent connections",
+    "pass": true,
+    "duration_ns": 1447422
+  },
+  {
+    "id": 267,
+    "category": "connections",
+    "name": "Rapid sequential requests",
+    "pass": true,
+    "duration_ns": 18970003
+  },
+  {
+    "id": 268,
+    "category": "connections",
+    "name": "Slow endpoint completes",
+    "pass": true,
+    "duration_ns": 1001302090
+  },
+  {
+    "id": 269,
+    "category": "connections",
+    "name": "Pipeline-style requests",
+    "pass": true,
+    "duration_ns": 3812017
+  },
+  {
+    "id": 270,
+    "category": "connections",
+    "name": "Large payload within timeout",
+    "pass": true,
+    "duration_ns": 1932444
+  },
+  {
+    "id": 271,
+    "category": "connections",
+    "name": "Many concurrent GET",
+    "pass": true,
+    "duration_ns": 4494344
+  },
+  {
+    "id": 272,
+    "category": "connections",
+    "name": "Mixed method concurrent",
+    "pass": true,
+    "duration_ns": 1917105
+  },
+  {
+    "id": 273,
+    "category": "connections",
+    "name": "Concurrent JSON endpoint",
+    "pass": true,
+    "duration_ns": 656849
+  },
+  {
+    "id": 274,
+    "category": "concurrency",
+    "name": "10 concurrent GET",
+    "pass": true,
+    "duration_ns": 1237639
+  },
+  {
+    "id": 275,
+    "category": "concurrency",
+    "name": "50 concurrent GET",
+    "pass": true,
+    "duration_ns": 5809859
+  },
+  {
+    "id": 276,
+    "category": "concurrency",
+    "name": "100 concurrent GET",
+    "pass": true,
+    "duration_ns": 52716091
+  },
+  {
+    "id": 277,
+    "category": "concurrency",
+    "name": "10 concurrent POST",
+    "pass": true,
+    "duration_ns": 660333
+  },
+  {
+    "id": 278,
+    "category": "concurrency",
+    "name": "50 concurrent POST",
+    "pass": true,
+    "duration_ns": 4517001
+  },
+  {
+    "id": 279,
+    "category": "concurrency",
+    "name": "Response ordering correct",
+    "pass": true,
+    "duration_ns": 1915222
+  },
+  {
+    "id": 280,
+    "category": "concurrency",
+    "name": "Burst 100 rapid requests",
+    "pass": true,
+    "duration_ns": 8223515
+  },
+  {
+    "id": 281,
+    "category": "concurrency",
+    "name": "Concurrent different routes",
+    "pass": true,
+    "duration_ns": 2318864
+  },
+  {
+    "id": 282,
+    "category": "concurrency",
+    "name": "Concurrent with compression",
+    "pass": true,
+    "duration_ns": 2137538
+  },
+  {
+    "id": 283,
+    "category": "concurrency",
+    "name": "Concurrent uploads",
+    "pass": true,
+    "duration_ns": 691966
+  },
+  {
+    "id": 284,
+    "category": "concurrency",
+    "name": "Concurrent static files",
+    "pass": true,
+    "duration_ns": 3769576
+  },
+  {
+    "id": 285,
+    "category": "concurrency",
+    "name": "Concurrent WebSocket + HTTP",
+    "pass": true,
+    "duration_ns": 895092
+  },
+  {
+    "id": 286,
+    "category": "concurrency",
+    "name": "Sequential rapid fire",
+    "pass": true,
+    "duration_ns": 37119659
+  },
+  {
+    "id": 287,
+    "category": "concurrency",
+    "name": "200 concurrent GET",
+    "pass": true,
+    "duration_ns": 16040206
+  },
+  {
+    "id": 288,
+    "category": "errors",
+    "name": "Invalid status code",
+    "pass": true,
+    "duration_ns": 404158
+  },
+  {
+    "id": 289,
+    "category": "errors",
+    "name": "Negative status code",
+    "pass": true,
+    "duration_ns": 354483
+  },
+  {
+    "id": 290,
+    "category": "errors",
+    "name": "Panic recovery in handler",
+    "pass": true,
+    "duration_ns": 424638
+  },
+  {
+    "id": 291,
+    "category": "errors",
+    "name": "Server survives after panic",
+    "pass": true,
+    "duration_ns": 840397
+  },
+  {
+    "id": 292,
+    "category": "errors",
+    "name": "404 for missing route",
+    "pass": true,
+    "duration_ns": 171246
+  },
+  {
+    "id": 293,
+    "category": "errors",
+    "name": "405 for wrong method",
+    "pass": true,
+    "duration_ns": 377257
+  },
+  {
+    "id": 294,
+    "category": "errors",
+    "name": "Invalid JSON returns 400",
+    "pass": true,
+    "duration_ns": 374142
+  },
+  {
+    "id": 295,
+    "category": "errors",
+    "name": "Empty POST to JSON endpoint",
+    "pass": true,
+    "duration_ns": 432320
+  },
+  {
+    "id": 296,
+    "category": "errors",
+    "name": "Very long URL",
+    "pass": true,
+    "duration_ns": 647972
+  },
+  {
+    "id": 297,
+    "category": "errors",
+    "name": "Status 418 teapot",
+    "pass": true,
+    "duration_ns": 399710
+  },
+  {
+    "id": 298,
+    "category": "h2",
+    "name": "H2 PATCH method",
+    "pass": true,
+    "duration_ns": 455747
+  },
+  {
+    "id": 299,
+    "category": "websocket",
+    "name": "WS close with normal code",
+    "pass": true,
+    "duration_ns": 495672
+  },
+  {
+    "id": 300,
+    "category": "middleware",
+    "name": "Recovery returns valid body",
+    "pass": true,
+    "duration_ns": 439496
+  },
+  {
+    "id": 301,
+    "category": "xproto-stream",
+    "name": "Plain HTTP stream chunks",
+    "pass": true,
+    "duration_ns": 312725
+  },
+  {
+    "id": 302,
+    "category": "xproto-stream",
+    "name": "Plain HTTP stream status 200",
+    "pass": true,
+    "duration_ns": 635637
+  },
+  {
+    "id": 303,
+    "category": "xproto-stream",
+    "name": "Plain HTTP chunked transfer",
+    "pass": true,
+    "duration_ns": 532914
+  },
+  {
+    "id": 304,
+    "category": "xproto-stream",
+    "name": "Plain HTTP SSE content-type",
+    "pass": true,
+    "duration_ns": 520418
+  },
+  {
+    "id": 305,
+    "category": "xproto-stream",
+    "name": "Plain HTTP SSE events",
+    "pass": true,
+    "duration_ns": 470855
+  },
+  {
+    "id": 306,
+    "category": "xproto-stream",
+    "name": "Plain HTTP large stream 400KB",
+    "pass": true,
+    "duration_ns": 2129519
+  },
+  {
+    "id": 307,
+    "category": "xproto-stream",
+    "name": "Plain HTTP stream X-Stream header",
+    "pass": true,
+    "duration_ns": 448143
+  },
+  {
+    "id": 308,
+    "category": "xproto-stream",
+    "name": "TLS H1 stream chunks",
+    "pass": true,
+    "duration_ns": 323353
+  },
+  {
+    "id": 309,
+    "category": "xproto-stream",
+    "name": "TLS H1 SSE content-type",
+    "pass": true,
+    "duration_ns": 1328266
+  },
+  {
+    "id": 310,
+    "category": "xproto-stream",
+    "name": "TLS H1 SSE events",
+    "pass": true,
+    "duration_ns": 1049125
+  },
+  {
+    "id": 311,
+    "category": "xproto-stream",
+    "name": "TLS H1 large stream 400KB",
+    "pass": true,
+    "duration_ns": 2396316
+  },
+  {
+    "id": 312,
+    "category": "xproto-stream",
+    "name": "TLS H1 stream all correct",
+    "pass": true,
+    "duration_ns": 3194803
+  },
+  {
+    "id": 313,
+    "category": "xproto-stream",
+    "name": "H2 stream chunks",
+    "pass": true,
+    "duration_ns": 999300
+  },
+  {
+    "id": 314,
+    "category": "xproto-stream",
+    "name": "H2 SSE content-type",
+    "pass": true,
+    "duration_ns": 277067
+  },
+  {
+    "id": 315,
+    "category": "xproto-stream",
+    "name": "H2 SSE events",
+    "pass": true,
+    "duration_ns": 988639
+  },
+  {
+    "id": 316,
+    "category": "xproto-stream",
+    "name": "H2 large stream 400KB",
+    "pass": true,
+    "duration_ns": 12787203
+  },
+  {
+    "id": 317,
+    "category": "xproto-stream",
+    "name": "H2 stream content correct",
+    "pass": true,
+    "duration_ns": 12225631
+  },
+  {
+    "id": 318,
+    "category": "xproto-stream",
+    "name": "H2 SSE JSON data",
+    "pass": true,
+    "duration_ns": 630398
+  },
+  {
+    "id": 319,
+    "category": "xproto-stream",
+    "name": "H2 stream octet content-type",
+    "pass": true,
+    "duration_ns": 372077
+  },
+  {
+    "id": 320,
+    "category": "xproto-stream",
+    "name": "Plain HTTP SSE JSON data",
+    "pass": true,
+    "duration_ns": 617203
+  },
+  {
+    "id": 321,
+    "category": "xproto-static",
+    "name": "Plain static HTML",
+    "pass": true,
+    "duration_ns": 508537
+  },
+  {
+    "id": 322,
+    "category": "xproto-static",
+    "name": "Plain static JSON",
+    "pass": true,
+    "duration_ns": 436977
+  },
+  {
+    "id": 323,
+    "category": "xproto-static",
+    "name": "Plain static PNG",
+    "pass": true,
+    "duration_ns": 684616
+  },
+  {
+    "id": 324,
+    "category": "xproto-static",
+    "name": "TLS H1 static HTML",
+    "pass": true,
+    "duration_ns": 1255596
+  },
+  {
+    "id": 325,
+    "category": "xproto-static",
+    "name": "TLS H1 static CSS",
+    "pass": true,
+    "duration_ns": 1057500
+  },
+  {
+    "id": 326,
+    "category": "xproto-static",
+    "name": "TLS H1 static JSON",
+    "pass": true,
+    "duration_ns": 1222616
+  },
+  {
+    "id": 327,
+    "category": "xproto-static",
+    "name": "TLS H1 static PNG",
+    "pass": true,
+    "duration_ns": 1748986
+  },
+  {
+    "id": 328,
+    "category": "xproto-static",
+    "name": "TLS H1 static 404",
+    "pass": true,
+    "duration_ns": 1212113
+  },
+  {
+    "id": 329,
+    "category": "xproto-static",
+    "name": "H2 static HTML",
+    "pass": true,
+    "duration_ns": 5286310
+  },
+  {
+    "id": 330,
+    "category": "xproto-static",
+    "name": "H2 static CSS",
+    "pass": true,
+    "duration_ns": 515519
+  },
+  {
+    "id": 331,
+    "category": "xproto-static",
+    "name": "H2 static JSON",
+    "pass": true,
+    "duration_ns": 526933
+  },
+  {
+    "id": 332,
+    "category": "xproto-static",
+    "name": "H2 static PNG",
+    "pass": true,
+    "duration_ns": 583889
+  },
+  {
+    "id": 333,
+    "category": "xproto-static",
+    "name": "H2 static TXT",
+    "pass": true,
+    "duration_ns": 659303
+  },
+  {
+    "id": 334,
+    "category": "xproto-static",
+    "name": "H2 static 404",
+    "pass": true,
+    "duration_ns": 304539
+  },
+  {
+    "id": 335,
+    "category": "xproto-static",
+    "name": "H2 static path traversal blocked",
+    "pass": true,
+    "duration_ns": 267648
+  },
+  {
+    "id": 336,
+    "category": "xproto-ws",
+    "name": "Plain WS handshake 101",
+    "pass": true,
+    "duration_ns": 468697
+  },
+  {
+    "id": 337,
+    "category": "xproto-ws",
+    "name": "Plain WS echo text",
+    "pass": true,
+    "duration_ns": 435561
+  },
+  {
+    "id": 338,
+    "category": "xproto-ws",
+    "name": "Plain WS echo binary",
+    "pass": true,
+    "duration_ns": 361113
+  },
+  {
+    "id": 339,
+    "category": "xproto-ws",
+    "name": "Plain WS accept hash correct",
+    "pass": true,
+    "duration_ns": 284651
+  },
+  {
+    "id": 340,
+    "category": "xproto-ws",
+    "name": "Plain WS 100KB binary",
+    "pass": true,
+    "duration_ns": 1024911
+  },
+  {
+    "id": 341,
+    "category": "xproto-ws",
+    "name": "TLS H1 WS handshake",
+    "pass": true,
+    "duration_ns": 1067670
+  },
+  {
+    "id": 342,
+    "category": "xproto-ws",
+    "name": "TLS H1 WS echo text",
+    "pass": true,
+    "duration_ns": 981366
+  },
+  {
+    "id": 343,
+    "category": "xproto-ws",
+    "name": "TLS H1 WS echo binary",
+    "pass": true,
+    "duration_ns": 1025449
+  },
+  {
+    "id": 344,
+    "category": "xproto-ws",
+    "name": "TLS H1 WS accept hash correct",
+    "pass": true,
+    "duration_ns": 901634
+  },
+  {
+    "id": 345,
+    "category": "xproto-ws",
+    "name": "TLS H1 WS large message",
+    "pass": true,
+    "duration_ns": 2016505
+  },
+  {
+    "id": 346,
+    "category": "xproto-ws",
+    "name": "Plain WS multiple messages",
+    "pass": true,
+    "duration_ns": 1686506
+  },
+  {
+    "id": 347,
+    "category": "xproto-ws",
+    "name": "TLS WS multiple messages",
+    "pass": true,
+    "duration_ns": 2221613
+  },
+  {
+    "id": 348,
+    "category": "xproto-ws",
+    "name": "Plain WS concurrent echo",
+    "pass": true,
+    "duration_ns": 1197476
+  },
+  {
+    "id": 349,
+    "category": "xproto-ws",
+    "name": "TLS WS concurrent echo",
+    "pass": true,
+    "duration_ns": 3908171
+  },
+  {
+    "id": 350,
+    "category": "xproto-ws",
+    "name": "Plain WS empty text frame",
+    "pass": true,
+    "duration_ns": 646188
+  },
+  {
+    "id": 351,
+    "category": "xproto-upload",
+    "name": "Plain HTTP 1KB upload",
+    "pass": true,
+    "duration_ns": 625108
+  },
+  {
+    "id": 352,
+    "category": "xproto-upload",
+    "name": "Plain HTTP 512KB upload",
+    "pass": true,
+    "duration_ns": 4075988
+  },
+  {
+    "id": 353,
+    "category": "xproto-upload",
+    "name": "TLS H1 1MB upload",
+    "pass": true,
+    "duration_ns": 11194342
+  },
+  {
+    "id": 354,
+    "category": "xproto-upload",
+    "name": "H2 1MB upload",
+    "pass": true,
+    "duration_ns": 8398227
+  },
+  {
+    "id": 355,
+    "category": "xproto-upload",
+    "name": "H2 5MB upload",
+    "pass": true,
+    "duration_ns": 20957753
+  },
+  {
+    "id": 356,
+    "category": "xproto-upload",
+    "name": "H2 10MB upload",
+    "pass": true,
+    "duration_ns": 83060813
+  },
+  {
+    "id": 357,
+    "category": "xproto-upload",
+    "name": "TLS H1 echo body",
+    "pass": true,
+    "duration_ns": 245066
+  },
+  {
+    "id": 358,
+    "category": "xproto-upload",
+    "name": "H2 echo body",
+    "pass": true,
+    "duration_ns": 341334
+  },
+  {
+    "id": 359,
+    "category": "xproto-upload",
+    "name": "Plain HTTP echo body",
+    "pass": true,
+    "duration_ns": 186405
+  },
+  {
+    "id": 360,
+    "category": "xproto-upload",
+    "name": "Concurrent multi-protocol uploads",
+    "pass": true,
+    "duration_ns": 1180864
+  }
+]
