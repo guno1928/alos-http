@@ -60,7 +60,7 @@ docker rm -f %CONTAINER_NAME% >nul 2>&1
 
 echo.
 if %TEST_EXIT% equ 0 (
-    echo ALL 300 TESTS PASSED
+    echo ALL 360 TESTS PASSED
 ) else (
     echo SOME TESTS FAILED (exit code %TEST_EXIT%)
 )
