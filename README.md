@@ -112,7 +112,7 @@ xproto-ws                 15/15
 
 Cleaning up container...
 
-ALL 300 TESTS PASSED
+ALL 360 TESTS PASSED
 
 ## Benchmarks
 
