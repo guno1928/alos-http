@@ -422,7 +422,7 @@ func extractHostPath(data []byte) (string, string) {
 		line := rest[:nl]
 		rest = rest[nl+2:]
 		colon := indexByte(line, ':')
-		if colon > 0 && ToLowerASCII(line[:colon]) == "host" {
+		if colon > 0 && EqualFoldASCII(line[:colon], "host") {
 			host = trimASCIISpace(line[colon+1:])
 			for i := len(host) - 1; i >= 0; i-- {
 				if host[i] == ':' {

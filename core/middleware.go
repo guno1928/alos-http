@@ -485,12 +485,23 @@ func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig
 }
 
 func responseHasHeader(headers [][2]string, name string) bool {
-	for i := range headers {
-		if EqualFoldASCII(headers[i][0], name) {
-			return true
+	switch len(headers) {
+	case 0:
+		return false
+	case 1:
+		return EqualFoldASCII(headers[0][0], name)
+	case 2:
+		return EqualFoldASCII(headers[0][0], name) || EqualFoldASCII(headers[1][0], name)
+	case 3:
+		return EqualFoldASCII(headers[0][0], name) || EqualFoldASCII(headers[1][0], name) || EqualFoldASCII(headers[2][0], name)
+	default:
+		for i := range headers {
+			if EqualFoldASCII(headers[i][0], name) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
 }
 
 type encodingType uint8

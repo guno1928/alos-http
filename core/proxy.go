@@ -104,6 +104,8 @@ type ProxyError struct {
 	Err        error
 }
 
+// ProxyErrorFunc is the callback signature for Server.OnProxyError. It receives
+// a ProxyError struct describing which backend failed and why.
 type ProxyErrorFunc func(ProxyError)
 
 // ProxyRequest is passed to the OnRequest callback before the request is
@@ -139,6 +141,8 @@ type ProxyRequest struct {
 	Host       string
 }
 
+// ProxyInterceptFunc is the callback signature for Server.OnProxyRequest.
+// Return true to allow the request to proceed, or false to reject it with 502.
 type ProxyInterceptFunc func(pr *ProxyRequest) bool
 
 // ProxyResponse is passed to the OnResponse callback after the backend replies
@@ -177,6 +181,8 @@ type ProxyResponse struct {
 	cacheCompressMin int
 }
 
+// CacheOption is a functional option passed to ProxyResponse.CacheThis to
+// control pre-compression and minimum size thresholds for cached entries.
 type CacheOption func(*cacheOpts)
 
 type cacheOpts struct {
@@ -250,6 +256,9 @@ func (pr *ProxyResponse) DontCache() {
 	pr.cacheTTL = 0
 }
 
+// ProxyResponseFunc is the callback signature for Server.OnProxyResponse.
+// Modify the ProxyResponse fields to transform headers or status before
+// sending to the client, or call CacheThis/DontCache to control caching.
 type ProxyResponseFunc func(pr *ProxyResponse)
 
 // DomainConfig holds the full configuration for a proxied domain, including its

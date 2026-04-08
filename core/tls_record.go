@@ -178,8 +178,36 @@ func SendCloseNotify(conn net.Conn, writer *TrafficAEAD) {
 
 func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	const maxContent = MaxRecordPayload - 1
-	ibp := WriteBufPool.Get().(*[]byte)
 	overhead := writer.Overhead()
+
+	if len(data) <= 256 {
+		innerLen := len(data) + 1
+		ciphertextLen := innerLen + overhead
+		var innerBuf [257]byte
+		inner := innerBuf[:innerLen]
+		copy(inner, data)
+		inner[innerLen-1] = 0x17
+
+		obp := LargeBufPool.Get().(*[]byte)
+		out := (*obp)[:5]
+		out[0] = 0x17
+		out[1] = 0x03
+		out[2] = 0x03
+		out[3] = byte(ciphertextLen >> 8)
+		out[4] = byte(ciphertextLen)
+		out = writer.EncryptAppend(out, inner)
+
+		if owned, ok := conn.(ownedWriteConn); ok {
+			_, err := owned.WriteOwned(out, obp, writeOwnedReleaseLargeBuf)
+			return err
+		}
+		err := writeFull(conn, out)
+		*obp = out[:0]
+		LargeBufPool.Put(obp)
+		return err
+	}
+
+	ibp := WriteBufPool.Get().(*[]byte)
 	maxRecordLen := 5 + maxContent + 1 + overhead
 
 	numRecords := (len(data) + maxContent - 1) / maxContent
@@ -218,28 +246,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	var err error
 	if len(out) > 0 {
 		if owned, ok := conn.(ownedWriteConn); ok {
-			releaseBuf := obp
-			releasePool := writeOwnedReleaseLargeBuf
-			if len(out) <= 512 {
-				sbp := SmallBufPool.Get().(*[]byte)
-				buf := (*sbp)[:len(out)]
-				copy(buf, out)
-				*obp = out[:0]
-				LargeBufPool.Put(obp)
-				out = buf
-				releaseBuf = sbp
-				releasePool = writeOwnedReleaseSmallBuf
-			} else if len(out) <= 4096 {
-				mbp := MediumBufPool.Get().(*[]byte)
-				buf := (*mbp)[:len(out)]
-				copy(buf, out)
-				*obp = out[:0]
-				LargeBufPool.Put(obp)
-				out = buf
-				releaseBuf = mbp
-				releasePool = writeOwnedReleaseMediumBuf
-			}
-			_, err = owned.WriteOwned(out, releaseBuf, releasePool)
+			_, err = owned.WriteOwned(out, obp, writeOwnedReleaseLargeBuf)
 			*ibp = (*ibp)[:0]
 			WriteBufPool.Put(ibp)
 			return err

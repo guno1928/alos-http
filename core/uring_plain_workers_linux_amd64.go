@@ -33,7 +33,7 @@ const (
 	plainConnProtoH1      = 1
 	plainConnProtoH2      = 2
 
-	plainAcceptDepth       = 4
+	plainAcceptDepth       = 64
 	plainWorkerRingEntries = 4096
 	plainReadMinFree       = 4096
 )
@@ -83,7 +83,7 @@ type plainUringWorker struct {
 	server          *Server
 	connections     []plainWorkerConn
 	freeHead        int32
-	completions     [64]ioUringCqe
+	completions     [ioUringCompletionBatchSize]ioUringCqe
 	timeoutCursor   int
 	acceptBackfill  int64
 	nextAcceptRetry int64
@@ -373,7 +373,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
 			continue
 		}
-		if _, err := worker.ring.submitAndWait(0); err != nil {
+		if _, err := worker.ring.submitIfNeeded(); err != nil {
 			if worker.server.doneClosed() && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
 				return nil
 			}

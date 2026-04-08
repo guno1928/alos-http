@@ -56,6 +56,7 @@ func newTLSWorkerSharedConn(worker *tlsUringWorker, conn *tlsWorkerConn, prefix 
 		closeWait:  make([]chan error, 0, 1),
 	}
 	conn.bridge = bridge
+	worker.activeBridgeCount++
 	return &tlsWorkerSharedConn{bridge: bridge}
 }
 
@@ -219,6 +220,7 @@ func (bridge *tlsWorkerSharedBridge) notify() {
 	select {
 	case bridge.worker.bridgeRequests <- bridge.conn.index:
 	default:
+		bridge.worker.pendingMissed.Add(1)
 	}
 	bridge.worker.signalWake()
 }

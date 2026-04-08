@@ -501,16 +501,21 @@ var (
 	ctPrefixJSON      = []byte("Content-Type: application/json; charset=utf-8\r\n")
 	ctPrefixOctet     = []byte("Content-Type: application/octet-stream\r\n")
 	connKeepAlive     = []byte("Connection: keep-alive\r\nServer: ALOS\r\n")
+	connClose         = []byte("Connection: close\r\nServer: ALOS\r\n")
 )
 
-var ctPrefixMap map[string][]byte
-
-func init() {
-	ctPrefixMap = map[string][]byte{
-		"text/plain; charset=utf-8":       ctPrefixTextPlain,
-		"text/html; charset=utf-8":        ctPrefixTextHTML,
-		"application/json; charset=utf-8": ctPrefixJSON,
-		"application/octet-stream":        ctPrefixOctet,
+func ctPrefixLookup(ct string) []byte {
+	switch ct {
+	case "text/plain; charset=utf-8":
+		return ctPrefixTextPlain
+	case "text/html; charset=utf-8":
+		return ctPrefixTextHTML
+	case "application/json; charset=utf-8":
+		return ctPrefixJSON
+	case "application/octet-stream":
+		return ctPrefixOctet
+	default:
+		return nil
 	}
 }
 
@@ -522,7 +527,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	buf = appendStatusLine(buf, resp.StatusCode)
 
 	if resp.ContentType != "" {
-		if pre, ok := ctPrefixMap[resp.ContentType]; ok {
+		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			buf = append(buf, pre...)
 		} else {
 			buf = append(buf, "Content-Type: "...)
@@ -568,7 +573,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	inner := (*ibp)[:0]
 	inner = appendStatusLine(inner, resp.StatusCode)
 	if resp.ContentType != "" {
-		if pre, ok := ctPrefixMap[resp.ContentType]; ok {
+		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			inner = append(inner, pre...)
 		} else {
 			inner = append(inner, "Content-Type: "...)

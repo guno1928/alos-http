@@ -1,9 +1,11 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -241,6 +243,20 @@ func parseUint(s string) (int, bool) {
 	return n, true
 }
 
+var hexLookup = [256]uint8{
+	'0': 0x00, '1': 0x01, '2': 0x02, '3': 0x03, '4': 0x04,
+	'5': 0x05, '6': 0x06, '7': 0x07, '8': 0x08, '9': 0x09,
+	'a': 0x0a, 'b': 0x0b, 'c': 0x0c, 'd': 0x0d, 'e': 0x0e, 'f': 0x0f,
+	'A': 0x0a, 'B': 0x0b, 'C': 0x0c, 'D': 0x0d, 'E': 0x0e, 'F': 0x0f,
+}
+
+var hexValid = [256]bool{
+	'0': true, '1': true, '2': true, '3': true, '4': true,
+	'5': true, '6': true, '7': true, '8': true, '9': true,
+	'a': true, 'b': true, 'c': true, 'd': true, 'e': true, 'f': true,
+	'A': true, 'B': true, 'C': true, 'D': true, 'E': true, 'F': true,
+}
+
 func parseHex64(s string) (int64, bool) {
 	if len(s) == 0 {
 		return 0, false
@@ -248,18 +264,10 @@ func parseHex64(s string) (int64, bool) {
 	var n int64
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		var d int64
-		switch {
-		case c >= '0' && c <= '9':
-			d = int64(c - '0')
-		case c >= 'a' && c <= 'f':
-			d = int64(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			d = int64(c-'A') + 10
-		default:
+		if !hexValid[c] {
 			return 0, false
 		}
-		n = n<<4 | d
+		n = n<<4 | int64(hexLookup[c])
 		if n < 0 {
 			return 0, false
 		}
@@ -273,18 +281,10 @@ func parseHex64Bytes(b []byte) (int64, bool) {
 	}
 	var n int64
 	for _, c := range b {
-		var d int64
-		switch {
-		case c >= '0' && c <= '9':
-			d = int64(c - '0')
-		case c >= 'a' && c <= 'f':
-			d = int64(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			d = int64(c-'A') + 10
-		default:
+		if !hexValid[c] {
 			return 0, false
 		}
-		n = n<<4 | d
+		n = n<<4 | int64(hexLookup[c])
 		if n < 0 {
 			return 0, false
 		}
@@ -305,12 +305,7 @@ func trimASCIISpaceBytes(b []byte) []byte {
 }
 
 func indexByteSlice(b []byte, c byte) int {
-	for i, v := range b {
-		if v == c {
-			return i
-		}
-	}
-	return -1
+	return bytes.IndexByte(b, c)
 }
 
 func trimASCIISpace(s string) string {
@@ -334,25 +329,27 @@ func trimRight(s string, cutset byte) string {
 }
 
 func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
+	return strings.IndexByte(s, c)
 }
 
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-func indexCRLF(s string) int {
-	for i := 0; i < len(s)-1; i++ {
-		if s[i] == '\r' && s[i+1] == '\n' {
-			return i
+func hasPrefixFold(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if asciiLower[s[i]] != asciiLower[prefix[i]] {
+			return false
 		}
 	}
-	return -1
+	return true
+}
+
+func indexCRLF(s string) int {
+	return strings.Index(s, "\r\n")
 }
 
 func appendUint(dst []byte, n int64) []byte {
@@ -598,12 +595,7 @@ func ValidateHost(host string) bool {
 }
 
 func containsCRLF(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\r' || s[i] == '\n' {
-			return true
-		}
-	}
-	return false
+	return strings.IndexByte(s, '\r') >= 0 || strings.IndexByte(s, '\n') >= 0
 }
 
 var coarseNow atomic.Int64

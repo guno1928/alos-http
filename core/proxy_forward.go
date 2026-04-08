@@ -498,23 +498,23 @@ func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *Domain
 	hasUserAgent := false
 	hasAccept := false
 	for i := range req.Headers {
-		name := ToLowerASCII(req.Headers[i][0])
-		if isProxyFilteredHeader(name) {
+		name := req.Headers[i][0]
+		if isProxyFilteredHeaderFold(name) {
 			continue
 		}
-		if !wsUpgrade && (name == "upgrade" || name == "connection") {
+		if !wsUpgrade && (EqualFoldASCII(name, "upgrade") || EqualFoldASCII(name, "connection")) {
 			continue
 		}
-		if containsCRLF(req.Headers[i][0]) || containsCRLF(req.Headers[i][1]) {
+		if containsCRLF(name) || containsCRLF(req.Headers[i][1]) {
 			continue
 		}
-		if name == "user-agent" {
+		if EqualFoldASCII(name, "user-agent") {
 			hasUserAgent = true
 		}
-		if name == "accept" {
+		if EqualFoldASCII(name, "accept") {
 			hasAccept = true
 		}
-		buf = append(buf, req.Headers[i][0]...)
+		buf = append(buf, name...)
 		buf = append(buf, ": "...)
 		buf = append(buf, req.Headers[i][1]...)
 		buf = append(buf, "\r\n"...)
@@ -552,6 +552,35 @@ func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *Domain
 	}
 
 	return buf
+}
+
+// isProxyFilteredHeaderFold checks if a header should be filtered in proxy
+// requests using case-insensitive comparison (zero allocations).
+func isProxyFilteredHeaderFold(name string) bool {
+	if len(name) > 0 && name[0] == ':' {
+		return true
+	}
+	switch len(name) {
+	case 2:
+		return EqualFoldASCII(name, "te")
+	case 4:
+		return EqualFoldASCII(name, "host")
+	case 7:
+		return EqualFoldASCII(name, "trailer")
+	case 10:
+		return EqualFoldASCII(name, "keep-alive")
+	case 14:
+		return EqualFoldASCII(name, "content-length")
+	case 15:
+		return EqualFoldASCII(name, "accept-encoding")
+	case 17:
+		return EqualFoldASCII(name, "transfer-encoding")
+	case 18:
+		return EqualFoldASCII(name, "proxy-authenticate")
+	case 19:
+		return EqualFoldASCII(name, "proxy-authorization")
+	}
+	return false
 }
 
 func isProxyFilteredHeader(name string) bool {
@@ -622,27 +651,26 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 		}
 		name := string(line[:colon])
 		val := string(trimASCIISpaceBytes(line[colon+1:]))
-		nameLower := ToLowerASCII(name)
 
-		switch nameLower {
-		case "content-type":
+		switch {
+		case EqualFoldASCII(name, "content-type"):
 			contentType = val
-		case "content-length":
+		case EqualFoldASCII(name, "content-length"):
 			cl, ok := parseUint(val)
 			if ok {
 				contentLength = int64(cl)
 			}
-		case "transfer-encoding":
+		case EqualFoldASCII(name, "transfer-encoding"):
 			if EqualFoldASCII(val, "chunked") {
 				isChunked = true
 			}
-		case "connection":
+		case EqualFoldASCII(name, "connection"):
 			if EqualFoldASCII(val, "close") {
 				keepAlive = false
 			}
 		}
 
-		if !isHopByHop(nameLower) {
+		if !isHopByHopFold(name) {
 			headers = append(headers, [2]string{name, val})
 			if len(headers) > 128 {
 				*bp = lineBuf[:0]
@@ -658,12 +686,33 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 }
 
 func isWebSocket(req *Request) bool {
-	for i := range req.Headers {
-		if EqualFoldASCII(req.Headers[i][0], "upgrade") && EqualFoldASCII(req.Headers[i][1], "websocket") {
+	nh := len(req.Headers)
+	switch {
+	case nh == 0:
+		return false
+	case nh == 1:
+		return EqualFoldASCII(req.Headers[0][0], "upgrade") && EqualFoldASCII(req.Headers[0][1], "websocket")
+	case nh == 2:
+		if EqualFoldASCII(req.Headers[0][0], "upgrade") && EqualFoldASCII(req.Headers[0][1], "websocket") {
 			return true
 		}
+		return EqualFoldASCII(req.Headers[1][0], "upgrade") && EqualFoldASCII(req.Headers[1][1], "websocket")
+	case nh == 3:
+		if EqualFoldASCII(req.Headers[0][0], "upgrade") && EqualFoldASCII(req.Headers[0][1], "websocket") {
+			return true
+		}
+		if EqualFoldASCII(req.Headers[1][0], "upgrade") && EqualFoldASCII(req.Headers[1][1], "websocket") {
+			return true
+		}
+		return EqualFoldASCII(req.Headers[2][0], "upgrade") && EqualFoldASCII(req.Headers[2][1], "websocket")
+	default:
+		for i := range req.Headers {
+			if EqualFoldASCII(req.Headers[i][0], "upgrade") && EqualFoldASCII(req.Headers[i][1], "websocket") {
+				return true
+			}
+		}
+		return false
 	}
-	return false
 }
 
 func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
@@ -754,6 +803,27 @@ func isHopByHop(name string) bool {
 	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 		"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
+	}
+	return false
+}
+
+// isHopByHopFold is like isHopByHop but uses case-insensitive comparison.
+func isHopByHopFold(name string) bool {
+	switch len(name) {
+	case 2:
+		return EqualFoldASCII(name, "te")
+	case 7:
+		return EqualFoldASCII(name, "trailer") || EqualFoldASCII(name, "upgrade")
+	case 10:
+		return EqualFoldASCII(name, "connection") || EqualFoldASCII(name, "keep-alive")
+	case 16:
+		return EqualFoldASCII(name, "proxy-connection")
+	case 17:
+		return EqualFoldASCII(name, "transfer-encoding")
+	case 18:
+		return EqualFoldASCII(name, "proxy-authenticate")
+	case 19:
+		return EqualFoldASCII(name, "proxy-authorization")
 	}
 	return false
 }

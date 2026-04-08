@@ -86,6 +86,10 @@ type cacheEntry struct {
 	gzipLen     int32
 }
 
+// ProxyCache stores and serves cached upstream responses keyed by method, host,
+// and path. It supports automatic TTL expiration, hit-count limits, gzip/brotli
+// pre-compression, and per-path cache rules. Create one with NewProxyCache or
+// let the server provision one automatically via Server.SetProxyCache.
 type ProxyCache struct {
 	entries      *alosmap.Map
 	config       atomic.Pointer[ProxyCacheConfig]
@@ -189,20 +193,22 @@ func proxyCacheRequestAllowed(req *Request) bool {
 
 func proxyCacheResponseAllowed(headers [][2]string) bool {
 	for i := range headers {
-		name := ToLowerASCII(headers[i][0])
+		name := headers[i][0]
 		value := headers[i][1]
-		switch name {
-		case "set-cookie":
+		if EqualFoldASCII(name, "set-cookie") {
 			return false
-		case "cache-control":
+		}
+		if EqualFoldASCII(name, "cache-control") {
 			if cacheControlDisablesStorage(value) {
 				return false
 			}
-		case "pragma":
+		}
+		if EqualFoldASCII(name, "pragma") {
 			if containsTokenFold(value, "no-cache") {
 				return false
 			}
-		case "vary":
+		}
+		if EqualFoldASCII(name, "vary") {
 			if !cacheVarySupported(value) {
 				return false
 			}
@@ -212,25 +218,48 @@ func proxyCacheResponseAllowed(headers [][2]string) bool {
 }
 
 func cacheControlDisablesLookup(value string) bool {
-	for _, token := range splitHeaderTokens(value) {
+	for len(value) > 0 {
+		end := indexByte(value, ',')
+		var token string
+		if end < 0 {
+			token = value
+			value = ""
+		} else {
+			token = value[:end]
+			value = value[end+1:]
+		}
+		token = trimASCIISpace(token)
+		if token == "" {
+			continue
+		}
 		name, arg := splitHeaderDirective(token)
-		switch name {
-		case "no-cache", "no-store":
+		if EqualFoldASCII(name, "no-cache") || EqualFoldASCII(name, "no-store") {
 			return true
-		case "max-age":
-			if arg == "0" {
-				return true
-			}
+		}
+		if EqualFoldASCII(name, "max-age") && arg == "0" {
+			return true
 		}
 	}
 	return false
 }
 
 func cacheControlDisablesStorage(value string) bool {
-	for _, token := range splitHeaderTokens(value) {
+	for len(value) > 0 {
+		end := indexByte(value, ',')
+		var token string
+		if end < 0 {
+			token = value
+			value = ""
+		} else {
+			token = value[:end]
+			value = value[end+1:]
+		}
+		token = trimASCIISpace(token)
+		if token == "" {
+			continue
+		}
 		name, _ := splitHeaderDirective(token)
-		switch name {
-		case "no-cache", "no-store", "private":
+		if EqualFoldASCII(name, "no-cache") || EqualFoldASCII(name, "no-store") || EqualFoldASCII(name, "private") {
 			return true
 		}
 	}
@@ -238,11 +267,24 @@ func cacheControlDisablesStorage(value string) bool {
 }
 
 func cacheVarySupported(value string) bool {
-	for _, token := range splitHeaderTokens(value) {
+	for len(value) > 0 {
+		end := indexByte(value, ',')
+		var token string
+		if end < 0 {
+			token = value
+			value = ""
+		} else {
+			token = value[:end]
+			value = value[end+1:]
+		}
+		token = trimASCIISpace(token)
+		if token == "" {
+			continue
+		}
 		if token == "*" {
 			return false
 		}
-		if token != "accept-encoding" {
+		if !EqualFoldASCII(token, "accept-encoding") {
 			return false
 		}
 	}
@@ -595,9 +637,15 @@ func (pc *ProxyCache) evictOldest() {
 func detectBackendEncoding(headers [][2]string) (bool, string) {
 	for i := range headers {
 		if EqualFoldASCII(headers[i][0], "content-encoding") {
-			enc := ToLowerASCII(headers[i][1])
-			if enc == "br" || enc == "gzip" || enc == "deflate" {
-				return true, enc
+			enc := headers[i][1]
+			if EqualFoldASCII(enc, "br") {
+				return true, "br"
+			}
+			if EqualFoldASCII(enc, "gzip") {
+				return true, "gzip"
+			}
+			if EqualFoldASCII(enc, "deflate") {
+				return true, "deflate"
 			}
 		}
 	}
@@ -731,9 +779,9 @@ func removeContentEncoding(headers [][2]string) [][2]string {
 func stripCacheUnsafeHeaders(headers [][2]string) [][2]string {
 	n := 0
 	for i := range headers {
-		k := ToLowerASCII(headers[i][0])
-		if k == "content-length" || k == "content-type" || k == "transfer-encoding" ||
-			k == "set-cookie" || k == "www-authenticate" || k == "proxy-authenticate" {
+		k := headers[i][0]
+		if EqualFoldASCII(k, "content-length") || EqualFoldASCII(k, "content-type") || EqualFoldASCII(k, "transfer-encoding") ||
+			EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "www-authenticate") || EqualFoldASCII(k, "proxy-authenticate") {
 			continue
 		}
 		headers[n] = headers[i]
@@ -771,16 +819,15 @@ func isCompressibleType(ct string) bool {
 	if ct == "" {
 		return false
 	}
-	ct = ToLowerASCII(ct)
-	if len(ct) >= 5 && ct[0] == 't' && ct[1] == 'e' && ct[2] == 'x' && ct[3] == 't' && ct[4] == '/' {
+	if len(ct) >= 5 && asciiLower[ct[0]] == 't' && asciiLower[ct[1]] == 'e' && asciiLower[ct[2]] == 'x' && asciiLower[ct[3]] == 't' && ct[4] == '/' {
 		return true
 	}
 	switch {
-	case hasPrefix(ct, "application/json"),
-		hasPrefix(ct, "application/javascript"),
-		hasPrefix(ct, "application/xml"),
-		hasPrefix(ct, "application/xhtml"),
-		hasPrefix(ct, "image/svg"):
+	case hasPrefixFold(ct, "application/json"),
+		hasPrefixFold(ct, "application/javascript"),
+		hasPrefixFold(ct, "application/xml"),
+		hasPrefixFold(ct, "application/xhtml"),
+		hasPrefixFold(ct, "image/svg"):
 		return true
 	}
 	return false

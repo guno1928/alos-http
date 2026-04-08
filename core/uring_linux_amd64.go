@@ -73,7 +73,7 @@ const (
 	ioUringSendZCReportUsage         = 1 << 3
 	sockCloexec                      = 0x80000
 	sockNonblock                     = 0x800
-	ioUringInitialConnsPerShard      = 600
+	ioUringInitialConnsPerShard      = 1600
 	ioUringAcceptDepth               = 16
 	ioUringConnSlotsPerLN            = 2048
 	ioUringSendZCThreshold           = 32 << 10
@@ -357,7 +357,7 @@ func (s *Server) ioUringRedirectAcceptLoop(acceptor *ioUringAcceptor, errCh chan
 		}
 		return
 	}
-	var completions [64]ioUringCqe
+	var completions [ioUringCompletionBatchSize]ioUringCqe
 	for {
 		if acceptor.inflight == 0 {
 			if !acceptor.acquireSlot(s.done) {
@@ -1251,6 +1251,25 @@ func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
 		ring.submitted += uint32(submitted)
 		return uint32(submitted), nil
 	}
+}
+
+// submitIfNeeded flushes pending SQEs only when necessary. It skips the
+// io_uring_enter syscall entirely when there are no SQEs to submit and,
+// for rings created with DEFER_TASKRUN+TASKRUN_FLAG, no pending task work.
+// This eliminates the overhead of a no-op syscall that pprof shows accounts
+// for 58-95% of CPU time on hot paths.
+func (ring *ioUring) submitIfNeeded() (uint32, error) {
+	toSubmit := ring.localSqTail - ring.submitted
+	if toSubmit == 0 {
+		if ring.flags&ioUringSetupDeferTaskrun != 0 {
+			if atomic.LoadUint32(ring.sqFlags)&ioUringSqTaskrun == 0 {
+				return 0, nil
+			}
+		} else {
+			return 0, nil
+		}
+	}
+	return ring.submitAndWait(0)
 }
 
 func (ring *ioUring) registerRingFD() error {

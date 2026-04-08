@@ -2,6 +2,15 @@ package core
 
 import "github.com/bytedance/sonic"
 
+// StreamWriter is the interface used for chunked and streaming HTTP responses
+// (Server-Sent Events, file downloads, long-polling, etc.). Obtain one from
+// Response.EnsureStreamWriter inside a route handler.
+//
+//	sw := resp.EnsureStreamWriter()
+//	sw.WriteHeader(200, nil, "text/event-stream")
+//	resp.SetStreamer(sw)
+//	sw.WriteChunk([]byte("data: hello\n\n"))
+//	sw.Close()
 type StreamWriter interface {
 	WriteHeader(statusCode int, headers [][2]string, contentType string) error
 	WriteChunk(data []byte) error
@@ -268,6 +277,7 @@ func (r *Response) GetBody() []byte {
 	return r.body
 }
 
+// BodyLen returns the byte length of the current response body.
 func (r *Response) BodyLen() int {
 	if r.bodyIsText {
 		return len(r.bodyString)
@@ -334,15 +344,20 @@ func (r *Response) appendTransmittedBody(dst []byte) []byte {
 	return r.appendBody(dst)
 }
 
+// SetStreamer marks this response as streamed and associates the given
+// StreamWriter. Once set, the server skips its normal body-writing path and
+// relies on the StreamWriter to deliver data to the client.
 func (r *Response) SetStreamer(sw StreamWriter) {
 	r.streamer = sw
 	r.streamed = true
 }
 
+// Streamer returns the StreamWriter previously set with SetStreamer, or nil.
 func (r *Response) Streamer() StreamWriter {
 	return r.streamer
 }
 
+// IsStreamed reports whether a StreamWriter has been set on this response.
 func (r *Response) IsStreamed() bool {
 	return r.streamed
 }

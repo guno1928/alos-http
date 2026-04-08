@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+// SendFileOption is a functional option for Response.SendFile that configures
+// download behavior, bandwidth limits, or content type overrides.
 type SendFileOption func(*sendFileConfig)
 
 type sendFileConfig struct {

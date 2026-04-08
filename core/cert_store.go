@@ -14,11 +14,15 @@ import (
 	"github.com/guno1928/alosmap"
 )
 
+// CertSource identifies how a TLS certificate was obtained.
 type CertSource uint8
 
 const (
+	// CertSelfSigned indicates the certificate was auto-generated for development.
 	CertSelfSigned CertSource = iota
+	// CertManual indicates the certificate was loaded from PEM files.
 	CertManual
+	// CertACME indicates the certificate was provisioned via ACME (Let's Encrypt).
 	CertACME
 )
 
@@ -58,6 +62,9 @@ type CertEntry struct {
 	cachedEECertEmpty []byte
 }
 
+// CertInfo is a read-only summary of a loaded certificate returned by
+// Server.ListCerts. Domain is the SNI hostname and Source indicates how
+// the certificate was obtained.
 type CertInfo struct {
 	Domain string
 	Source CertSource

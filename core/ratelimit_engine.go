@@ -19,6 +19,9 @@ type RateLimitEvent struct {
 	RetryAfter time.Duration
 }
 
+// RateLimitFunc is the callback signature for custom rate-limit handling.
+// Return true if the response has been fully handled, or false to fall
+// through to the default 429 Too Many Requests response.
 type RateLimitFunc func(event RateLimitEvent, req *Request, resp *Response) bool
 
 type matchType uint8

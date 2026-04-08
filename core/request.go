@@ -132,19 +132,45 @@ func (r *Request) resetFastH1() {
 	r.Body = r.Body[:0]
 	r.ParamCount = 0
 	r.hijacked = false
-	r.cachedCL = ""
-	r.cachedConn = ""
-	r.cachedTE = ""
-	r.cachedHost = ""
-	r.cachedAE = ""
-	r.cachedOrigin = ""
-	r.cachedXFF = ""
-	r.cachedXRI = ""
-	r.cachedAuth = ""
-	r.cachedUpgrade = ""
-	r.cachedWSKey = ""
-	r.cachedWSVer = ""
-	r.headerCacheMask = 0
+	if mask := r.headerCacheMask; mask != 0 {
+		if mask&headerCacheContentLength != 0 {
+			r.cachedCL = ""
+		}
+		if mask&headerCacheConnection != 0 {
+			r.cachedConn = ""
+		}
+		if mask&headerCacheTransferEncoding != 0 {
+			r.cachedTE = ""
+		}
+		if mask&headerCacheHost != 0 {
+			r.cachedHost = ""
+		}
+		if mask&headerCacheAcceptEncoding != 0 {
+			r.cachedAE = ""
+		}
+		if mask&headerCacheOrigin != 0 {
+			r.cachedOrigin = ""
+		}
+		if mask&headerCacheXForwardedFor != 0 {
+			r.cachedXFF = ""
+		}
+		if mask&headerCacheXRealIP != 0 {
+			r.cachedXRI = ""
+		}
+		if mask&headerCacheAuthorization != 0 {
+			r.cachedAuth = ""
+		}
+		if mask&headerCacheUpgrade != 0 {
+			r.cachedUpgrade = ""
+		}
+		if mask&headerCacheWSKey != 0 {
+			r.cachedWSKey = ""
+		}
+		if mask&headerCacheWSVersion != 0 {
+			r.cachedWSVer = ""
+		}
+		r.headerCacheMask = 0
+	}
 	r.attachConn = nil
 	r.connTakenOver = false
 	r.hijackReadBuf = nil

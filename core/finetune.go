@@ -23,9 +23,12 @@ const fineTuneHealthPath = "/"
 var (
 	wrkRequestsPerSecPattern = regexp.MustCompile(`(?m)Requests/sec:\s+([0-9]+(?:\.[0-9]+)?)`)
 	wrkLatencyPattern        = regexp.MustCompile(`(?m)Latency\s+([^\s]+)`)
+	wrkMaxLatencyPattern     = regexp.MustCompile(`(?m)Latency\s+\S+\s+\S+\s+(\S+)`)
 	wrkTransferPattern       = regexp.MustCompile(`(?m)Transfer/sec:\s+(.+)$`)
 )
 
+// FineTuneScenario describes a single load-test scenario used by the
+// auto-tuner. The tuner runs wrk with these parameters against the server.
 type FineTuneScenario struct {
 	Name        string
 	Connections int
@@ -33,6 +36,8 @@ type FineTuneScenario struct {
 	Duration    time.Duration
 }
 
+// FineTuneResult holds the measured performance for one (workers, listeners,
+// scenario) combination produced by Server.FineTuneWithOptions.
 type FineTuneResult struct {
 	Scenario       FineTuneScenario
 	Workers        int
@@ -40,10 +45,13 @@ type FineTuneResult struct {
 	AcceptShards   int
 	RequestsPerSec float64
 	Latency        string
+	MaxLatency     string
 	TransferPerSec string
 	RawOutput      string
 }
 
+// FineTuneReport summarises the auto-tuning sweep and records the best
+// worker/listener combination found. Returned by Server.FineTuneWithOptions.
 type FineTuneReport struct {
 	WrkPath            string
 	AutoInstalledWrk   bool
@@ -75,31 +83,40 @@ func (report *FineTuneReport) String() string {
 	fmt.Fprintf(b, "- workers=%d listeners=%d accept_shards=%d\n", report.BestWorkerCount, report.BestListenerCount, report.BestAcceptShards)
 	b.WriteString("\nBest per scenario\n")
 	for _, result := range report.BestByScenario {
-		fmt.Fprintf(b, "- %s: workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s transfer=%s\n",
+		fmt.Fprintf(b, "- %s: workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s max_latency=%s transfer=%s\n",
 			result.Scenario.Name,
 			result.Workers,
 			result.Listeners,
 			result.AcceptShards,
 			result.RequestsPerSec,
 			result.Latency,
+			result.MaxLatency,
 			result.TransferPerSec,
 		)
 	}
 	b.WriteString("\nFull sweep\n")
 	for _, result := range report.Results {
-		fmt.Fprintf(b, "- %s: workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s transfer=%s\n",
+		fmt.Fprintf(b, "- %s: workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s max_latency=%s transfer=%s\n",
 			result.Scenario.Name,
 			result.Workers,
 			result.Listeners,
 			result.AcceptShards,
 			result.RequestsPerSec,
 			result.Latency,
+			result.MaxLatency,
 			result.TransferPerSec,
 		)
 	}
 	return b.String()
 }
 
+// FineTuneOptions controls the parameter sweep performed by
+// Server.FineTuneWithOptions. Use DefaultFineTuneOptions for sensible defaults.
+//
+//	opts := core.DefaultFineTuneOptions()
+//	opts.WorkerCandidates = []int{12, 24, 48}
+//	opts.ListenerCandidates = []int{1, 5, 10}
+//	report, err := s.FineTuneWithOptions(opts)
 type FineTuneOptions struct {
 	WorkerCandidates   []int
 	ListenerCandidates []int
@@ -272,13 +289,14 @@ func (s *Server) runFineTuneScenario(wrkPath string, workers int, listeners int,
 	parsed.Listeners = listeners
 	parsed.AcceptShards = minInt(workers, listeners)
 	parsed.RawOutput = output
-	log.Printf("[FINETUNE] wrk result scenario=%q workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s transfer=%s",
+	log.Printf("[FINETUNE] wrk result scenario=%q workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s max_latency=%s transfer=%s",
 		parsed.Scenario.Name,
 		parsed.Workers,
 		parsed.Listeners,
 		parsed.AcceptShards,
 		parsed.RequestsPerSec,
 		parsed.Latency,
+		parsed.MaxLatency,
 		parsed.TransferPerSec,
 	)
 	return parsed, nil
@@ -466,6 +484,10 @@ func parseWrkOutput(output string) (FineTuneResult, error) {
 	if latencyMatch := wrkLatencyPattern.FindStringSubmatch(output); len(latencyMatch) == 2 {
 		latency = latencyMatch[1]
 	}
+	maxLatency := "unknown"
+	if maxLatencyMatch := wrkMaxLatencyPattern.FindStringSubmatch(output); len(maxLatencyMatch) == 2 {
+		maxLatency = maxLatencyMatch[1]
+	}
 	transfer := "unknown"
 	if transferMatch := wrkTransferPattern.FindStringSubmatch(output); len(transferMatch) == 2 {
 		transfer = strings.TrimSpace(transferMatch[1])
@@ -473,6 +495,7 @@ func parseWrkOutput(output string) (FineTuneResult, error) {
 	return FineTuneResult{
 		RequestsPerSec: requestsPerSec,
 		Latency:        latency,
+		MaxLatency:     maxLatency,
 		TransferPerSec: transfer,
 	}, nil
 }

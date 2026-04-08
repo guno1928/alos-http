@@ -259,8 +259,13 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		}
 	}
 
-	bodyLen := resp.headerContentLength()
-	if bodyLen >= 0 {
+	method := ""
+	if resp.lazyReq != nil {
+		method = resp.lazyReq.Method
+	}
+	suppressBody, omitContentLength := responseBodyDisposition(method, resp.StatusCode)
+	if !omitContentLength {
+		bodyLen := resp.BodyLen()
 		if bodyLen < 256 {
 			dst = append(dst, smallCL[bodyLen]...)
 		} else {
@@ -280,11 +285,11 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 	if keepAlive {
 		dst = append(dst, connKeepAlive...)
 	} else {
-		dst = append(dst, "Connection: close\r\nServer: ALOS\r\n"...)
+		dst = append(dst, connClose...)
 	}
 	dst = append(dst, '\r', '\n')
-	if includeBody {
-		dst = resp.appendTransmittedBody(dst)
+	if includeBody && !suppressBody {
+		dst = resp.appendBody(dst)
 	}
 	return dst
 }
@@ -313,19 +318,20 @@ func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
 	return newBuf, true
 }
 
+var rootPrefixBytes = []byte("GET / HTTP/1.1\r\n")
+
 func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool) {
 	if !s.plainRootFast.enabled {
 		return nil, 0, false, false
 	}
-	const rootPrefix = "GET / HTTP/1.1\r\n"
-	if len(data) < len(rootPrefix)+4 || UnsafeString(data[:len(rootPrefix)]) != rootPrefix {
+	if len(data) < len(rootPrefixBytes)+4 || !bytes.Equal(data[:len(rootPrefixBytes)], rootPrefixBytes) {
 		return nil, 0, false, false
 	}
 	maxHeaderBytes := s.config.MaxHeaderSize
 	if maxHeaderBytes <= 0 {
 		maxHeaderBytes = 8192
 	}
-	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefix), maxHeaderBytes)
+	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes)
 	if needRead {
 		return nil, 0, false, false
 	}
@@ -395,29 +401,37 @@ func asciiEqualFoldBytes(line []byte, value string) bool {
 	return true
 }
 
+var crlfcrlfSlice = []byte{'\r', '\n', '\r', '\n'}
+
 func findHeaderTerminatorBytes(buf []byte, start int) int {
-	for i := start; i+3 < len(buf); i++ {
-		if buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
-			return i + 4
-		}
+	if start >= len(buf) {
+		return -1
 	}
-	return -1
+	idx := bytes.Index(buf[start:], crlfcrlfSlice)
+	if idx < 0 {
+		return -1
+	}
+	return start + idx + 4
 }
 
+var crlfSlice = []byte{'\r', '\n'}
+
 func findCRLFBytes(buf []byte, start int) int {
-	for i := start; i+1 < len(buf); i++ {
-		if buf[i] == '\r' && buf[i+1] == '\n' {
-			return i
-		}
+	if start >= len(buf) {
+		return -1
 	}
-	return -1
+	idx := bytes.Index(buf[start:], crlfSlice)
+	if idx < 0 {
+		return -1
+	}
+	return start + idx
 }
 
 func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, ok bool) {
 	const maxHeaders = 128
 
-	idx := bytes.IndexByte(data, '\r')
-	if idx < 0 || idx+1 >= len(data) || data[idx+1] != '\n' {
+	idx := bytes.Index(data, crlfSlice)
+	if idx < 0 {
 		return 0, 0, false, false, false, false
 	}
 
@@ -459,8 +473,8 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 
 	for pos := idx + 2; pos < len(data); {
 		remaining := data[pos:]
-		lineEndOff := bytes.IndexByte(remaining, '\r')
-		if lineEndOff < 0 || pos+lineEndOff+1 >= len(data) || remaining[lineEndOff+1] != '\n' {
+		lineEndOff := bytes.Index(remaining, crlfSlice)
+		if lineEndOff < 0 {
 			return 0, 0, false, false, false, false
 		}
 		nl := pos + lineEndOff
@@ -665,7 +679,7 @@ func (hc *H2Conn) readAndValidatePrefacePlain() bool {
 }
 
 func (hc *H2Conn) writerLoopPlain() {
-	var batch [64]WriteRequest
+	var batch [writeRequestBatchSize]WriteRequest
 	batchBuf := make([]byte, 0, 16384)
 	for req := range hc.writeCh {
 		batch[0] = req

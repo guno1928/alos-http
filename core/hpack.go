@@ -98,7 +98,12 @@ func init() {
 
 func hpackHuffmanEncodedLen(s string) int {
 	var bits int
-	for i := 0; i < len(s); i++ {
+	l := len(s)
+	i := 0
+	for ; i+3 < l; i += 4 {
+		bits += int(huffBitLen[s[i]]) + int(huffBitLen[s[i+1]]) + int(huffBitLen[s[i+2]]) + int(huffBitLen[s[i+3]])
+	}
+	for ; i < l; i++ {
 		bits += int(huffBitLen[s[i]])
 	}
 	return (bits + 7) / 8
@@ -143,6 +148,247 @@ func (e *HpackEncoder) EncodeHeader(name, value string) {
 		e.Buf = append(e.Buf, 0x00)
 		e.EncodeString(name)
 		e.EncodeString(value)
+	}
+}
+
+// EncodeHeaderFold encodes a header using case-insensitive name lookup,
+// avoiding allocation from ToLowerASCII. The name is lowered on-the-fly
+// during Huffman/literal encoding when not found in the static table.
+func (e *HpackEncoder) EncodeHeaderFold(name, value string) {
+	idx := hpackFindStaticNameFold(name)
+	if idx > 0 {
+		e.EncodeInt(0x00, 4, uint64(idx))
+		e.EncodeString(value)
+	} else {
+		e.Buf = append(e.Buf, 0x00)
+		e.encodeStringLower(name)
+		e.EncodeString(value)
+	}
+}
+
+// hpackFindStaticNameFold looks up a header name in the HPACK static table
+// using case-insensitive comparison. Returns the 1-based index or 0 if not found.
+// Uses length-discriminated dispatch for fast rejection of non-matching entries.
+func hpackFindStaticNameFold(name string) int {
+	switch len(name) {
+	case 3:
+		if EqualFoldASCII(name, "age") {
+			return 21
+		}
+		if EqualFoldASCII(name, "via") {
+			return 60
+		}
+	case 4:
+		if EqualFoldASCII(name, "date") {
+			return 33
+		}
+		if EqualFoldASCII(name, "etag") {
+			return 34
+		}
+		if EqualFoldASCII(name, "from") {
+			return 37
+		}
+		if EqualFoldASCII(name, "host") {
+			return 38
+		}
+		if EqualFoldASCII(name, "link") {
+			return 46
+		}
+		if EqualFoldASCII(name, "vary") {
+			return 59
+		}
+	case 5:
+		if name[0] == ':' {
+			if EqualFoldASCII(name, ":path") {
+				return 4
+			}
+		} else {
+			if EqualFoldASCII(name, "allow") {
+				return 22
+			}
+			if EqualFoldASCII(name, "range") {
+				return 50
+			}
+		}
+	case 6:
+		if EqualFoldASCII(name, "accept") {
+			return 19
+		}
+		if EqualFoldASCII(name, "cookie") {
+			return 32
+		}
+		if EqualFoldASCII(name, "expect") {
+			return 35
+		}
+		if EqualFoldASCII(name, "server") {
+			return 54
+		}
+	case 7:
+		if name[0] == ':' {
+			if EqualFoldASCII(name, ":method") {
+				return 2
+			}
+			if EqualFoldASCII(name, ":scheme") {
+				return 6
+			}
+			if EqualFoldASCII(name, ":status") {
+				return 8
+			}
+		} else {
+			if EqualFoldASCII(name, "expires") {
+				return 36
+			}
+			if EqualFoldASCII(name, "referer") {
+				return 51
+			}
+			if EqualFoldASCII(name, "refresh") {
+				return 52
+			}
+		}
+	case 8:
+		if EqualFoldASCII(name, "if-match") {
+			return 39
+		}
+		if EqualFoldASCII(name, "if-range") {
+			return 42
+		}
+		if EqualFoldASCII(name, "location") {
+			return 47
+		}
+	case 10:
+		if name[0] == ':' {
+			if EqualFoldASCII(name, ":authority") {
+				return 1
+			}
+		} else {
+			if EqualFoldASCII(name, "set-cookie") {
+				return 55
+			}
+			if EqualFoldASCII(name, "user-agent") {
+				return 58
+			}
+		}
+	case 11:
+		if EqualFoldASCII(name, "retry-after") {
+			return 53
+		}
+	case 12:
+		if EqualFoldASCII(name, "content-type") {
+			return 31
+		}
+		if EqualFoldASCII(name, "max-forwards") {
+			return 48
+		}
+	case 13:
+		if EqualFoldASCII(name, "accept-ranges") {
+			return 18
+		}
+		if EqualFoldASCII(name, "authorization") {
+			return 23
+		}
+		if EqualFoldASCII(name, "cache-control") {
+			return 24
+		}
+		if EqualFoldASCII(name, "content-range") {
+			return 30
+		}
+		if EqualFoldASCII(name, "if-none-match") {
+			return 41
+		}
+		if EqualFoldASCII(name, "last-modified") {
+			return 44
+		}
+	case 14:
+		if EqualFoldASCII(name, "accept-charset") {
+			return 15
+		}
+		if EqualFoldASCII(name, "content-length") {
+			return 28
+		}
+	case 15:
+		if EqualFoldASCII(name, "accept-encoding") {
+			return 16
+		}
+		if EqualFoldASCII(name, "accept-language") {
+			return 17
+		}
+	case 16:
+		if EqualFoldASCII(name, "content-encoding") {
+			return 26
+		}
+		if EqualFoldASCII(name, "content-language") {
+			return 27
+		}
+		if EqualFoldASCII(name, "content-location") {
+			return 29
+		}
+		if EqualFoldASCII(name, "www-authenticate") {
+			return 61
+		}
+	case 17:
+		if EqualFoldASCII(name, "if-modified-since") {
+			return 40
+		}
+		if EqualFoldASCII(name, "transfer-encoding") {
+			return 57
+		}
+	case 18:
+		if EqualFoldASCII(name, "proxy-authenticate") {
+			return 49
+		}
+	case 19:
+		if EqualFoldASCII(name, "content-disposition") {
+			return 25
+		}
+		if EqualFoldASCII(name, "if-unmodified-since") {
+			return 43
+		}
+		if EqualFoldASCII(name, "proxy-authorization") {
+			return 49
+		}
+	case 25:
+		if EqualFoldASCII(name, "strict-transport-security") {
+			return 56
+		}
+	case 27:
+		if EqualFoldASCII(name, "access-control-allow-origin") {
+			return 20
+		}
+	}
+	return 0
+}
+
+// encodeStringLower encodes a string into the HPACK buffer while lowercasing
+// each byte on-the-fly. Zero allocations.
+func (e *HpackEncoder) encodeStringLower(s string) {
+	n := len(s)
+	var bits int
+	for i := 0; i < n; i++ {
+		bits += int(huffBitLen[asciiLower[s[i]]])
+	}
+	huffLen := (bits + 7) / 8
+
+	if huffLen < n {
+		e.EncodeInt(0x80, 7, uint64(huffLen))
+		var cur uint64
+		var nbits uint8
+		for i := 0; i < n; i++ {
+			entry := huffmanCodes[asciiLower[s[i]]]
+			cur = cur<<entry.bits | uint64(entry.code)
+			nbits += entry.bits
+			for nbits >= 8 {
+				nbits -= 8
+				e.Buf = append(e.Buf, byte(cur>>nbits))
+			}
+		}
+		if nbits > 0 {
+			e.Buf = append(e.Buf, byte(cur<<(8-nbits)|uint64(0xff>>(nbits))))
+		}
+	} else {
+		e.EncodeInt(0x00, 7, uint64(n))
+		for i := 0; i < n; i++ {
+			e.Buf = append(e.Buf, asciiLower[s[i]])
+		}
 	}
 }
 
@@ -687,6 +933,16 @@ const (
 	hpackPseudoAuthority
 )
 
+var h2FieldNameValid [256]bool
+
+func init() {
+	for i := 0x21; i < 0x7f; i++ {
+		if i != ':' && !(i >= 'A' && i <= 'Z') {
+			h2FieldNameValid[i] = true
+		}
+	}
+}
+
 func isValidH2FieldName(name string) bool {
 	if name == "" {
 		return false
@@ -699,12 +955,19 @@ func isValidH2FieldName(name string) bool {
 		start = 1
 	}
 	for i := start; i < len(name); i++ {
-		c := name[i]
-		if c <= 0x20 || c >= 0x7f || (c >= 'A' && c <= 'Z') || c == ':' {
+		if !h2FieldNameValid[name[i]] {
 			return false
 		}
 	}
 	return true
+}
+
+var h2FieldValueInvalid [256]bool
+
+func init() {
+	h2FieldValueInvalid[0] = true
+	h2FieldValueInvalid['\r'] = true
+	h2FieldValueInvalid['\n'] = true
 }
 
 func isValidH2FieldValue(value string) bool {
@@ -714,8 +977,7 @@ func isValidH2FieldValue(value string) bool {
 		}
 	}
 	for i := 0; i < len(value); i++ {
-		switch value[i] {
-		case 0, '\r', '\n':
+		if h2FieldValueInvalid[value[i]] {
 			return false
 		}
 	}
@@ -759,7 +1021,11 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 				return ErrH2BadHeader
 			}
 			meta.pseudoMask |= hpackPseudoPath
-			meta.path = sanitizeRequestPath(value)
+			if value == "/" {
+				meta.path = "/"
+			} else {
+				meta.path = sanitizeRequestPath(value)
+			}
 		case ":authority":
 			if meta.pseudoMask&hpackPseudoAuthority != 0 {
 				return ErrH2BadHeader
@@ -926,6 +1192,13 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 }
 
 func (d *HpackDecoder) DecodeFastRootRequest(data []byte) (hpackRequestMeta, bool, error) {
+	if len(data) >= 4 && data[0] == 0x82 && data[1] == 0x04 && data[len(data)-1] == 0x87 {
+		meta, err := d.DecodeRequestMeta(data)
+		if err == nil && meta.method == "GET" && meta.path == "/" {
+			return meta, true, nil
+		}
+		return meta, false, err
+	}
 	snap := d.snapshot()
 	meta, err := d.DecodeRequestMeta(data)
 	if err != nil {

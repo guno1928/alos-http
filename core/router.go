@@ -498,9 +498,11 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 
 		c := remaining[0]
 		matched := false
-		for i, b := range current.indices {
-			if b == c {
-				child := current.children[i]
+		nIndices := len(current.indices)
+		switch {
+		case nIndices == 1:
+			if current.indices[0] == c {
+				child := current.children[0]
 				plen := len(child.path)
 				if plen == 1 {
 					remaining = remaining[1:]
@@ -511,7 +513,49 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 					current = child
 					matched = true
 				}
-				break
+			}
+		case nIndices == 2:
+			if current.indices[0] == c {
+				child := current.children[0]
+				plen := len(child.path)
+				if plen == 1 {
+					remaining = remaining[1:]
+					current = child
+					matched = true
+				} else if len(remaining) >= plen && remaining[:plen] == child.path {
+					remaining = remaining[plen:]
+					current = child
+					matched = true
+				}
+			} else if current.indices[1] == c {
+				child := current.children[1]
+				plen := len(child.path)
+				if plen == 1 {
+					remaining = remaining[1:]
+					current = child
+					matched = true
+				} else if len(remaining) >= plen && remaining[:plen] == child.path {
+					remaining = remaining[plen:]
+					current = child
+					matched = true
+				}
+			}
+		default:
+			for i, b := range current.indices {
+				if b == c {
+					child := current.children[i]
+					plen := len(child.path)
+					if plen == 1 {
+						remaining = remaining[1:]
+						current = child
+						matched = true
+					} else if len(remaining) >= plen && remaining[:plen] == child.path {
+						remaining = remaining[plen:]
+						current = child
+						matched = true
+					}
+					break
+				}
 			}
 		}
 		if matched {
@@ -563,15 +607,44 @@ func (r *Router) findInTree(root *node, path string, req *Request) HandlerFunc {
 
 		c := remaining[0]
 		matched := false
-		for i, b := range current.indices {
-			if b == c {
-				child := current.children[i]
+		nIndices := len(current.indices)
+		switch {
+		case nIndices == 1:
+			if current.indices[0] == c {
+				child := current.children[0]
 				if len(remaining) >= len(child.path) && remaining[:len(child.path)] == child.path {
 					remaining = remaining[len(child.path):]
 					current = child
 					matched = true
 				}
-				break
+			}
+		case nIndices == 2:
+			if current.indices[0] == c {
+				child := current.children[0]
+				if len(remaining) >= len(child.path) && remaining[:len(child.path)] == child.path {
+					remaining = remaining[len(child.path):]
+					current = child
+					matched = true
+				}
+			} else if current.indices[1] == c {
+				child := current.children[1]
+				if len(remaining) >= len(child.path) && remaining[:len(child.path)] == child.path {
+					remaining = remaining[len(child.path):]
+					current = child
+					matched = true
+				}
+			}
+		default:
+			for i, b := range current.indices {
+				if b == c {
+					child := current.children[i]
+					if len(remaining) >= len(child.path) && remaining[:len(child.path)] == child.path {
+						remaining = remaining[len(child.path):]
+						current = child
+						matched = true
+					}
+					break
+				}
 			}
 		}
 		if matched {

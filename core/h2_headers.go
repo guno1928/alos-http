@@ -8,45 +8,72 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	wroteServer := false
 
 	if contentType != "" {
-		enc.EncodeHeader("content-type", contentType)
+		enc.EncodeHeaderFold("content-type", contentType)
 		wroteContentType = true
 	}
 	if contentLength >= 0 {
 		var clBuf [20]byte
 		clStr := appendUint(clBuf[:0], contentLength)
-		enc.EncodeHeader("content-length", UnsafeString(clStr))
+		enc.EncodeHeaderFold("content-length", UnsafeString(clStr))
 		wroteContentLength = true
 	}
 
-	for i := range headers {
-		name := ToLowerASCII(headers[i][0])
-		if name == "" {
-			continue
+	switch len(headers) {
+	case 0:
+	case 1:
+		name := headers[0][0]
+		if name != "" && name[0] != ':' && !isHopByHopFold(name) {
+			switch {
+			case EqualFoldASCII(name, "content-type"):
+				if !wroteContentType {
+					wroteContentType = true
+					enc.EncodeHeaderFold(name, headers[0][1])
+				}
+			case EqualFoldASCII(name, "content-length"):
+				if !wroteContentLength {
+					wroteContentLength = true
+					enc.EncodeHeaderFold(name, headers[0][1])
+				}
+			case EqualFoldASCII(name, "server"):
+				if !wroteServer {
+					wroteServer = true
+					enc.EncodeHeaderFold(name, headers[0][1])
+				}
+			default:
+				enc.EncodeHeaderFold(name, headers[0][1])
+			}
 		}
-		if name[0] == ':' || isHopByHop(name) {
-			continue
-		}
-		switch name {
-		case "content-type":
-			if wroteContentType {
+	default:
+		for i := range headers {
+			name := headers[i][0]
+			if name == "" {
 				continue
 			}
-			wroteContentType = true
-		case "content-length":
-			if wroteContentLength {
+			if name[0] == ':' || isHopByHopFold(name) {
 				continue
 			}
-			wroteContentLength = true
-		case "server":
-			if wroteServer {
-				continue
+			switch {
+			case EqualFoldASCII(name, "content-type"):
+				if wroteContentType {
+					continue
+				}
+				wroteContentType = true
+			case EqualFoldASCII(name, "content-length"):
+				if wroteContentLength {
+					continue
+				}
+				wroteContentLength = true
+			case EqualFoldASCII(name, "server"):
+				if wroteServer {
+					continue
+				}
+				wroteServer = true
 			}
-			wroteServer = true
+			enc.EncodeHeaderFold(name, headers[i][1])
 		}
-		enc.EncodeHeader(name, headers[i][1])
 	}
 
 	if !wroteServer {
-		enc.EncodeHeader("server", "ALOS")
+		enc.EncodeHeaderFold("server", "ALOS")
 	}
 }

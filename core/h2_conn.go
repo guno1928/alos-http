@@ -51,17 +51,19 @@ type H2Conn struct {
 	recvConnWindow atomic.Int64
 }
 
-func appendWriteBatch(dst []byte, batch [64]WriteRequest, n int) []byte {
+func appendWriteBatch(dst []byte, batch [writeRequestBatchSize]WriteRequest, n int) []byte {
 	totalLen := 0
 	for i := 0; i < n; i++ {
 		totalLen += len(batch[i].Data)
 	}
 	if cap(dst) < totalLen {
-		dst = make([]byte, 0, totalLen)
+		dst = make([]byte, totalLen)
+	} else {
+		dst = dst[:totalLen]
 	}
-	dst = dst[:0]
+	off := 0
 	for i := 0; i < n; i++ {
-		dst = append(dst, batch[i].Data...)
+		off += copy(dst[off:], batch[i].Data)
 	}
 	return dst
 }
@@ -92,16 +94,12 @@ func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte)
 }
 
 func releaseWriteRequest(req *WriteRequest) {
-	if req == nil || req.releaseBuf == nil {
+	if req.releaseBuf == nil {
 		return
 	}
-	switch req.releasePool {
-	case writeReleaseH2Frame:
-		*req.releaseBuf = req.Data[:0]
-		H2FrameBufPool.Put(req.releaseBuf)
-	}
+	*req.releaseBuf = req.Data[:0]
+	H2FrameBufPool.Put(req.releaseBuf)
 	req.releaseBuf = nil
-	req.releasePool = writeReleaseNone
 }
 
 func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []byte) {
@@ -155,24 +153,19 @@ func (hc *H2Conn) writerLoop() {
 		hc.writerLoopPlain()
 		return
 	}
-	var batch [64]WriteRequest
+	var batch [writeRequestBatchSize]WriteRequest
 	batchBuf := make([]byte, 0, 16384)
 	for req := range hc.writeCh {
 		batch[0] = req
 		n := 1
 
-	drain:
-		for n < len(batch) {
-			select {
-			case next, ok := <-hc.writeCh:
-				if !ok {
-					break drain
-				}
-				batch[n] = next
-				n++
-			default:
-				break drain
-			}
+		avail := len(hc.writeCh)
+		if avail > len(batch)-n {
+			avail = len(batch) - n
+		}
+		for i := 0; i < avail; i++ {
+			batch[n] = <-hc.writeCh
+			n++
 		}
 
 		if n == 1 {
@@ -197,12 +190,22 @@ func (hc *H2Conn) writerLoop() {
 func (hc *H2Conn) enqueueWrite(frame []byte) {
 	select {
 	case hc.writeCh <- WriteRequest{Data: frame}:
+		return
+	default:
+	}
+	select {
+	case hc.writeCh <- WriteRequest{Data: frame}:
 	case <-hc.done:
 	}
 }
 
 func (hc *H2Conn) enqueueWriteOwned(frame []byte, releaseBuf *[]byte, releasePool uint8) {
 	req := WriteRequest{Data: frame, releaseBuf: releaseBuf, releasePool: releasePool}
+	select {
+	case hc.writeCh <- req:
+		return
+	default:
+	}
 	select {
 	case hc.writeCh <- req:
 	case <-hc.done:
@@ -713,11 +716,22 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 	stream.Path = meta.path
 	stream.Scheme = meta.scheme
 	stream.Auth = meta.authority
-	for i := range headers {
-		switch headers[i][0] {
-		case ":method", ":path", ":scheme", ":authority":
-		default:
-			stream.Headers = append(stream.Headers, headers[i])
+	nh := len(headers)
+	if nh > 4 {
+		start := 0
+		for start < nh && len(headers[start][0]) > 0 && headers[start][0][0] == ':' {
+			start++
+		}
+		if start < nh {
+			stream.Headers = append(stream.Headers, headers[start:]...)
+		}
+	} else {
+		for i := range headers {
+			switch headers[i][0] {
+			case ":method", ":path", ":scheme", ":authority":
+			default:
+				stream.Headers = append(stream.Headers, headers[i])
+			}
 		}
 	}
 

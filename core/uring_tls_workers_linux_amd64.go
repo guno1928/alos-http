@@ -107,7 +107,7 @@ type tlsUringWorker struct {
 	server             *Server
 	connections        []tlsWorkerConn
 	freeHead           int32
-	completions        [64]ioUringCqe
+	completions        [ioUringCompletionBatchSize]ioUringCqe
 	timeoutCursor      int
 	acceptBackfill     int64
 	nextAcceptRetry    int64
@@ -118,6 +118,8 @@ type tlsUringWorker struct {
 	parking            bool
 	active             atomic.Int64
 	bridgeRequests     chan int32
+	activeBridgeCount  int
+	pendingMissed      atomic.Int64
 	acceptArmed        bool
 	recvBufs           *ioUringBufferRing
 	useMultishotAccept bool
@@ -447,7 +449,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 		if worker.listenerFD < 0 && worker.active.Load() == 0 && len(worker.handoffs) == 0 {
 			continue
 		}
-		if _, err := worker.ring.submitAndWait(0); err != nil {
+		if _, err := worker.ring.submitIfNeeded(); err != nil {
 			if worker.server.doneClosed() && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
 				return nil
 			}
@@ -1001,7 +1003,7 @@ func (worker *tlsUringWorker) processClientFinished(conn *tlsWorkerConn) (int, e
 		conn.hsReader = nil
 		if conn.selectedALPN == "h2" {
 			if worker.server.IsDebug() {
-				Dbg("[%s] worker TLS handshake complete; handing off to HTTP/2 shared bridge", conn.remoteAddr)
+				Dbg("[%s] worker TLS handshake complete; entering HTTP/2", conn.remoteAddr)
 			}
 			return worker.handoffHTTP2(conn)
 		}
@@ -1309,6 +1311,10 @@ func (worker *tlsUringWorker) drainBridgeRequests() error {
 				return err
 			}
 		default:
+			if worker.activeBridgeCount == 0 || worker.pendingMissed.Load() == 0 {
+				return nil
+			}
+			worker.pendingMissed.Store(0)
 			for i := range worker.connections {
 				conn := &worker.connections[i]
 				if conn.fd < 0 || conn.bridge == nil || !conn.bridge.notifyPending.Load() {
@@ -1537,6 +1543,7 @@ func (worker *tlsUringWorker) recycleConnection(conn *tlsWorkerConn) {
 	if conn.bridge != nil {
 		conn.bridge.shutdown()
 		conn.bridge = nil
+		worker.activeBridgeCount--
 	}
 	conn.clientHello.Reset()
 	conn.h2.reset()

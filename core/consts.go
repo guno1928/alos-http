@@ -1,10 +1,12 @@
 package core
 
 const (
-	MaxRecordPayload  = 16384
-	MaxRecordOverhead = 256
-	MaxRecordSize     = MaxRecordPayload + MaxRecordOverhead
-	CacheLineSize     = 64
+	MaxRecordPayload           = 16384
+	MaxRecordOverhead          = 256
+	MaxRecordSize              = MaxRecordPayload + MaxRecordOverhead
+	CacheLineSize              = 64
+	ioUringCompletionBatchSize = 256
+	writeRequestBatchSize      = 96
 
 	H2PrefaceLen           = 24
 	H2DefaultWindowSize    = 65535

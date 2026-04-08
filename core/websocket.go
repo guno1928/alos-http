@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -43,10 +44,13 @@ type WSConn struct {
 }
 
 func wsAcceptKey(clientKey string) string {
-	h := sha1.New()
-	h.Write([]byte(clientKey))
-	h.Write([]byte(wsGUID))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	var buf [96]byte
+	n := copy(buf[:], clientKey)
+	n += copy(buf[n:], wsGUID)
+	sum := sha1.Sum(buf[:n])
+	var b64 [28]byte
+	base64.StdEncoding.Encode(b64[:], sum[:])
+	return string(b64[:])
 }
 
 // UpgradeWebSocket performs the WebSocket handshake on the current request. It
@@ -320,12 +324,7 @@ func containsTokenFold(header, token string) bool {
 }
 
 func indexOf(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
+	return strings.IndexByte(s, c)
 }
 
 func Uint32Hash64(v uint64) uint64 {
