@@ -26,16 +26,17 @@ type HandlerFunc func(req *Request, resp *Response)
 type MiddlewareFunc func(HandlerFunc) HandlerFunc
 
 type node struct {
-	path           string
-	children       []*node
-	indices        []byte
-	handler        HandlerFunc
-	wrappedHandler HandlerFunc
-	paramChild     *node
-	catchAll       *node
-	paramName      string
-	catchName      string
-	middleware     []MiddlewareFunc
+	path              string
+	children          []*node
+	indices           []byte
+	handler           HandlerFunc
+	wrappedHandler    HandlerFunc
+	paramChild        *node
+	catchAll          *node
+	inheritedCatchAll *node
+	paramName         string
+	catchName         string
+	middleware        []MiddlewareFunc
 }
 
 const (
@@ -325,7 +326,7 @@ func (r *Router) Build() {
 	r.wrappedMethodNotAllowed = r.applyMiddleware(r.methodNotAllowed)
 	for mi, root := range r.trees {
 		if root != nil {
-			r.buildNode(root)
+			r.buildNode(root, nil)
 			if root.path == "" && len(root.children) == 1 &&
 				root.wrappedHandler == nil && root.paramChild == nil && root.catchAll == nil {
 				r.trees[mi] = root.children[0]
@@ -363,7 +364,7 @@ func (r *Router) Build() {
 			for _, b := range root.indices {
 				r.validFirst[b/64] |= 1 << (b % 64)
 			}
-			if root.paramChild != nil {
+			if root.paramChild != nil || root.catchAll != nil {
 				r.validFirst = [4]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
 				break
 			}
@@ -386,18 +387,24 @@ func collectStaticRoutes(n *node, prefix string, out *[]staticEntry) {
 	}
 }
 
-func (r *Router) buildNode(n *node) {
+func (r *Router) buildNode(n *node, inheritedCatchAll *node) {
 	if n.handler != nil {
 		n.wrappedHandler = r.applyMiddleware(n.handler)
 	}
-	for _, child := range n.children {
-		r.buildNode(child)
-	}
-	if n.paramChild != nil {
-		r.buildNode(n.paramChild)
+	if inheritedCatchAll != nil {
+		n.inheritedCatchAll = inheritedCatchAll
 	}
 	if n.catchAll != nil {
-		r.buildNode(n.catchAll)
+		inheritedCatchAll = n.catchAll
+	}
+	for _, child := range n.children {
+		r.buildNode(child, inheritedCatchAll)
+	}
+	if n.paramChild != nil {
+		r.buildNode(n.paramChild, inheritedCatchAll)
+	}
+	if n.catchAll != nil {
+		r.buildNode(n.catchAll, inheritedCatchAll)
 	}
 }
 
@@ -460,6 +467,17 @@ func (r *Router) lookupBuilt(idx int, path string, req *Request) HandlerFunc {
 
 	if handler := findBuilt(root, path, req); handler != nil {
 		return handler
+	}
+
+	if root != nil && root.catchAll != nil {
+		req.ParamCount = 0
+		if req.ParamCount < len(req.Params) {
+			p := &req.Params[req.ParamCount]
+			p.Key = root.catchAll.catchName
+			p.Value = path[1:]
+			req.ParamCount++
+		}
+		return root.catchAll.wrappedHandler
 	}
 
 	if len(path) > 1 {
@@ -586,6 +604,20 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 				req.ParamCount++
 			}
 			return current.catchAll.wrappedHandler
+		}
+
+		if current.inheritedCatchAll != nil {
+			if req.ParamCount < len(req.Params) {
+				p := &req.Params[req.ParamCount]
+				p.Key = current.inheritedCatchAll.catchName
+				if len(path) > 1 {
+					p.Value = path[1:]
+				} else {
+					p.Value = ""
+				}
+				req.ParamCount++
+			}
+			return current.inheritedCatchAll.wrappedHandler
 		}
 
 		return nil
