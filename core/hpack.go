@@ -192,7 +192,7 @@ func hpackFindStaticNameFold(name string) int {
 			return 38
 		}
 		if EqualFoldASCII(name, "link") {
-			return 46
+			return 45
 		}
 		if EqualFoldASCII(name, "vary") {
 			return 59
@@ -253,7 +253,7 @@ func hpackFindStaticNameFold(name string) int {
 			return 42
 		}
 		if EqualFoldASCII(name, "location") {
-			return 47
+			return 46
 		}
 	case 10:
 		if name[0] == ':' {
@@ -277,7 +277,7 @@ func hpackFindStaticNameFold(name string) int {
 			return 31
 		}
 		if EqualFoldASCII(name, "max-forwards") {
-			return 48
+			return 47
 		}
 	case 13:
 		if EqualFoldASCII(name, "accept-ranges") {
@@ -334,7 +334,7 @@ func hpackFindStaticNameFold(name string) int {
 		}
 	case 18:
 		if EqualFoldASCII(name, "proxy-authenticate") {
-			return 49
+			return 48
 		}
 	case 19:
 		if EqualFoldASCII(name, "content-disposition") {
@@ -903,7 +903,9 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 		headers = make([][2]string, 0, 3)
 	}
 	headers = headers[:0]
+	rawPath := path
 	path = sanitizeRequestPath(path)
+	_, query := splitPathQuery(rawPath)
 	headers = append(headers,
 		[2]string{":method", "GET"},
 		[2]string{":path", path},
@@ -911,6 +913,8 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 	)
 	meta.method = "GET"
 	meta.path = path
+	meta.rawPath = rawPath
+	meta.query = query
 	meta.scheme = "https"
 	meta.headerCount = 3
 	return headers, meta, true, nil
@@ -919,6 +923,8 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 type hpackRequestMeta struct {
 	method      string
 	path        string
+	rawPath     string
+	query       string
 	scheme      string
 	authority   string
 	headerCount int
@@ -1021,6 +1027,8 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 				return ErrH2BadHeader
 			}
 			meta.pseudoMask |= hpackPseudoPath
+			meta.rawPath = value
+			_, meta.query = splitPathQuery(value)
 			if value == "/" {
 				meta.path = "/"
 			} else {

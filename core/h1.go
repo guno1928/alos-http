@@ -349,11 +349,15 @@ func ParseH1Request(data []byte, req *Request) int {
 		req.Method = string(methodBytes)
 	}
 
+	var rawURI string
 	if sp2 < 0 {
-		req.Path = sanitizeRequestPath(UnsafeString(rl[sp1+1:]))
+		rawURI = UnsafeString(rl[sp1+1:])
 	} else {
-		req.Path = sanitizeRequestPath(UnsafeString(rl[sp1+1 : sp2]))
+		rawURI = UnsafeString(rl[sp1+1 : sp2])
 	}
+	req.Path = sanitizeRequestPath(rawURI)
+	_, req.Query = splitPathQuery(rawURI)
+	req.RawPath = rawURI
 
 	for pos := lineEnd + 2; pos < len(data); {
 		remaining := data[pos:]
@@ -370,7 +374,8 @@ func ParseH1Request(data []byte, req *Request) int {
 		line := data[pos:nl]
 		colon := bytes.IndexByte(line, ':')
 		if colon <= 0 {
-			bodyStart = nl + 2
+			pos = nl + 2
+			bodyStart = pos
 			continue
 		}
 
@@ -505,18 +510,24 @@ var (
 )
 
 func ctPrefixLookup(ct string) []byte {
-	switch ct {
-	case "text/plain; charset=utf-8":
-		return ctPrefixTextPlain
-	case "text/html; charset=utf-8":
-		return ctPrefixTextHTML
-	case "application/json; charset=utf-8":
-		return ctPrefixJSON
-	case "application/octet-stream":
-		return ctPrefixOctet
-	default:
-		return nil
+	switch len(ct) {
+	case 25:
+		if ct == "text/plain; charset=utf-8" {
+			return ctPrefixTextPlain
+		}
+	case 24:
+		if ct == "text/html; charset=utf-8" {
+			return ctPrefixTextHTML
+		}
+		if ct == "application/octet-stream" {
+			return ctPrefixOctet
+		}
+	case 31:
+		if ct == "application/json; charset=utf-8" {
+			return ctPrefixJSON
+		}
 	}
+	return nil
 }
 
 func BuildH1Response(resp *Response) ([]byte, *[]byte) {

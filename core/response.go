@@ -1,6 +1,10 @@
 package core
 
-import "github.com/bytedance/sonic"
+import (
+	"strings"
+
+	"github.com/bytedance/sonic"
+)
 
 // StreamWriter is the interface used for chunked and streaming HTTP responses
 // (Server-Sent Events, file downloads, long-polling, etc.). Obtain one from
@@ -131,19 +135,17 @@ func (r *Response) Status(code int) *Response {
 }
 
 func sanitizeHeaderValue(v string) string {
-	for i := 0; i < len(v); i++ {
-		if v[i] == '\r' || v[i] == '\n' || v[i] == 0 {
-			b := make([]byte, 0, len(v))
-			for j := 0; j < len(v); j++ {
-				c := v[j]
-				if c != '\r' && c != '\n' && c != 0 {
-					b = append(b, c)
-				}
-			}
-			return string(b)
+	if strings.IndexByte(v, '\r') < 0 && strings.IndexByte(v, '\n') < 0 && strings.IndexByte(v, 0) < 0 {
+		return v
+	}
+	b := make([]byte, 0, len(v))
+	for j := 0; j < len(v); j++ {
+		c := v[j]
+		if c != '\r' && c != '\n' && c != 0 {
+			b = append(b, c)
 		}
 	}
-	return v
+	return string(b)
 }
 
 // SetHeader appends a sanitized response header.
@@ -272,7 +274,7 @@ func (r *Response) appendBody(dst []byte) []byte {
 //	body := resp.GetBody()
 func (r *Response) GetBody() []byte {
 	if r.bodyIsText {
-		return append(r.body[:0], r.bodyString...)
+		return []byte(r.bodyString)
 	}
 	return r.body
 }
@@ -360,4 +362,23 @@ func (r *Response) Streamer() StreamWriter {
 // IsStreamed reports whether a StreamWriter has been set on this response.
 func (r *Response) IsStreamed() bool {
 	return r.streamed
+}
+
+func (r *Response) Redirect(url string, code int) *Response {
+	if code == 0 {
+		code = 302
+	}
+	r.StatusCode = code
+	r.SetHeader("Location", url)
+	return r
+}
+
+func (r *Response) SetCookie(cookie Cookie) *Response {
+	r.SetHeader("Set-Cookie", cookie.String())
+	return r
+}
+
+func (r *Response) DeleteCookie(name string) *Response {
+	r.SetHeader("Set-Cookie", deleteCookieString(name, "/", ""))
+	return r
 }

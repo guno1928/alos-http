@@ -140,70 +140,117 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 // automatically — a close reply is sent and io.EOF is returned. Ping frames
 // trigger an automatic pong response.
 func (ws *WSConn) ReadMessage() (byte, []byte, error) {
-	var header [2]byte
-	if _, err := io.ReadFull(ws.conn, header[:]); err != nil {
-		return 0, nil, err
-	}
+	var msgOpcode byte
+	var assembled []byte
 
-	if header[0]&0x70 != 0 {
-		ws.Close()
-		return 0, nil, ErrWebSocketProtocol
+	for {
+		var header [2]byte
+		if _, err := io.ReadFull(ws.conn, header[:]); err != nil {
+			return 0, nil, err
+		}
+
+		if header[0]&0x70 != 0 {
+			ws.Close()
+			return 0, nil, ErrWebSocketProtocol
+		}
+		fin := header[0]&0x80 != 0
+		opcode := header[0] & 0x0F
+		masked := header[1]&0x80 != 0
+
+		if !masked {
+			ws.Close()
+			return 0, nil, ErrWebSocketProtocol
+		}
+
+		if opcode >= wsOpClose {
+			payload, err := ws.readFramePayload(header[1], masked)
+			if err != nil {
+				return 0, nil, err
+			}
+			if opcode == wsOpClose {
+				if len(payload) >= 2 {
+					ws.WriteMessage(wsOpClose, payload[:2])
+				} else {
+					ws.WriteMessage(wsOpClose, nil)
+				}
+				ws.Close()
+				return opcode, payload, io.EOF
+			}
+			if opcode == wsOpPing {
+				ws.WriteMessage(wsOpPong, payload)
+			}
+			continue
+		}
+
+		if assembled == nil {
+			if opcode == wsOpContinuation {
+				ws.Close()
+				return 0, nil, ErrWebSocketProtocol
+			}
+			msgOpcode = opcode
+		} else {
+			if opcode != wsOpContinuation {
+				ws.Close()
+				return 0, nil, ErrWebSocketProtocol
+			}
+		}
+
+		payload, err := ws.readFramePayload(header[1], masked)
+		if err != nil {
+			return 0, nil, err
+		}
+		assembled = append(assembled, payload...)
+
+		if int64(len(assembled)) > 16*1024*1024 {
+			ws.Close()
+			return 0, nil, ErrBodyTooLarge
+		}
+
+		if fin {
+			return msgOpcode, assembled, nil
+		}
 	}
-	fin := header[0]&0x80 != 0
-	opcode := header[0] & 0x0F
-	masked := header[1]&0x80 != 0
-	if !fin || opcode == wsOpContinuation {
-		ws.Close()
-		return 0, nil, ErrWebSocketProtocol
-	}
-	switch opcode {
-	case wsOpText, wsOpBinary, wsOpClose, wsOpPing, wsOpPong:
-	default:
-		ws.Close()
-		return 0, nil, ErrWebSocketProtocol
-	}
-	if !masked {
-		ws.Close()
-		return 0, nil, ErrWebSocketProtocol
-	}
-	payloadLen := int64(header[1] & 0x7F)
+}
+
+func (ws *WSConn) readFramePayload(secondByte byte, masked bool) ([]byte, error) {
+	payloadLen := int64(secondByte & 0x7F)
 
 	switch payloadLen {
 	case 126:
 		var ext [2]byte
 		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		payloadLen = int64(ext[0])<<8 | int64(ext[1])
 	case 127:
 		var ext [8]byte
 		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		payloadLen = int64(ext[0])<<56 | int64(ext[1])<<48 | int64(ext[2])<<40 | int64(ext[3])<<32 |
 			int64(ext[4])<<24 | int64(ext[5])<<16 | int64(ext[6])<<8 | int64(ext[7])
 		if payloadLen < 0 {
 			ws.Close()
-			return 0, nil, ErrBodyTooLarge
+			return nil, ErrBodyTooLarge
 		}
 	}
 
 	if payloadLen > 16*1024*1024 {
 		ws.Close()
-		return 0, nil, ErrBodyTooLarge
+		return nil, ErrBodyTooLarge
 	}
 
 	var maskKey [4]byte
 	if masked {
 		if _, err := io.ReadFull(ws.conn, maskKey[:]); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 	}
 
 	payload := make([]byte, payloadLen)
 	if payloadLen > 0 {
 		if _, err := io.ReadFull(ws.conn, payload); err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 	}
 
@@ -211,21 +258,7 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 		maskXOR(payload, maskKey)
 	}
 
-	if opcode == wsOpClose {
-		if len(payload) >= 2 {
-			ws.WriteMessage(wsOpClose, payload[:2])
-		} else {
-			ws.WriteMessage(wsOpClose, nil)
-		}
-		ws.Close()
-		return opcode, payload, io.EOF
-	}
-
-	if opcode == wsOpPing {
-		ws.WriteMessage(wsOpPong, payload)
-	}
-
-	return opcode, payload, nil
+	return payload, nil
 }
 
 // WriteMessage writes a WebSocket frame with the given opcode and payload.

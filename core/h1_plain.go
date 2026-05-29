@@ -382,7 +382,7 @@ func asciiHasPrefixFoldBytes(line []byte, prefix string) bool {
 		return false
 	}
 	for i := 0; i < len(prefix); i++ {
-		if asciiLower[line[i]] != asciiLower[prefix[i]] {
+		if line[i]|0x20 != prefix[i]|0x20 {
 			return false
 		}
 	}
@@ -465,11 +465,15 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		req.Method = string(methodBytes)
 	}
 
+	var rawURI string
 	if sp2 < 0 {
-		req.Path = sanitizeRequestPath(UnsafeString(rl[sp1+1:]))
+		rawURI = UnsafeString(rl[sp1+1:])
 	} else {
-		req.Path = sanitizeRequestPath(UnsafeString(rl[sp1+1 : sp2]))
+		rawURI = UnsafeString(rl[sp1+1 : sp2])
 	}
+	req.Path = sanitizeRequestPath(rawURI)
+	_, req.Query = splitPathQuery(rawURI)
+	req.RawPath = rawURI
 
 	for pos := idx + 2; pos < len(data); {
 		remaining := data[pos:]

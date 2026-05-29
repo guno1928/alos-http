@@ -37,11 +37,9 @@ func (j *JSON) Marshal(v any) []byte {
 	data, err := sonic.Marshal(v)
 	if err != nil {
 		log.Printf("[JSON] marshal failed: %v", err)
-		j.Buf = append(j.Buf[:0], "null"...)
-		return j.Buf
+		return []byte("null")
 	}
-	j.Buf = append(j.Buf[:0], data...)
-	return j.Buf
+	return data
 }
 
 func (j *JSON) Release() {

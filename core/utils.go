@@ -203,7 +203,21 @@ func EqualFoldASCII(a, b string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := 0; i < len(a); i++ {
+	n := len(a)
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		if asciiLower[a[i]] != asciiLower[b[i]] ||
+			asciiLower[a[i+1]] != asciiLower[b[i+1]] ||
+			asciiLower[a[i+2]] != asciiLower[b[i+2]] ||
+			asciiLower[a[i+3]] != asciiLower[b[i+3]] ||
+			asciiLower[a[i+4]] != asciiLower[b[i+4]] ||
+			asciiLower[a[i+5]] != asciiLower[b[i+5]] ||
+			asciiLower[a[i+6]] != asciiLower[b[i+6]] ||
+			asciiLower[a[i+7]] != asciiLower[b[i+7]] {
+			return false
+		}
+	}
+	for ; i < n; i++ {
 		if asciiLower[a[i]] != asciiLower[b[i]] {
 			return false
 		}
@@ -352,16 +366,37 @@ func indexCRLF(s string) int {
 	return strings.Index(s, "\r\n")
 }
 
+var digitPairs = [100]uint16{
+	0x3030, 0x3130, 0x3230, 0x3330, 0x3430, 0x3530, 0x3630, 0x3730, 0x3830, 0x3930,
+	0x3031, 0x3131, 0x3231, 0x3331, 0x3431, 0x3531, 0x3631, 0x3731, 0x3831, 0x3931,
+	0x3032, 0x3132, 0x3232, 0x3332, 0x3432, 0x3532, 0x3632, 0x3732, 0x3832, 0x3932,
+	0x3033, 0x3133, 0x3233, 0x3333, 0x3433, 0x3533, 0x3633, 0x3733, 0x3833, 0x3933,
+	0x3034, 0x3134, 0x3234, 0x3334, 0x3434, 0x3534, 0x3634, 0x3734, 0x3834, 0x3934,
+	0x3035, 0x3135, 0x3235, 0x3335, 0x3435, 0x3535, 0x3635, 0x3735, 0x3835, 0x3935,
+	0x3036, 0x3136, 0x3236, 0x3336, 0x3436, 0x3536, 0x3636, 0x3736, 0x3836, 0x3936,
+	0x3037, 0x3137, 0x3237, 0x3337, 0x3437, 0x3537, 0x3637, 0x3737, 0x3837, 0x3937,
+	0x3038, 0x3138, 0x3238, 0x3338, 0x3438, 0x3538, 0x3638, 0x3738, 0x3838, 0x3938,
+	0x3039, 0x3139, 0x3239, 0x3339, 0x3439, 0x3539, 0x3639, 0x3739, 0x3839, 0x3939,
+}
+
 func appendUint(dst []byte, n int64) []byte {
 	var buf [20]byte
 	i := len(buf)
 	if n == 0 {
 		return append(dst, '0')
 	}
-	for n > 0 {
+	for n >= 100 {
+		d := n % 100
+		n /= 100
+		i -= 2
+		*(*uint16)(unsafe.Pointer(&buf[i])) = digitPairs[d]
+	}
+	if n >= 10 {
+		i -= 2
+		*(*uint16)(unsafe.Pointer(&buf[i])) = digitPairs[n]
+	} else {
 		i--
-		buf[i] = byte(n%10) + '0'
-		n /= 10
+		buf[i] = byte(n) + '0'
 	}
 	return append(dst, buf[i:]...)
 }
@@ -505,50 +540,46 @@ func AppendJSONString(dst []byte, s string) []byte {
 	return dst
 }
 
-func sanitizeRequestPath(path string) string {
-	for i := 0; i < len(path); i++ {
-		if path[i] == 0 || path[i] == '\r' || path[i] == '\n' {
-			path = path[:i]
-			break
+func splitPathQuery(raw string) (string, string) {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '?' {
+			return raw[:i], raw[i+1:]
 		}
+	}
+	return raw, ""
+}
+
+func sanitizeRequestPath(path string) string {
+	if nul := strings.IndexByte(path, 0); nul >= 0 {
+		path = path[:nul]
+	} else if cr := strings.IndexByte(path, '\r'); cr >= 0 {
+		path = path[:cr]
+	} else if lf := strings.IndexByte(path, '\n'); lf >= 0 {
+		path = path[:lf]
 	}
 	if len(path) == 0 {
 		return "/"
 	}
 
-	queryIdx := -1
-	needsSanitize := path[0] != '/'
-	for i := 0; i < len(path) && !needsSanitize; i++ {
-		c := path[i]
-		if c == '?' {
-			queryIdx = i
-			break
-		}
-		if c == '/' && i+1 < len(path) {
-			next := path[i+1]
+	p, _ := splitPathQuery(path)
+
+	if p[0] == '/' && strings.IndexByte(p, '.') < 0 && !strings.Contains(p, "//") {
+		return p
+	}
+
+	needsSanitize := p[0] != '/'
+	for i := 0; i < len(p) && !needsSanitize; i++ {
+		if p[i] == '/' && i+1 < len(p) {
+			next := p[i+1]
 			if next == '/' || next == '.' {
 				needsSanitize = true
 			}
 		}
 	}
 	if !needsSanitize {
-		return path
+		return p
 	}
 
-	var query string
-	p := path
-	if queryIdx < 0 {
-		for i := 0; i < len(path); i++ {
-			if path[i] == '?' {
-				queryIdx = i
-				break
-			}
-		}
-	}
-	if queryIdx >= 0 {
-		query = path[queryIdx:]
-		p = path[:queryIdx]
-	}
 	if len(p) == 0 || p[0] != '/' {
 		p = "/" + p
 	}
@@ -571,23 +602,29 @@ func sanitizeRequestPath(path string) string {
 		}
 	}
 	if len(segments) == 0 {
-		return "/" + query
+		return "/"
 	}
 	clean := make([]byte, 0, len(p))
 	for _, seg := range segments {
 		clean = append(clean, '/')
 		clean = append(clean, seg...)
 	}
-	return string(clean) + query
+	return string(clean)
+}
+
+var badHostChar [256]bool
+
+func init() {
+	badHostChar['/'] = true
+	badHostChar['\\'] = true
+	badHostChar['\r'] = true
+	badHostChar['\n'] = true
+	badHostChar[0] = true
 }
 
 func ValidateHost(host string) bool {
-	if host == "" {
-		return true
-	}
 	for i := 0; i < len(host); i++ {
-		c := host[i]
-		if c == '/' || c == '\\' || c == '\r' || c == '\n' || c == 0 {
+		if badHostChar[host[i]] {
 			return false
 		}
 	}

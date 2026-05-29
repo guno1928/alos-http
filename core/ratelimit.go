@@ -72,15 +72,36 @@ func (tb *TokenBucket) Allow(tokens int64) bool {
 }
 
 func (tb *TokenBucket) Wait(tokens int64) {
-	if tokens > tb.burst {
-		return
+	for tokens > tb.burst {
+		tb.waitForChunk(tb.burst)
+		tokens -= tb.burst
 	}
-	for !tb.Allow(tokens) {
+	if tokens > 0 {
+		for !tb.Allow(tokens) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func (tb *TokenBucket) waitForChunk(n int64) {
+	for !tb.Allow(n) {
 		time.Sleep(time.Millisecond)
 	}
 }
 
 func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
+	for tokens > tb.burst {
+		for !tb.Allow(tb.burst) {
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(time.Millisecond)
+		}
+		tokens -= tb.burst
+	}
+	if tokens <= 0 {
+		return true
+	}
 	for !tb.Allow(tokens) {
 		if time.Now().After(deadline) {
 			return false

@@ -403,7 +403,7 @@ func parseSNI(data []byte) string {
 			break
 		}
 		if nameType == 0x00 {
-			return UnsafeString(list[i : i+nameLen])
+			return string(list[i : i+nameLen])
 		}
 		i += nameLen
 	}
@@ -454,7 +454,7 @@ func parseALPN(ch *ParsedClientHello, data []byte) []string {
 	for i, j := 0, 0; i < len(list) && j < count; j++ {
 		pLen := int(list[i])
 		i++
-		protos[j] = UnsafeString(list[i : i+pLen])
+		protos[j] = string(list[i : i+pLen])
 		i += pLen
 	}
 	return protos

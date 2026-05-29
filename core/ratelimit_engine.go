@@ -262,7 +262,11 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 }
 
 func (rle *RateLimitEngine) Stop() {
-	close(rle.stopCh)
+	select {
+	case <-rle.stopCh:
+	default:
+		close(rle.stopCh)
+	}
 }
 
 func (rle *RateLimitEngine) cleanupLoop() {

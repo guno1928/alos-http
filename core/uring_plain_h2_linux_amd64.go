@@ -332,6 +332,8 @@ func (worker *plainUringWorker) processHTTP2DecodedHeaders(conn *plainWorkerConn
 	stream.Window.Store(int64(st.initialWindowSize))
 	stream.Method = meta.method
 	stream.Path = meta.path
+	stream.RawPath = meta.rawPath
+	stream.Query = meta.query
 	stream.Scheme = meta.scheme
 	stream.Auth = meta.authority
 	for i := range headers {
@@ -463,6 +465,8 @@ func (worker *plainUringWorker) dispatchHTTP2Stream(conn *plainWorkerConn, strea
 	conn.req.Reset()
 	conn.req.Method = stream.Method
 	conn.req.Path = stream.Path
+	conn.req.RawPath = stream.RawPath
+	conn.req.Query = stream.Query
 	conn.req.Proto = "HTTP/2"
 	conn.req.Headers = append(conn.req.Headers[:0], stream.Headers...)
 	conn.req.Body = stream.Body

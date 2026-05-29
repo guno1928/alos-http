@@ -15,6 +15,8 @@ type H2Stream struct {
 	Window  atomic.Int64
 	Method  string
 	Path    string
+	RawPath string
+	Query   string
 	Scheme  string
 	Auth    string
 	Headers [][2]string
@@ -30,6 +32,8 @@ func (s *H2Stream) Reset() {
 	s.Window.Store(0)
 	s.Method = ""
 	s.Path = ""
+	s.RawPath = ""
+	s.Query = ""
 	s.Scheme = ""
 	s.Auth = ""
 	s.Headers = s.Headers[:0]

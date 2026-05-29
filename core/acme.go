@@ -306,7 +306,11 @@ func (ai *acmeIntegration) Start() {
 }
 
 func (ai *acmeIntegration) Stop() {
-	close(ai.stop)
+	select {
+	case <-ai.stop:
+	default:
+		close(ai.stop)
+	}
 }
 
 func (ai *acmeIntegration) runLoop() {

@@ -1,14 +1,16 @@
 # ALOS HTTP - go web framework with io_uring support
 
+> **Linux x86-64 only.** ALOS HTTP requires **Linux** on **amd64 (x86-64)** CPUs. It does not support Windows, macOS, ARM, or any other OS/architecture combination. If you are on Windows or macOS, use Docker or a Linux VM to run it.
+
 > **Work in progress.** ALOS HTTP is still under active development and bugs may be present. If you find a bug or rough edge, please open a GitHub issue.
 >
 > **Join the Discord:** [https://alos.gg/discord](https://alos.gg/discord)
 
 Based on the project's current published benchmark suite, ALOS HTTP is the fastest web framework currently available right now.
 
-ALOS HTTP is a Linux-first Go web framework, Go HTTP server, and application server built around a custom networking stack with full `io_uring` support on supported kernels.
+ALOS HTTP is a Linux-only Go web framework, Go HTTP server, and application server built around a custom networking stack with full `io_uring` support. It only runs on **Linux amd64 (x86-64)** — the entire I/O layer, including HTTP/1.1, HTTP/2, HTTP/3 (QUIC), TLS, and reverse proxying, is built on `io_uring` syscalls and amd64-specific optimizations.
 
-It includes first-class TLS handling, HTTP/1.1 and HTTP/2 support, reverse proxying, load balancing, rate limiting, streaming, ACME automation, and a high-performance radix router.
+It includes first-class TLS handling, HTTP/1.1, HTTP/2, and HTTP/3 support, reverse proxying, load balancing, rate limiting, streaming, ACME automation, and a high-performance radix router.
 
 It is designed for people who want more control than a thin net/http wrapper, while still getting an ergonomic handler API.
 
@@ -22,8 +24,8 @@ https://github.com/guno1928/alos-http
 ALOS HTTP focuses on a different part of the stack than most Go web frameworks.
 
 - Custom server core instead of delegating everything to net/http.
-- Built-in HTTP/1.1 and HTTP/2 serving.
-- Linux-first runtime with full `io_uring` support on supported kernels.
+- Built-in HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) serving.
+- Linux amd64 runtime with full `io_uring` support.
 - Built-in TLS flow with ACME support for HTTPS and TLS automation.
 - High-performance radix router with params, wildcards, groups, and middleware.
 - Reverse proxy with load balancing, health checks, and cache support.
@@ -41,8 +43,9 @@ On Linux amd64 with a supported kernel, the following paths run entirely through
 - **Reverse proxy egress** — outbound connections to backends (dial, send, receive) go through dedicated proxy `io_uring` rings.
 - **Sendfile** — static file serving uses `io_uring`-backed splice/sendfile operations where the kernel supports it.
 - **HTTP/2 framing** — HTTP/2 frame reads and writes on both the ingress and shared-bridge proxy paths use `io_uring`.
+- **HTTP/3 (QUIC)** — UDP socket I/O for QUIC connections uses `io_uring`-backed recv/send with `SO_REUSEPORT` for multi-listener scaling.
 
-In short, every network I/O syscall in the hot path (accept, read, write, connect, sendfile) is submitted through `io_uring` rather than the traditional `epoll` + blocking-syscall model.
+In short, every network I/O syscall in the hot path (accept, read, write, connect, sendfile, UDP recv/send) is submitted through `io_uring` rather than the traditional `epoll` + blocking-syscall model.
 
 Search-friendly summary:
 
@@ -51,17 +54,24 @@ Search-friendly summary:
 - Linux web server
 - `io_uring` framework
 - reverse proxy and load balancer
-- HTTP/1.1 and HTTP/2 server
+- HTTP/1.1, HTTP/2, and HTTP/3 server
+- QUIC server
 - TLS 1.3 and ACME automation
 
 ## Platform Support
 
-ALOS HTTP now targets Linux only.
+| | Supported |
+|---|---|
+| **OS** | Linux only |
+| **Architecture** | amd64 (x86-64) only |
+| **Go version** | Go 1.26+ |
+| **Kernel** | 5.11+ (for io_uring), 6.0+ recommended |
 
-- Linux is the supported production platform.
-- The framework is optimized around `io_uring`, which is a Linux kernel feature.
-- If you are developing on Windows or macOS, treat those environments as places to edit code, not as the target runtime.
-- For the full fast path, use a recent Linux kernel with `io_uring` features enabled.
+- **Linux amd64 is the only supported platform.** ARM, RISC-V, 32-bit, Windows, macOS, and FreeBSD are not supported.
+- The entire I/O stack (TCP accept, TLS, HTTP/1.1, HTTP/2, HTTP/3 QUIC, reverse proxy, sendfile) uses `io_uring`, which is a Linux kernel feature available only on x86-64.
+- Hand-written amd64 assembly is used in hot paths (QUIC varint encoding, packet number processing).
+- If you are developing on Windows or macOS, edit code locally and deploy/test on Linux via Docker (`--privileged` required for `io_uring` access) or a Linux VM.
+- For HTTP/3 (QUIC over UDP), the server uses `io_uring`-backed UDP sockets with `SO_REUSEPORT`.
 
 ## What is io_uring?
 

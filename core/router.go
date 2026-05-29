@@ -1,5 +1,12 @@
 package core
 
+import (
+	"math/bits"
+	"sort"
+	"strings"
+	"unsafe"
+)
+
 // HandlerFunc is the signature for request handlers. Every route handler and
 // middleware terminal receives a Request (the incoming HTTP request) and a
 // Response (the outgoing reply builder). Write the response by calling methods
@@ -75,11 +82,27 @@ func methodIndex(method string) int {
 	if len(method) < 3 {
 		return -1
 	}
-	idx := int(methodLookup[method[0]][method[1]])
-	if idx == 0 {
-		return -1
+	switch {
+	case method[0] == 'G' && method[1] == 'E':
+		return methodGET
+	case method[0] == 'P' && method[1] == 'O':
+		return methodPOST
+	case method[0] == 'P' && method[1] == 'U':
+		return methodPUT
+	case method[0] == 'D' && method[1] == 'E':
+		return methodDELETE
+	case method[0] == 'P' && method[1] == 'A':
+		return methodPATCH
+	case method[0] == 'H' && method[1] == 'E':
+		return methodHEAD
+	case method[0] == 'O' && method[1] == 'P':
+		return methodOPTIONS
+	case method[0] == 'C' && method[1] == 'O':
+		return methodCONNECT
+	case method[0] == 'T' && method[1] == 'R':
+		return methodTRACE
 	}
-	return idx - 1
+	return -1
 }
 
 type staticEntry struct {
@@ -294,6 +317,14 @@ func longestCommonPrefix(a, b string) int {
 		max = len(b)
 	}
 	i := 0
+	for ; i+7 < max; i += 8 {
+		aw := *(*uint64)(unsafe.Pointer(unsafe.StringData(a[i:])))
+		bw := *(*uint64)(unsafe.Pointer(unsafe.StringData(b[i:])))
+		if aw != bw {
+			diff := aw ^ bw
+			return i + bits.TrailingZeros64(diff)/8
+		}
+	}
 	for i < max && a[i] == b[i] {
 		i++
 	}
@@ -469,13 +500,17 @@ func (r *Router) lookupBuilt(idx int, path string, req *Request) HandlerFunc {
 		return handler
 	}
 
-	if root != nil && root.catchAll != nil {
+	if root.catchAll != nil {
 		req.ParamCount = 0
-		if req.ParamCount < len(req.Params) {
-			p := &req.Params[req.ParamCount]
+		if len(req.Params) > 0 {
+			p := &req.Params[0]
 			p.Key = root.catchAll.catchName
-			p.Value = path[1:]
-			req.ParamCount++
+			if len(path) > 1 {
+				p.Value = path[1:]
+			} else {
+				p.Value = ""
+			}
+			req.ParamCount = 1
 		}
 		return root.catchAll.wrappedHandler
 	}
@@ -821,6 +856,56 @@ func Chain(handler HandlerFunc, middleware ...MiddlewareFunc) HandlerFunc {
 		h = middleware[i](h)
 	}
 	return h
+}
+
+type RouteInfo struct {
+	Method string
+	Path   string
+}
+
+func (r *Router) Routes() []RouteInfo {
+	var routes []RouteInfo
+	for i, root := range r.trees {
+		if root == nil {
+			continue
+		}
+		collectRoutes(root, "", allMethods[i], &routes)
+	}
+	sort.Slice(routes, func(a, b int) bool {
+		if routes[a].Method != routes[b].Method {
+			return routes[a].Method < routes[b].Method
+		}
+		return routes[a].Path < routes[b].Path
+	})
+	return routes
+}
+
+func collectRoutes(n *node, prefix, method string, out *[]RouteInfo) {
+	fullPath := prefix + n.path
+	if n.handler != nil || n.wrappedHandler != nil {
+		*out = append(*out, RouteInfo{Method: method, Path: fullPath})
+	}
+	for _, child := range n.children {
+		collectRoutes(child, fullPath, method, out)
+	}
+	if n.paramChild != nil {
+		collectRoutes(n.paramChild, fullPath+":"+n.paramChild.paramName, method, out)
+	}
+	if n.catchAll != nil {
+		catchPath := fullPath + "*" + n.catchAll.catchName
+		*out = append(*out, RouteInfo{Method: method, Path: catchPath})
+	}
+}
+
+func (g *RouteGroup) Routes() []RouteInfo {
+	all := g.router.Routes()
+	var filtered []RouteInfo
+	for _, ri := range all {
+		if strings.HasPrefix(ri.Path, g.prefix) {
+			filtered = append(filtered, ri)
+		}
+	}
+	return filtered
 }
 
 // Match reports whether a route exists for the given method and path without

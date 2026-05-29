@@ -42,6 +42,8 @@ type Param struct {
 type Request struct {
 	Method          string
 	Path            string
+	RawPath         string
+	Query           string
 	Proto           string
 	Host            string
 	RemoteAddr      string
@@ -74,6 +76,15 @@ type Request struct {
 	attachConn      func(*Request) net.Conn
 	connTakenOver   bool
 	hijackReadBuf   []byte
+	store           map[string]any
+	queryParsed     bool
+	queryCache      map[string][]string
+	formParsed      bool
+	formCache       map[string][]string
+	filesParsed     bool
+	filesCache      map[string][]FileHeader
+	cookiesParsed   bool
+	cookiesCache    []Cookie
 }
 
 const (
@@ -94,6 +105,8 @@ const (
 func (r *Request) Reset() {
 	r.Method = ""
 	r.Path = ""
+	r.RawPath = ""
+	r.Query = ""
 	r.Proto = ""
 	r.Host = ""
 	r.RemoteAddr = ""
@@ -125,12 +138,31 @@ func (r *Request) Reset() {
 	r.attachConn = nil
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
+	r.queryParsed = false
+	for k := range r.queryCache {
+		delete(r.queryCache, k)
+	}
+	r.formParsed = false
+	for k := range r.formCache {
+		delete(r.formCache, k)
+	}
+	r.filesParsed = false
+	for k := range r.filesCache {
+		delete(r.filesCache, k)
+	}
+	r.cookiesParsed = false
+	r.cookiesCache = r.cookiesCache[:0]
+	for k := range r.store {
+		delete(r.store, k)
+	}
 }
 
 func (r *Request) resetFastH1() {
 	r.Headers = r.Headers[:0]
 	r.Body = r.Body[:0]
 	r.ParamCount = 0
+	r.RawPath = ""
+	r.Query = ""
 	r.hijacked = false
 	if mask := r.headerCacheMask; mask != 0 {
 		if mask&headerCacheContentLength != 0 {
@@ -174,6 +206,23 @@ func (r *Request) resetFastH1() {
 	r.attachConn = nil
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
+	r.queryParsed = false
+	for k := range r.queryCache {
+		delete(r.queryCache, k)
+	}
+	r.formParsed = false
+	for k := range r.formCache {
+		delete(r.formCache, k)
+	}
+	r.filesParsed = false
+	for k := range r.filesCache {
+		delete(r.filesCache, k)
+	}
+	r.cookiesParsed = false
+	r.cookiesCache = r.cookiesCache[:0]
+	for k := range r.store {
+		delete(r.store, k)
+	}
 }
 
 func (r *Request) ensureConn() net.Conn {
@@ -420,4 +469,142 @@ func (r *Request) SetParam(key, value string) {
 		r.Params[r.ParamCount] = Param{Key: key, Value: value}
 		r.ParamCount++
 	}
+}
+
+func (r *Request) Set(key string, value any) {
+	if r.store == nil {
+		r.store = make(map[string]any)
+	}
+	r.store[key] = value
+}
+
+func (r *Request) Get(key string) (any, bool) {
+	if r.store == nil {
+		return nil, false
+	}
+	v, ok := r.store[key]
+	return v, ok
+}
+
+func (r *Request) GetString(key string) string {
+	if r.store == nil {
+		return ""
+	}
+	v, ok := r.store[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+func (r *Request) parseCookiesLazy() {
+	if r.cookiesParsed {
+		return
+	}
+	r.cookiesParsed = true
+	hdr := r.Header("Cookie")
+	if hdr == "" {
+		return
+	}
+	r.cookiesCache = append(r.cookiesCache[:0], parseCookieHeader(hdr)...)
+}
+
+func (r *Request) Cookie(name string) string {
+	r.parseCookiesLazy()
+	for i := range r.cookiesCache {
+		if r.cookiesCache[i].Name == name {
+			return r.cookiesCache[i].Value
+		}
+	}
+	return ""
+}
+
+func (r *Request) Cookies() []Cookie {
+	r.parseCookiesLazy()
+	return r.cookiesCache
+}
+
+func (r *Request) parseQueryLazy() {
+	if r.queryParsed {
+		return
+	}
+	r.queryParsed = true
+	if r.Query == "" {
+		return
+	}
+	r.queryCache = parseQueryString(r.Query)
+}
+
+func (r *Request) QueryParam(key string) string {
+	r.parseQueryLazy()
+	vals := r.queryCache[key]
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
+}
+
+func (r *Request) QueryParamAll(key string) []string {
+	r.parseQueryLazy()
+	return r.queryCache[key]
+}
+
+func (r *Request) QueryParams() map[string][]string {
+	r.parseQueryLazy()
+	return r.queryCache
+}
+
+func (r *Request) parseFormLazy() {
+	if r.formParsed {
+		return
+	}
+	r.formParsed = true
+	ct := r.Header("Content-Type")
+	if hasPrefixFold(ct, "application/x-www-form-urlencoded") {
+		r.formCache = parseFormURLEncoded(r.Body)
+	}
+}
+
+func (r *Request) parseFilesLazy() {
+	if r.filesParsed {
+		return
+	}
+	r.filesParsed = true
+	ct := r.Header("Content-Type")
+	if !hasPrefixFold(ct, "multipart/form-data") {
+		return
+	}
+	boundary := extractBoundary(ct)
+	if boundary == "" {
+		return
+	}
+	vals, files := parseMultipart(r.Body, boundary)
+	if !r.formParsed {
+		r.formParsed = true
+		r.formCache = vals
+	}
+	r.filesCache = files
+}
+
+func (r *Request) FormValue(key string) string {
+	r.parseFormLazy()
+	vals := r.formCache[key]
+	if len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
+}
+
+func (r *Request) FormFile(field string) (FileHeader, bool) {
+	r.parseFilesLazy()
+	files := r.filesCache[field]
+	if len(files) == 0 {
+		return FileHeader{}, false
+	}
+	return files[0], true
+}
+
+func (r *Request) BindJSON(v any) error {
+	return bindJSON(r.Body, v)
 }

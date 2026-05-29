@@ -714,6 +714,8 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 	stream.Window.Store(int64(hc.initialWindowSize))
 	stream.Method = meta.method
 	stream.Path = meta.path
+	stream.RawPath = meta.rawPath
+	stream.Query = meta.query
 	stream.Scheme = meta.scheme
 	stream.Auth = meta.authority
 	nh := len(headers)
@@ -855,6 +857,8 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	req.Reset()
 	req.Method = stream.Method
 	req.Path = stream.Path
+	req.RawPath = stream.RawPath
+	req.Query = stream.Query
 	req.Proto = "HTTP/2"
 	req.Headers = append(req.Headers[:0], stream.Headers...)
 	req.Body = stream.Body

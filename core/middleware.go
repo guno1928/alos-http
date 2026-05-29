@@ -179,12 +179,7 @@ func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
 		return
 	}
 	if xff := req.Header("x-forwarded-for"); xff != "" {
-		var ip string
-		if comma := indexByte(xff, ','); comma > 0 {
-			ip = trimASCIISpace(xff[:comma])
-		} else {
-			ip = trimASCIISpace(xff)
-		}
+		ip := lastXFFEntry(xff)
 		if isValidIP(ip) {
 			req.RemoteAddr = ip
 			return
@@ -196,6 +191,17 @@ func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
 			req.RemoteAddr = ip
 		}
 	}
+}
+
+func lastXFFEntry(xff string) string {
+	last := xff
+	for i := len(xff) - 1; i >= 0; i-- {
+		if xff[i] == ',' {
+			last = xff[i+1:]
+			break
+		}
+	}
+	return trimASCIISpace(last)
 }
 
 func (ce *CORSEngine) Config() CORSConfig {
@@ -516,18 +522,59 @@ func negotiateEncoding(accept string) encodingType {
 	if accept == "" {
 		return encodingNone
 	}
-	hasGzip := false
-	hasDeflate := false
-	for i := 0; i < len(accept); i++ {
-		if accept[i] == 'g' && i+3 < len(accept) && accept[i:i+4] == "gzip" {
-			return encodingGzip
+	var bestGzip, bestDeflate int8
+	bestGzip = -1
+	bestDeflate = -1
+	for i := 0; i < len(accept); {
+		for i < len(accept) && (accept[i] == ' ' || accept[i] == ',') {
+			i++
 		}
-		if accept[i] == 'd' && i+6 < len(accept) && accept[i:i+7] == "deflate" {
-			hasDeflate = true
+		tokenStart := i
+		for i < len(accept) && accept[i] != ',' && accept[i] != ';' {
+			i++
+		}
+		tokenEnd := i
+		for tokenEnd > tokenStart && accept[tokenEnd-1] == ' ' {
+			tokenEnd--
+		}
+		token := accept[tokenStart:tokenEnd]
+		q := int8(1)
+		if i < len(accept) && accept[i] == ';' {
+			i++
+			for i < len(accept) && accept[i] == ' ' {
+				i++
+			}
+			if i+2 <= len(accept) && (accept[i] == 'q' || accept[i] == 'Q') && accept[i+1] == '=' {
+				i += 2
+				if i < len(accept) && accept[i] == '0' {
+					isZero := true
+					if i+1 < len(accept) && accept[i+1] != ',' && accept[i+1] != ' ' && accept[i+1] != ';' {
+						isZero = false
+					}
+					if isZero {
+						q = 0
+					}
+				}
+			}
+			for i < len(accept) && accept[i] != ',' {
+				i++
+			}
+		}
+		switch {
+		case len(token) == 4 && (token[0] == 'g' || token[0] == 'G') &&
+			(token[1] == 'z' || token[1] == 'Z') &&
+			(token[2] == 'i' || token[2] == 'I') &&
+			(token[3] == 'p' || token[3] == 'P'):
+			bestGzip = q
+		case len(token) == 7 && (token[0] == 'd' || token[0] == 'D') &&
+			EqualFoldASCII(token, "deflate"):
+			bestDeflate = q
 		}
 	}
-	_ = hasGzip
-	if hasDeflate {
+	if bestGzip > 0 {
+		return encodingGzip
+	}
+	if bestDeflate > 0 {
 		return encodingDeflate
 	}
 	return encodingNone
@@ -563,6 +610,8 @@ func Timeout(d time.Duration) MiddlewareFunc {
 		return func(req *Request, resp *Response) {
 			done := make(chan struct{}, 1)
 			tmpReq := *req
+			tmpReq.Params = req.Params
+			tmpReq.ParamCount = req.ParamCount
 			if len(req.Headers) > 0 {
 				tmpReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 			} else {
@@ -578,6 +627,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			tmpReq.tlsReader = nil
 			tmpReq.tlsWriter = nil
 			tmpReq.hdrBuf = nil
+			tmpReq.attachConn = nil
 			tmpResp := ResponsePool.Get().(*Response)
 			tmpResp.Reset()
 			tmpResp.lazyReq = &tmpReq
@@ -607,8 +657,9 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					if tmpResp.IsStreamed() {
 						resp.SetStreamer(tmpResp.Streamer())
 					}
+					tmpResp.Reset()
+					ResponsePool.Put(tmpResp)
 				}
-				ResponsePool.Put(tmpResp)
 			case <-timer.C:
 				timedOut.Store(true)
 				go func() {
@@ -694,12 +745,7 @@ func RealIP(trustedProxies ...string) MiddlewareFunc {
 		return func(req *Request, resp *Response) {
 			if isTrusted(req.RemoteAddr) {
 				if xff := req.Header("x-forwarded-for"); xff != "" {
-					var ip string
-					if comma := indexByte(xff, ','); comma > 0 {
-						ip = trimASCIISpace(xff[:comma])
-					} else {
-						ip = trimASCIISpace(xff)
-					}
+					ip := lastXFFEntry(xff)
 					if isValidIP(ip) {
 						req.RemoteAddr = ip
 					}

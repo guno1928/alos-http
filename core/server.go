@@ -193,8 +193,10 @@ type Server struct {
 	h2RootFast     h2RootFastResponse
 	trustedProxies trustedProxyMatcher
 	perIPLimiter   *perIPRequestLimiter
-	trackedConnMu  sync.Mutex
-	trackedConns   map[*trackedHandoffConn]struct{}
+	trackedConnMu   sync.Mutex
+	trackedConns    map[*trackedHandoffConn]struct{}
+	onRequestHooks  []func(*Request, *Response) bool
+	onResponseHooks []func(*Request, *Response)
 }
 
 type trackedHandoffConn struct {
@@ -1198,6 +1200,14 @@ func (s *Server) PurgeDomainCache(domain string) int64 {
 	return pe.Cache.PurgeDomain(domain)
 }
 
+func (s *Server) OnRequest(fn func(*Request, *Response) bool) {
+	s.onRequestHooks = append(s.onRequestHooks, fn)
+}
+
+func (s *Server) OnResponse(fn func(*Request, *Response)) {
+	s.onResponseHooks = append(s.onResponseHooks, fn)
+}
+
 func (s *Server) dispatch(req *Request, resp *Response) {
 	if !s.tryAcquireRequestSlot() {
 		resp.Status(503).String("Service Unavailable")
@@ -1218,12 +1228,21 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		defer s.perIPLimiter.release(clientIP)
 	}
 
+	for _, hook := range s.onRequestHooks {
+		if !hook(req, resp) {
+			return
+		}
+	}
+
 	cors := s.CORS
 	var corsSnap *corsSnapshot
 	if cors != nil {
 		corsSnap = cors.snapshot.Load()
 	}
 	defer func() {
+		for _, hook := range s.onResponseHooks {
+			hook(req, resp)
+		}
 		if s.config.EnableCompress && !req.hijacked {
 			applyConfiguredCompression(req, resp, CompressConfig{
 				Level:   s.config.CompressLevel,

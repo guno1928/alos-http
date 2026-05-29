@@ -148,7 +148,11 @@ func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 }
 
 func (pc *ProxyCache) Stop() {
-	close(pc.stopCh)
+	select {
+	case <-pc.stopCh:
+	default:
+		close(pc.stopCh)
+	}
 }
 
 func (pc *ProxyCache) buildKey(method, host, path string) string {
@@ -567,6 +571,8 @@ func (pc *ProxyCache) compressGzip(data []byte) []byte {
 	gw.Write(data)
 	gw.Close()
 	pc.gzipPool.Put(gw)
+	w.buf = nil
+	bytesWriterPool.Put(w)
 	result := make([]byte, len(buf))
 	copy(result, buf)
 	*bp = buf[:0]
@@ -805,11 +811,16 @@ func acceptsGzip(accept string) bool {
 			accept = accept[end+1:]
 		}
 		token = trimASCIISpace(token)
+		qDisabled := false
 		if semi := indexByte(token, ';'); semi >= 0 {
+			params := trimASCIISpace(token[semi+1:])
 			token = token[:semi]
+			if len(params) >= 3 && (params[0] == 'q' || params[0] == 'Q') && params[1] == '=' {
+				qDisabled = params[2] == '0' && (len(params) == 3 || params[3] == ',' || params[3] == ' ')
+			}
 		}
 		if trimASCIISpace(token) == "gzip" {
-			return true
+			return !qDisabled
 		}
 	}
 	return false

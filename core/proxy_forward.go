@@ -17,7 +17,11 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	cache := pe.Cache
 	if cache != nil && cacheableMethod {
-		entry, hit := cache.Get(req.Method, host, req.Path, req)
+		cachePath := req.Path
+		if req.Query != "" {
+			cachePath = req.Path + "?" + req.Query
+		}
+		entry, hit := cache.Get(req.Method, host, cachePath, req)
 		if hit {
 			cache.ServeCached(entry, req, resp)
 			if pe.OnResponse != nil {
@@ -230,8 +234,12 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			resp.SetBody(body)
 
 			host := stripPort(req.Host)
+			cPath := req.Path
+			if req.Query != "" {
+				cPath = req.Path + "?" + req.Query
+			}
 			if manualCache && cache != nil {
-				cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+				cache.PutManual(req.Method, host, cPath, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
 			}
 
 			if keepAlive {
@@ -262,12 +270,16 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			resp.SetBody(bodyBuf)
 		}
 
+		cPath := req.Path
+		if req.Query != "" {
+			cPath = req.Path + "?" + req.Query
+		}
 		if manualCache && cache != nil {
 			host := stripPort(req.Host)
-			cache.PutManual(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody(), manualTTL, manualMaxHits, manualCompress, manualCompressMin)
+			cache.PutManual(req.Method, host, cPath, statusCode, headers, contentType, resp.GetBody(), manualTTL, manualMaxHits, manualCompress, manualCompressMin)
 		} else if autoCacheAllowed && cache != nil && proxyCacheResponseAllowed(headers) {
 			host := stripPort(req.Host)
-			cache.Put(req.Method, host, req.Path, statusCode, headers, contentType, resp.GetBody())
+			cache.Put(req.Method, host, cPath, statusCode, headers, contentType, resp.GetBody())
 		}
 
 		if keepAlive {
@@ -476,10 +488,17 @@ func readChunkedBody(br io.Reader, maxSize int64) ([]byte, bool) {
 func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *DomainConfig) []byte {
 	buf = append(buf, req.Method...)
 	buf = append(buf, ' ')
-	if containsCRLF(req.Path) {
+	uri := req.RawPath
+	if uri == "" {
+		uri = req.Path
+		if req.Query != "" {
+			uri = req.Path + "?" + req.Query
+		}
+	}
+	if containsCRLF(uri) {
 		buf = append(buf, '/')
 	} else {
-		buf = append(buf, req.Path...)
+		buf = append(buf, uri...)
 	}
 	buf = append(buf, " HTTP/1.1\r\n"...)
 
@@ -833,37 +852,25 @@ func extractIP(addr string) string {
 		return ""
 	}
 	if addr[0] == '[' {
-		end := -1
 		for i := 1; i < len(addr); i++ {
 			if addr[i] == ']' {
-				end = i
-				break
-			}
-		}
-		if end > 1 {
-			return addr[1:end]
-		}
-	}
-	if addr[len(addr)-1] >= '0' && addr[len(addr)-1] <= '9' {
-		for i := len(addr) - 1; i >= 0; i-- {
-			if addr[i] == ':' {
-				return addr[:i]
+				return addr[1:i]
 			}
 		}
 		return addr
 	}
-	idx := -1
+	lastColon := -1
 	for i := len(addr) - 1; i >= 0; i-- {
 		if addr[i] == ':' {
-			idx = i
-			break
+			if lastColon == -1 {
+				lastColon = i
+			} else {
+				return addr
+			}
 		}
 	}
-	if idx >= 0 {
-		if addr[0] == '[' && idx > 0 && addr[idx-1] == ']' {
-			return addr[1 : idx-1]
-		}
-		return addr[:idx]
+	if lastColon >= 0 {
+		return addr[:lastColon]
 	}
 	return addr
 }
@@ -872,30 +879,23 @@ func stripPort(host string) string {
 	if host == "" {
 		return ""
 	}
-	idx := -1
+	if host[0] == '[' {
+		if bracket := indexByte(host, ']'); bracket > 0 {
+			return host[1:bracket]
+		}
+		return host
+	}
+	lastColon := -1
 	for i := len(host) - 1; i >= 0; i-- {
 		if host[i] == ':' {
-			idx = i
-			break
+			if lastColon >= 0 {
+				return host
+			}
+			lastColon = i
 		}
 	}
-	if idx >= 0 {
-		hasBracket := false
-		bracket := -1
-		for i := len(host) - 1; i >= 0; i-- {
-			if host[i] == ']' {
-				hasBracket = true
-				bracket = i
-				break
-			}
-		}
-		if hasBracket {
-			if bracket < idx {
-				return host[:idx]
-			}
-			return host
-		}
-		return host[:idx]
+	if lastColon > 0 {
+		return host[:lastColon]
 	}
 	return host
 }
