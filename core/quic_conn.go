@@ -38,9 +38,15 @@ type QUICConn struct {
 	recvLargest [3]int64
 	loss        *quicLossState
 	cryptoBuf   [3][]byte
+	cryptoRcv   [3][]bool
 
-	tlsState   *quicTLSState
+	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
+	firstFlight   struct {
+		serverHello []byte
+		ee, cert, cv, fin []byte
+		sent bool
+	}
 
 	streams      map[uint64]*QUICStream
 	streamsMu    sync.Mutex
@@ -127,6 +133,12 @@ func (qc *QUICConn) handlePacket(data []byte) {
 }
 
 func (qc *QUICConn) recvLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[QUIC-PANIC] recvLoop panic: %v", r)
+		}
+	}()
+	log.Printf("[QUIC-DBG] recvLoop started for %s", qc.remoteAddr.String())
 	for {
 		select {
 		case data := <-qc.inbound:
@@ -139,6 +151,7 @@ func (qc *QUICConn) recvLoop() {
 }
 
 func (qc *QUICConn) processPacket(data []byte) {
+	log.Printf("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
 	for len(data) > 0 {
 		if quicIsLongHeader(data) {
 			consumed := qc.handleLongHeaderPacket(data)
@@ -156,9 +169,13 @@ func (qc *QUICConn) processPacket(data []byte) {
 func (qc *QUICConn) handleLongHeaderPacket(data []byte) int {
 	hdr, total, err := quicParseLongHeader(data)
 	if err != nil {
+		log.Printf("[QUIC-DBG] parseLongHeader failed: %v (dataLen=%d)", err, len(data))
 		return 0
 	}
 	packet := data[:total]
+
+	log.Printf("[QUIC-DBG] longHeader: type=%d ver=0x%08x dcid=%x scid=%x total=%d pnOff=%d payOff=%d payLen=%d",
+		hdr.pktType, hdr.version, hdr.dcid, hdr.scid, total, hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
 
 	switch hdr.pktType {
 	case quicPktInitial:
@@ -191,28 +208,34 @@ func (qc *QUICConn) handleShortHeaderPacket(data []byte) {
 func (qc *QUICConn) handleInitialPacket(packet []byte, hdr *quicPacketHeader) {
 	keys := qc.keys[quicSpaceInitial]
 	if keys == nil || !keys.valid {
+		log.Printf("[QUIC-DBG] handleInitial: no keys (nil=%v)", keys == nil)
 		return
 	}
 
 	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceInitial])
 	if err != nil {
+		log.Printf("[QUIC-DBG] handleInitial: decrypt failed: %v (pktLen=%d pnOff=%d payOff=%d payLen=%d)", err, len(packet), hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
 		return
 	}
 
+	log.Printf("[QUIC-DBG] handleInitial: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
 	qc.processFrames(quicSpaceInitial, hdr.pn, plaintext)
 }
 
 func (qc *QUICConn) handleHandshakePacket(packet []byte, hdr *quicPacketHeader) {
 	keys := qc.keys[quicSpaceHandshake]
 	if keys == nil || !keys.valid {
+		log.Printf("[QUIC-DBG] handleHandshake: no keys (nil=%v valid=%v)", keys == nil, keys != nil && keys.valid)
 		return
 	}
 
 	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceHandshake])
 	if err != nil {
+		log.Printf("[QUIC-DBG] handleHandshake: decrypt failed: %v", err)
 		return
 	}
 
+	log.Printf("[QUIC-DBG] handleHandshake: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
 	qc.processFrames(quicSpaceHandshake, hdr.pn, plaintext)
 }
 
@@ -274,7 +297,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		return
 	}
 
-	if needsAck {
+	if needsAck && (space != quicSpaceInitial || qc.handshakeDone.Load()) {
 		qc.sendACK(space)
 	}
 }
@@ -283,15 +306,39 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 	if qc.tlsState == nil {
 		return
 	}
+
 	end := f.offset + uint64(len(f.data))
-	if end <= uint64(len(qc.cryptoBuf[space])) {
+	if end > uint64(len(qc.cryptoBuf[space])) {
+		grownBuf := make([]byte, end)
+		copy(grownBuf, qc.cryptoBuf[space])
+		grownRcv := make([]bool, end)
+		copy(grownRcv, qc.cryptoRcv[space])
+		qc.cryptoBuf[space] = grownBuf
+		qc.cryptoRcv[space] = grownRcv
+	}
+	copy(qc.cryptoBuf[space][f.offset:], f.data)
+	for i := f.offset; i < end; i++ {
+		qc.cryptoRcv[space][i] = true
+	}
+
+	if len(qc.cryptoBuf[space]) < 4 || !qc.cryptoRcv[space][0] || !qc.cryptoRcv[space][1] || !qc.cryptoRcv[space][2] || !qc.cryptoRcv[space][3] {
 		return
 	}
-	if f.offset <= uint64(len(qc.cryptoBuf[space])) {
-		newData := f.data[uint64(len(qc.cryptoBuf[space]))-f.offset:]
-		qc.cryptoBuf[space] = append(qc.cryptoBuf[space], newData...)
+
+	msgLen := int(qc.cryptoBuf[space][1])<<16 | int(qc.cryptoBuf[space][2])<<8 | int(qc.cryptoBuf[space][3])
+	needed := 4 + msgLen
+	if len(qc.cryptoBuf[space]) < needed {
+		return
 	}
-	qc.tlsState.handleCryptoData(qc, space, qc.cryptoBuf[space])
+
+	for i := 0; i < needed; i++ {
+		if !qc.cryptoRcv[space][i] {
+			return
+		}
+	}
+
+	log.Printf("[QUIC-DBG] handleCryptoFrame: space=%d complete message %d bytes, all bytes verified", space, needed)
+	qc.tlsState.handleCryptoData(qc, space, qc.cryptoBuf[space][:needed])
 }
 
 func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
@@ -342,9 +389,20 @@ func (qc *QUICConn) openLocalUniStream() *QUICStream {
 }
 
 func (qc *QUICConn) sendCrypto(space int, data []byte) {
-	var frames []byte
-	frames = quicAppendCryptoFrame(frames, 0, data)
-	qc.sendFrames(space, frames, true)
+	const maxCryptoPerPacket = 1000
+	offset := uint64(0)
+	for len(data) > 0 {
+		chunk := data
+		if len(chunk) > maxCryptoPerPacket {
+			chunk = data[:maxCryptoPerPacket]
+		}
+		var frames []byte
+		frames = quicAppendCryptoFrame(frames, offset, chunk)
+		qc.sendFrames(space, frames, true)
+		log.Printf("[QUIC-DBG] sendCrypto: space=%d offset=%d chunkLen=%d remaining=%d", space, offset, len(chunk), len(data)-len(chunk))
+		offset += uint64(len(chunk))
+		data = data[len(chunk):]
+	}
 }
 
 func (qc *QUICConn) sendACK(space int) {
@@ -353,7 +411,7 @@ func (qc *QUICConn) sendACK(space int) {
 		return
 	}
 	var frames []byte
-	frames = quicAppendACKFrame(frames, uint64(largest), 0, uint64(largest))
+	frames = quicAppendACKFrame(frames, uint64(largest), 0, 0)
 	qc.sendFrames(space, frames, false)
 }
 
@@ -390,11 +448,14 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 	}
 
 	if len(packet) > 0 {
+		var sendErr error
 		if qc.uringUDP != nil && qc.udpAddr != nil {
-			qc.uringUDP.sendTo(packet, qc.udpAddr)
+			_, sendErr = qc.uringUDP.sendTo(packet, qc.udpAddr)
 		} else if qc.udpConn != nil {
-			qc.udpConn.WriteTo(packet, qc.remoteAddr)
+			_, sendErr = qc.udpConn.WriteTo(packet, qc.remoteAddr)
 		}
+		log.Printf("[QUIC-DBG] sendFrames: space=%d pn=%d pktLen=%d framesLen=%d sendErr=%v dst=%v",
+			space, pn, len(packet), len(frames), sendErr, qc.udpAddr)
 		qc.loss.onPacketSent(space, pn, len(packet), ackEliciting, frames)
 	}
 }
@@ -414,6 +475,126 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 	}
+}
+
+func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
+	if !qc.firstFlight.sent {
+		qc.firstFlight.serverHello = make([]byte, len(serverHello))
+		copy(qc.firstFlight.serverHello, serverHello)
+		qc.firstFlight.ee = make([]byte, len(ee))
+		copy(qc.firstFlight.ee, ee)
+		qc.firstFlight.cert = make([]byte, len(cert))
+		copy(qc.firstFlight.cert, cert)
+		qc.firstFlight.cv = make([]byte, len(cv))
+		copy(qc.firstFlight.cv, cv)
+		qc.firstFlight.fin = make([]byte, len(fin))
+		copy(qc.firstFlight.fin, fin)
+		qc.firstFlight.sent = true
+	}
+
+	qc.writeMu.Lock()
+	defer qc.writeMu.Unlock()
+
+	initialKeys := qc.sendKeys[quicSpaceInitial]
+	if initialKeys == nil || !initialKeys.valid {
+		initialKeys = qc.keys[quicSpaceInitial]
+	}
+	hsKeys := qc.sendKeys[quicSpaceHandshake]
+	if hsKeys == nil || !hsKeys.valid {
+		hsKeys = qc.keys[quicSpaceHandshake]
+	}
+	if initialKeys == nil || hsKeys == nil {
+		log.Printf("[QUIC-DBG] sendFirstFlight: missing keys")
+		return
+	}
+
+	sendDatagram := func(data []byte) {
+		if qc.uringUDP != nil && qc.udpAddr != nil {
+			qc.uringUDP.sendTo(data, qc.udpAddr)
+		} else if qc.udpConn != nil {
+			qc.udpConn.WriteTo(data, qc.remoteAddr)
+		}
+	}
+
+	var initialFrames []byte
+	largest := qc.recvLargest[quicSpaceInitial]
+	if largest >= 0 {
+		initialFrames = quicAppendACKFrame(initialFrames, uint64(largest), 0, 0)
+	}
+	initialFrames = quicAppendCryptoFrame(initialFrames, 0, serverHello)
+
+	pn0 := qc.sendPN[quicSpaceInitial]
+	qc.sendPN[quicSpaceInitial]++
+	la0 := qc.loss.largestAcked[quicSpaceInitial]
+
+	var hsMessages []byte
+	hsMessages = append(hsMessages, ee...)
+	hsMessages = append(hsMessages, cert...)
+	hsMessages = append(hsMessages, cv...)
+	hsMessages = append(hsMessages, fin...)
+
+	const maxCryptoPerPacket = 1000
+
+	firstHSChunk := hsMessages
+	if len(firstHSChunk) > maxCryptoPerPacket {
+		firstHSChunk = hsMessages[:maxCryptoPerPacket]
+	}
+	var firstHSFrames []byte
+	firstHSFrames = quicAppendCryptoFrame(firstHSFrames, 0, firstHSChunk)
+	pnHS0 := qc.sendPN[quicSpaceHandshake]
+	qc.sendPN[quicSpaceHandshake]++
+	laHS := qc.loss.largestAcked[quicSpaceHandshake]
+	firstHSPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), firstHSFrames, pnHS0, laHS, hsKeys)
+
+	log.Printf("[H3-DBG] sendFirstFlight: building Initial pkt dcid=%x scid=%x pn=%d", qc.dstCID(), qc.srcCID(), pn0)
+	initialPkt := quicBuildInitialPacket(nil, qc.dstCID(), qc.srcCID(), nil, initialFrames, pn0, la0, initialKeys)
+	log.Printf("[H3-DBG] sendFirstFlight: Initial pkt %d bytes, first20=%x", len(initialPkt), initialPkt[:min(20, len(initialPkt))])
+	log.Printf("[H3-DBG] sendFirstFlight: HS0 pkt %d bytes, first20=%x", len(firstHSPkt), firstHSPkt[:min(20, len(firstHSPkt))])
+	datagram := make([]byte, 0, quicMaxPacketSize+len(firstHSPkt))
+	datagram = append(datagram, initialPkt...)
+	datagram = append(datagram, firstHSPkt...)
+
+	if len(datagram) < quicMaxPacketSize {
+		padNeeded := quicMaxPacketSize - len(datagram)
+		paddedFrames := make([]byte, len(initialFrames)+padNeeded)
+		copy(paddedFrames, initialFrames)
+		initialPkt = quicBuildInitialPacket(nil, qc.dstCID(), qc.srcCID(), nil, paddedFrames, pn0, la0, initialKeys)
+		datagram = datagram[:0]
+		datagram = append(datagram, initialPkt...)
+		datagram = append(datagram, firstHSPkt...)
+	}
+	log.Printf("[H3-DBG] sendFirstFlight: datagram1 %d bytes (initial=%d hs=%d) first50=%x hsStart=%x",
+		len(datagram), len(initialPkt), len(firstHSPkt),
+		datagram[:min(50, len(datagram))],
+		datagram[len(initialPkt):min(len(initialPkt)+20, len(datagram))])
+	sendDatagram(datagram)
+	qc.loss.onPacketSent(quicSpaceInitial, pn0, quicMaxPacketSize, true, initialFrames)
+	qc.loss.onPacketSent(quicSpaceHandshake, pnHS0, len(firstHSPkt), true, firstHSFrames)
+
+	hsOffset := uint64(len(firstHSChunk))
+	remaining := hsMessages[len(firstHSChunk):]
+	chunkIdx := 1
+	for len(remaining) > 0 {
+		chunk := remaining
+		if len(chunk) > maxCryptoPerPacket {
+			chunk = remaining[:maxCryptoPerPacket]
+		}
+		var hsFrames []byte
+		hsFrames = quicAppendCryptoFrame(hsFrames, hsOffset, chunk)
+		pnHS := qc.sendPN[quicSpaceHandshake]
+		qc.sendPN[quicSpaceHandshake]++
+		hsPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), hsFrames, pnHS, laHS, hsKeys)
+		log.Printf("[H3-DBG] sendFirstFlight: datagram%d (HS%d) %d bytes, crypto offset=%d len=%d",
+			chunkIdx+1, chunkIdx, len(hsPkt), hsOffset, len(chunk))
+		sendDatagram(hsPkt)
+		qc.loss.onPacketSent(quicSpaceHandshake, pnHS, len(hsPkt), true, hsFrames)
+		hsOffset += uint64(len(chunk))
+		remaining = remaining[len(chunk):]
+		chunkIdx++
+	}
+
+	log.Printf("[H3-DBG] sendFirstFlight: total %d datagrams, hsMessages=%d bytes across %d chunks",
+		chunkIdx+1, len(hsMessages), chunkIdx)
 }
 
 func (qc *QUICConn) retransmitFrames(space int, frames []byte) {

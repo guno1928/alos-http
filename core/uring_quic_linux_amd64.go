@@ -4,6 +4,7 @@ package core
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -162,8 +163,10 @@ func (c *ioUringUDPConn) sendTo(buf []byte, addr *net.UDPAddr) (int, error) {
 
 	err := syscall.Sendto(c.fd, buf, syscall.MSG_DONTWAIT, sa)
 	if err != nil {
+		log.Printf("[H3-DBG] sendTo: FAILED %d bytes to %s: %v", len(buf), addr, err)
 		return 0, err
 	}
+	log.Printf("[H3-DBG] sendTo: sent %d bytes to %s fd=%d", len(buf), addr, c.fd)
 	return len(buf), nil
 }
 
