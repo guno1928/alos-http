@@ -370,7 +370,10 @@ func (r *Response) Redirect(url string, code int) *Response {
 	}
 	r.StatusCode = code
 	r.SetHeader("Location", url)
-	r.HTML("<html><head><meta http-equiv=\"refresh\" content=\"0;url=" + url + "\"></head><body></body></html>")
+	r.body = r.body[:0]
+	r.bodyString = ""
+	r.bodyIsText = false
+	r.ContentType = ""
 	return r
 }
 
