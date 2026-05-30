@@ -752,13 +752,13 @@ func (s *Server) serveTLSFallbackWithPrefix(conn net.Conn, prefix []byte, addr s
 
 	if state.NegotiatedProtocol == "h2" {
 		Stats.H2Conns.Add(1)
-		if s.logRequests.Load() {
+		if debugFlag.Load() {
 			log.Printf("[%s] serving HTTP/2 (%s fallback)", addr, ver)
 		}
 		s.ServeH2Plain(tlsConn)
 	} else {
 		Stats.H1Conns.Add(1)
-		if s.logRequests.Load() {
+		if debugFlag.Load() {
 			log.Printf("[%s] serving HTTP/1.1 (%s fallback)", addr, ver)
 		}
 		s.ServeH1Plain(tlsConn)
@@ -1318,7 +1318,9 @@ func (s *Server) SetHTTPRoutes(routes []HTTPRoute) {
 		s.httpRouter = newHTTPRouter()
 	}
 	s.httpRouter.SetRoutes(routes)
-	log.Printf("[HTTP-ROUTE] %d route(s) configured", len(routes))
+	if debugFlag.Load() {
+		log.Printf("[HTTP-ROUTE] %d route(s) configured", len(routes))
+	}
 }
 
 func (s *Server) AddHTTPRoute(route HTTPRoute) {
@@ -1326,13 +1328,17 @@ func (s *Server) AddHTTPRoute(route HTTPRoute) {
 		s.httpRouter = newHTTPRouter()
 	}
 	s.httpRouter.AddRoute(route)
-	log.Printf("[HTTP-ROUTE] added: %s -> %s", route.PathPrefix, route.Backend)
+	if debugFlag.Load() {
+		log.Printf("[HTTP-ROUTE] added: %s -> %s", route.PathPrefix, route.Backend)
+	}
 }
 
 func (s *Server) RemoveHTTPRoute(pathPrefix string) {
 	if s.httpRouter != nil {
 		s.httpRouter.RemoveRoute(pathPrefix)
-		log.Printf("[HTTP-ROUTE] removed: %s", pathPrefix)
+		if debugFlag.Load() {
+			log.Printf("[HTTP-ROUTE] removed: %s", pathPrefix)
+		}
 	}
 }
 

@@ -232,26 +232,34 @@ func (hc *H2Conn) readAndValidatePreface() bool {
 	}
 	_, rec, recBP, err := ReadRecordSkipCCS(hc.conn, hc.hdrBuf)
 	if err != nil {
-		log.Printf("[H2] read preface record: %v", err)
+		if debugFlag.Load() {
+			log.Printf("[H2] read preface record: %v", err)
+		}
 		return false
 	}
 
 	pt, err := hc.reader.Decrypt(rec)
 	if err != nil {
-		log.Printf("[H2] decrypt preface: %v", err)
+		if debugFlag.Load() {
+			log.Printf("[H2] decrypt preface: %v", err)
+		}
 		ReleaseRecordBuf(recBP)
 		return false
 	}
 
 	content, ct, err := StripInnerPlaintext(pt)
 	if err != nil || ct != 0x17 {
-		log.Printf("[H2] preface inner type: 0x%02x err=%v", ct, err)
+		if debugFlag.Load() {
+			log.Printf("[H2] preface inner type: 0x%02x err=%v", ct, err)
+		}
 		ReleaseRecordBuf(recBP)
 		return false
 	}
 
 	if len(content) < H2PrefaceLen {
-		log.Printf("[H2] preface too short: %d bytes", len(content))
+		if debugFlag.Load() {
+			log.Printf("[H2] preface too short: %d bytes", len(content))
+		}
 		ReleaseRecordBuf(recBP)
 		return false
 	}
@@ -263,7 +271,9 @@ func (hc *H2Conn) readAndValidatePreface() bool {
 		}
 	}
 	if !prefaceOk {
-		log.Printf("[H2] bad preface")
+		if debugFlag.Load() {
+			log.Printf("[H2] bad preface")
+		}
 		ReleaseRecordBuf(recBP)
 		return false
 	}
@@ -325,7 +335,9 @@ func (hc *H2Conn) readAppData() error {
 	}
 	if ct == 0x15 {
 		if len(content) >= 2 {
-			log.Printf("[H2] TLS alert from peer: level=%d desc=%d", content[0], content[1])
+			if debugFlag.Load() {
+				log.Printf("[H2] TLS alert from peer: level=%d desc=%d", content[0], content[1])
+			}
 		}
 		ReleaseRecordBuf(recBP)
 		return ErrH2GoAway

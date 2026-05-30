@@ -66,6 +66,9 @@ var (
 )
 
 func logIOUringStartupProbe() {
+	if !debugFlag.Load() {
+		return
+	}
 	for _, line := range ioUringStartupProbeLines(getIOUringStartupProbe()) {
 		log.Print(line)
 	}
@@ -127,6 +130,9 @@ func runIOUringStartupProbe() ioUringStartupProbeResult {
 }
 
 func logIOUringStartupProbeResult(result ioUringStartupProbeResult) {
+	if !debugFlag.Load() {
+		return
+	}
 	for _, line := range ioUringStartupProbeLines(result) {
 		log.Print(line)
 	}

@@ -138,7 +138,9 @@ func (qc *QUICConn) recvLoop() {
 			log.Printf("[QUIC-PANIC] recvLoop panic: %v", r)
 		}
 	}()
-	log.Printf("[QUIC-DBG] recvLoop started for %s", qc.remoteAddr.String())
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] recvLoop started for %s", qc.remoteAddr.String())
+	}
 	for {
 		select {
 		case data := <-qc.inbound:
@@ -151,7 +153,9 @@ func (qc *QUICConn) recvLoop() {
 }
 
 func (qc *QUICConn) processPacket(data []byte) {
-	log.Printf("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
+	}
 	for len(data) > 0 {
 		if quicIsLongHeader(data) {
 			consumed := qc.handleLongHeaderPacket(data)
@@ -169,13 +173,17 @@ func (qc *QUICConn) processPacket(data []byte) {
 func (qc *QUICConn) handleLongHeaderPacket(data []byte) int {
 	hdr, total, err := quicParseLongHeader(data)
 	if err != nil {
-		log.Printf("[QUIC-DBG] parseLongHeader failed: %v (dataLen=%d)", err, len(data))
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] parseLongHeader failed: %v (dataLen=%d)", err, len(data))
+		}
 		return 0
 	}
 	packet := data[:total]
 
-	log.Printf("[QUIC-DBG] longHeader: type=%d ver=0x%08x dcid=%x scid=%x total=%d pnOff=%d payOff=%d payLen=%d",
-		hdr.pktType, hdr.version, hdr.dcid, hdr.scid, total, hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] longHeader: type=%d ver=0x%08x dcid=%x scid=%x total=%d pnOff=%d payOff=%d payLen=%d",
+			hdr.pktType, hdr.version, hdr.dcid, hdr.scid, total, hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
+	}
 
 	switch hdr.pktType {
 	case quicPktInitial:
@@ -208,34 +216,46 @@ func (qc *QUICConn) handleShortHeaderPacket(data []byte) {
 func (qc *QUICConn) handleInitialPacket(packet []byte, hdr *quicPacketHeader) {
 	keys := qc.keys[quicSpaceInitial]
 	if keys == nil || !keys.valid {
-		log.Printf("[QUIC-DBG] handleInitial: no keys (nil=%v)", keys == nil)
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleInitial: no keys (nil=%v)", keys == nil)
+		}
 		return
 	}
 
 	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceInitial])
 	if err != nil {
-		log.Printf("[QUIC-DBG] handleInitial: decrypt failed: %v (pktLen=%d pnOff=%d payOff=%d payLen=%d)", err, len(packet), hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleInitial: decrypt failed: %v (pktLen=%d pnOff=%d payOff=%d payLen=%d)", err, len(packet), hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
+		}
 		return
 	}
 
-	log.Printf("[QUIC-DBG] handleInitial: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handleInitial: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
+	}
 	qc.processFrames(quicSpaceInitial, hdr.pn, plaintext)
 }
 
 func (qc *QUICConn) handleHandshakePacket(packet []byte, hdr *quicPacketHeader) {
 	keys := qc.keys[quicSpaceHandshake]
 	if keys == nil || !keys.valid {
-		log.Printf("[QUIC-DBG] handleHandshake: no keys (nil=%v valid=%v)", keys == nil, keys != nil && keys.valid)
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleHandshake: no keys (nil=%v valid=%v)", keys == nil, keys != nil && keys.valid)
+		}
 		return
 	}
 
 	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceHandshake])
 	if err != nil {
-		log.Printf("[QUIC-DBG] handleHandshake: decrypt failed: %v", err)
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleHandshake: decrypt failed: %v", err)
+		}
 		return
 	}
 
-	log.Printf("[QUIC-DBG] handleHandshake: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handleHandshake: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
+	}
 	qc.processFrames(quicSpaceHandshake, hdr.pn, plaintext)
 }
 
@@ -337,7 +357,9 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 		}
 	}
 
-	log.Printf("[QUIC-DBG] handleCryptoFrame: space=%d complete message %d bytes, all bytes verified", space, needed)
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handleCryptoFrame: space=%d complete message %d bytes, all bytes verified", space, needed)
+	}
 	qc.tlsState.handleCryptoData(qc, space, qc.cryptoBuf[space][:needed])
 }
 
@@ -399,7 +421,9 @@ func (qc *QUICConn) sendCrypto(space int, data []byte) {
 		var frames []byte
 		frames = quicAppendCryptoFrame(frames, offset, chunk)
 		qc.sendFrames(space, frames, true)
-		log.Printf("[QUIC-DBG] sendCrypto: space=%d offset=%d chunkLen=%d remaining=%d", space, offset, len(chunk), len(data)-len(chunk))
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] sendCrypto: space=%d offset=%d chunkLen=%d remaining=%d", space, offset, len(chunk), len(data)-len(chunk))
+		}
 		offset += uint64(len(chunk))
 		data = data[len(chunk):]
 	}
@@ -454,8 +478,10 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 		} else if qc.udpConn != nil {
 			_, sendErr = qc.udpConn.WriteTo(packet, qc.remoteAddr)
 		}
-		log.Printf("[QUIC-DBG] sendFrames: space=%d pn=%d pktLen=%d framesLen=%d sendErr=%v dst=%v",
-			space, pn, len(packet), len(frames), sendErr, qc.udpAddr)
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] sendFrames: space=%d pn=%d pktLen=%d framesLen=%d sendErr=%v dst=%v",
+				space, pn, len(packet), len(frames), sendErr, qc.udpAddr)
+		}
 		qc.loss.onPacketSent(space, pn, len(packet), ackEliciting, frames)
 	}
 }
@@ -504,7 +530,9 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		hsKeys = qc.keys[quicSpaceHandshake]
 	}
 	if initialKeys == nil || hsKeys == nil {
-		log.Printf("[QUIC-DBG] sendFirstFlight: missing keys")
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] sendFirstFlight: missing keys")
+		}
 		return
 	}
 
@@ -546,10 +574,14 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	laHS := qc.loss.largestAcked[quicSpaceHandshake]
 	firstHSPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), firstHSFrames, pnHS0, laHS, hsKeys)
 
-	log.Printf("[H3-DBG] sendFirstFlight: building Initial pkt dcid=%x scid=%x pn=%d", qc.dstCID(), qc.srcCID(), pn0)
+	if debugFlag.Load() {
+		log.Printf("[H3-DBG] sendFirstFlight: building Initial pkt dcid=%x scid=%x pn=%d", qc.dstCID(), qc.srcCID(), pn0)
+	}
 	initialPkt := quicBuildInitialPacket(nil, qc.dstCID(), qc.srcCID(), nil, initialFrames, pn0, la0, initialKeys)
-	log.Printf("[H3-DBG] sendFirstFlight: Initial pkt %d bytes, first20=%x", len(initialPkt), initialPkt[:min(20, len(initialPkt))])
-	log.Printf("[H3-DBG] sendFirstFlight: HS0 pkt %d bytes, first20=%x", len(firstHSPkt), firstHSPkt[:min(20, len(firstHSPkt))])
+	if debugFlag.Load() {
+		log.Printf("[H3-DBG] sendFirstFlight: Initial pkt %d bytes, first20=%x", len(initialPkt), initialPkt[:min(20, len(initialPkt))])
+		log.Printf("[H3-DBG] sendFirstFlight: HS0 pkt %d bytes, first20=%x", len(firstHSPkt), firstHSPkt[:min(20, len(firstHSPkt))])
+	}
 	datagram := make([]byte, 0, quicMaxPacketSize+len(firstHSPkt))
 	datagram = append(datagram, initialPkt...)
 	datagram = append(datagram, firstHSPkt...)
@@ -563,10 +595,12 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		datagram = append(datagram, initialPkt...)
 		datagram = append(datagram, firstHSPkt...)
 	}
-	log.Printf("[H3-DBG] sendFirstFlight: datagram1 %d bytes (initial=%d hs=%d) first50=%x hsStart=%x",
-		len(datagram), len(initialPkt), len(firstHSPkt),
-		datagram[:min(50, len(datagram))],
-		datagram[len(initialPkt):min(len(initialPkt)+20, len(datagram))])
+	if debugFlag.Load() {
+		log.Printf("[H3-DBG] sendFirstFlight: datagram1 %d bytes (initial=%d hs=%d) first50=%x hsStart=%x",
+			len(datagram), len(initialPkt), len(firstHSPkt),
+			datagram[:min(50, len(datagram))],
+			datagram[len(initialPkt):min(len(initialPkt)+20, len(datagram))])
+	}
 	sendDatagram(datagram)
 	qc.loss.onPacketSent(quicSpaceInitial, pn0, quicMaxPacketSize, true, initialFrames)
 	qc.loss.onPacketSent(quicSpaceHandshake, pnHS0, len(firstHSPkt), true, firstHSFrames)
@@ -584,8 +618,10 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		pnHS := qc.sendPN[quicSpaceHandshake]
 		qc.sendPN[quicSpaceHandshake]++
 		hsPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), hsFrames, pnHS, laHS, hsKeys)
-		log.Printf("[H3-DBG] sendFirstFlight: datagram%d (HS%d) %d bytes, crypto offset=%d len=%d",
-			chunkIdx+1, chunkIdx, len(hsPkt), hsOffset, len(chunk))
+		if debugFlag.Load() {
+			log.Printf("[H3-DBG] sendFirstFlight: datagram%d (HS%d) %d bytes, crypto offset=%d len=%d",
+				chunkIdx+1, chunkIdx, len(hsPkt), hsOffset, len(chunk))
+		}
 		sendDatagram(hsPkt)
 		qc.loss.onPacketSent(quicSpaceHandshake, pnHS, len(hsPkt), true, hsFrames)
 		hsOffset += uint64(len(chunk))
@@ -593,8 +629,10 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		chunkIdx++
 	}
 
-	log.Printf("[H3-DBG] sendFirstFlight: total %d datagrams, hsMessages=%d bytes across %d chunks",
-		chunkIdx+1, len(hsMessages), chunkIdx)
+	if debugFlag.Load() {
+		log.Printf("[H3-DBG] sendFirstFlight: total %d datagrams, hsMessages=%d bytes across %d chunks",
+			chunkIdx+1, len(hsMessages), chunkIdx)
+	}
 }
 
 func (qc *QUICConn) retransmitFrames(space int, frames []byte) {

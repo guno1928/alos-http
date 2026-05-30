@@ -82,7 +82,9 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 		case h3FrameHeaders:
 			decoded, decErr := h3.decoder.Decode(payload)
 			if decErr != nil {
-				log.Printf("[H3] QPACK decode error: %v", decErr)
+				if debugFlag.Load() {
+					log.Printf("[H3] QPACK decode error: %v", decErr)
+				}
 				return
 			}
 			for _, h := range decoded {

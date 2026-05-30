@@ -146,7 +146,9 @@ func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, d
 func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, scid []byte, connMap *ShardedMap[string, *QUICConn]) *QUICConn {
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
-		log.Printf("[QUIC] derive initial keys: %v", err)
+		if debugFlag.Load() {
+			log.Printf("[QUIC] derive initial keys: %v", err)
+		}
 		return nil
 	}
 
@@ -165,7 +167,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	go qc.runIdleTimer()
 
 	Stats.TotalConns.Add(1)
-	if s.logRequests.Load() {
+	if debugFlag.Load() {
 		log.Printf("[QUIC] new connection from %s dcid=%s scid=%s", remoteAddr, dcidKey, srcCIDKey)
 	}
 

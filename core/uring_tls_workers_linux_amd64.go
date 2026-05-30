@@ -150,14 +150,20 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 		tlsRecvPath := probeIOUringTLSRecvPathDetailed(workerCount)
 		if !tlsRecvPath.ok {
 			recvMultishotSupported = false
-			log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during live-size startup probe, starting in classic recv mode: %v", tlsRecvPath.err)
+			if debugFlag.Load() {
+				log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during live-size startup probe, starting in classic recv mode: %v", tlsRecvPath.err)
+			}
 		}
 	}
 	if !recvMultishotSupported {
-		log.Printf("[INFO] io_uring multishot recv unavailable during startup probe, starting in classic recv mode")
+		if debugFlag.Load() {
+			log.Printf("[INFO] io_uring multishot recv unavailable during startup probe, starting in classic recv mode")
+		}
 	}
 	if recvMultishotSupported {
-		log.Printf("[INFO] io_uring TLS worker handoff paths require single-owner recv state, starting in classic recv mode")
+		if debugFlag.Load() {
+			log.Printf("[INFO] io_uring TLS worker handoff paths require single-owner recv state, starting in classic recv mode")
+		}
 		recvMultishotSupported = false
 	}
 	backend := &tlsUringBackend{
@@ -230,7 +236,9 @@ func (backend *tlsUringBackend) start() {
 			if errors.Is(err, errTLSPbufUnavailable) {
 				if !pbufDisabled {
 					pbufDisabled = true
-					log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during worker startup, disabling buffered recv for all TLS workers: %v", err)
+					if debugFlag.Load() {
+						log.Printf("[INFO] io_uring TLS provided buffer rings unavailable during worker startup, disabling buffered recv for all TLS workers: %v", err)
+					}
 					backend.disableBufferedRecv()
 				}
 				continue
@@ -559,7 +567,9 @@ func (worker *tlsUringWorker) handleAccept(backend *tlsUringBackend, result int3
 			worker.useMultishotAccept = false
 			worker.acceptArmed = false
 			atomic.StoreInt64(&worker.acceptBackfill, tlsAcceptDepth)
-			log.Printf("[INFO] io_uring multishot accept unavailable on worker %d, falling back to one-shot accepts: %v", worker.id, syscall.Errno(-result))
+			if debugFlag.Load() {
+				log.Printf("[INFO] io_uring multishot accept unavailable on worker %d, falling back to one-shot accepts: %v", worker.id, syscall.Errno(-result))
+			}
 			return nil
 		}
 		if result == -int32(syscall.EINVAL) {
@@ -594,7 +604,9 @@ func (worker *tlsUringWorker) handleRead(conn *tlsWorkerConn, result int32, flag
 			Dbg("[%s] worker read completion result=%d flags=0x%x", conn.remoteAddr, result, flags)
 		}
 		if worker.recvBufs != nil && (result == -int32(syscall.EINVAL) || result == -int32(syscall.ENOSYS)) {
-			log.Printf("[INFO] io_uring multishot recv unavailable on worker %d, falling back to classic recv path: %v", worker.id, syscall.Errno(-result))
+			if debugFlag.Load() {
+				log.Printf("[INFO] io_uring multishot recv unavailable on worker %d, falling back to classic recv path: %v", worker.id, syscall.Errno(-result))
+			}
 			worker.recvBufs.close()
 			worker.recvBufs = nil
 			conn.readArmed = false
@@ -693,7 +705,9 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 			Dbg("tls worker %d buffered read completion result=%d flags=0x%x", worker.id, result, flags)
 		}
 		if result == -int32(syscall.EINVAL) || result == -int32(syscall.ENOSYS) {
-			log.Printf("[INFO] io_uring multishot recv unavailable on worker %d, falling back to classic recv path: %v", worker.id, syscall.Errno(-result))
+			if debugFlag.Load() {
+				log.Printf("[INFO] io_uring multishot recv unavailable on worker %d, falling back to classic recv path: %v", worker.id, syscall.Errno(-result))
+			}
 			if worker.recvBufs != nil {
 				worker.recvBufs.close()
 				worker.recvBufs = nil
@@ -1646,7 +1660,7 @@ func (backend *tlsUringBackend) dispatchAccepted(source *tlsUringWorker, fd int,
 	}
 	if source.active.Load() < 96 {
 		if attached, err := source.tryAttachAccepted(fd, now); attached {
-			if err != nil {
+			if err != nil && debugFlag.Load() {
 				log.Printf("[INFO] io_uring source attach failed on worker %d: %v", source.id, err)
 			}
 			return

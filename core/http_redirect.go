@@ -232,10 +232,14 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 	}
 
 	if hasPrefix(path, "/.well-known/acme-challenge/") {
-		log.Printf("[HTTP] ACME challenge request from %s: %s%s", conn.RemoteAddr(), host, path)
+		if debugFlag.Load() {
+			log.Printf("[HTTP] ACME challenge request from %s: %s%s", conn.RemoteAddr(), host, path)
+		}
 
 		if s.acme != nil && s.acme.acmeNode != "" {
-			log.Printf("[HTTP] proxying ACME challenge to node %s", s.acme.acmeNode)
+			if debugFlag.Load() {
+				log.Printf("[HTTP] proxying ACME challenge to node %s", s.acme.acmeNode)
+			}
 			route := &httpRouteEntry{
 				pathPrefix: "/.well-known/acme-challenge/",
 				addr:       normalizeRouteAddr(s.acme.acmeNode),
@@ -247,13 +251,19 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 		if s.acme != nil {
 			resp, ok := s.acme.HandleHTTP01(path)
 			if ok {
-				log.Printf("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
+				if debugFlag.Load() {
+					log.Printf("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
+				}
 				_ = writeFull(conn, buildACMEResponse(resp))
 				return
 			}
-			log.Printf("[HTTP] ACME challenge NOT FOUND in handler: %s", path)
+			if debugFlag.Load() {
+				log.Printf("[HTTP] ACME challenge NOT FOUND in handler: %s", path)
+			}
 		} else {
-			log.Printf("[HTTP] ACME challenge request but ACME not enabled: %s", path)
+			if debugFlag.Load() {
+				log.Printf("[HTTP] ACME challenge request but ACME not enabled: %s", path)
+			}
 		}
 
 		_ = writeFull(conn, []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))

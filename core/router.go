@@ -161,37 +161,42 @@ func (r *Router) Use(middleware ...MiddlewareFunc) {
 //
 //	r.Handle("GET", "/users/:id", getUser)
 //	r.Handle("GET", "/files/*filepath", serveFiles)
-func (r *Router) Handle(method, path string, handler HandlerFunc) {
+func (r *Router) Handle(method, path string, handler HandlerFunc) *Route {
 	idx := methodIndex(method)
 	if idx < 0 {
-		return
+		return &Route{}
 	}
 	if r.trees[idx] == nil {
 		r.trees[idx] = &node{}
 	}
-	r.addRoute(r.trees[idx], path, handler)
+	n := r.addRoute(r.trees[idx], path, handler)
+	return &Route{node: n, router: r, method: method, path: path}
 }
 
 // GET registers a handler for GET requests at the given path.
-func (r *Router) GET(path string, handler HandlerFunc) { r.Handle("GET", path, handler) }
+func (r *Router) GET(path string, handler HandlerFunc) *Route { return r.Handle("GET", path, handler) }
 
-// POST registers a handler for POST requests at the given path.
-func (r *Router) POST(path string, handler HandlerFunc) { r.Handle("POST", path, handler) }
+func (r *Router) POST(path string, handler HandlerFunc) *Route {
+	return r.Handle("POST", path, handler)
+}
 
-// PUT registers a handler for PUT requests at the given path.
-func (r *Router) PUT(path string, handler HandlerFunc) { r.Handle("PUT", path, handler) }
+func (r *Router) PUT(path string, handler HandlerFunc) *Route { return r.Handle("PUT", path, handler) }
 
-// DELETE registers a handler for DELETE requests at the given path.
-func (r *Router) DELETE(path string, handler HandlerFunc) { r.Handle("DELETE", path, handler) }
+func (r *Router) DELETE(path string, handler HandlerFunc) *Route {
+	return r.Handle("DELETE", path, handler)
+}
 
-// PATCH registers a handler for PATCH requests at the given path.
-func (r *Router) PATCH(path string, handler HandlerFunc) { r.Handle("PATCH", path, handler) }
+func (r *Router) PATCH(path string, handler HandlerFunc) *Route {
+	return r.Handle("PATCH", path, handler)
+}
 
-// HEAD registers a handler for HEAD requests at the given path.
-func (r *Router) HEAD(path string, handler HandlerFunc) { r.Handle("HEAD", path, handler) }
+func (r *Router) HEAD(path string, handler HandlerFunc) *Route {
+	return r.Handle("HEAD", path, handler)
+}
 
-// OPTIONS registers a handler for OPTIONS requests at the given path.
-func (r *Router) OPTIONS(path string, handler HandlerFunc) { r.Handle("OPTIONS", path, handler) }
+func (r *Router) OPTIONS(path string, handler HandlerFunc) *Route {
+	return r.Handle("OPTIONS", path, handler)
+}
 
 var allMethods = [...]string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
 
@@ -222,7 +227,7 @@ func (r *Router) MethodNotAllowed(handler HandlerFunc) {
 	r.methodNotAllowed = handler
 }
 
-func (r *Router) addRoute(root *node, path string, handler HandlerFunc) {
+func (r *Router) addRoute(root *node, path string, handler HandlerFunc) *node {
 	current := root
 	remaining := path
 
@@ -246,7 +251,7 @@ func (r *Router) addRoute(root *node, path string, handler HandlerFunc) {
 		if remaining[0] == '*' {
 			catchName := remaining[1:]
 			current.catchAll = &node{catchName: catchName, handler: handler}
-			return
+			return current.catchAll
 		}
 
 		found := false
@@ -302,13 +307,14 @@ func (r *Router) addRoute(root *node, path string, handler HandlerFunc) {
 			current = newNode
 			if len(remaining) == 0 {
 				current.handler = handler
-				return
+				return current
 			}
 			continue
 		}
 	}
 
 	current.handler = handler
+	return current
 }
 
 func longestCommonPrefix(a, b string) int {
@@ -793,31 +799,37 @@ func (g *RouteGroup) Use(middleware ...MiddlewareFunc) {
 	g.middleware = append(g.middleware, middleware...)
 }
 
-func (g *RouteGroup) handle(method, path string, handler HandlerFunc) {
+func (g *RouteGroup) handle(method, path string, handler HandlerFunc) *Route {
 	h := handler
 	for i := len(g.middleware) - 1; i >= 0; i-- {
 		h = g.middleware[i](h)
 	}
-	g.router.Handle(method, g.prefix+path, h)
+	return g.router.Handle(method, g.prefix+path, h)
 }
 
-// GET registers a GET handler on the group.
-func (g *RouteGroup) GET(path string, handler HandlerFunc) { g.handle("GET", path, handler) }
+func (g *RouteGroup) GET(path string, handler HandlerFunc) *Route {
+	return g.handle("GET", path, handler)
+}
 
-// POST registers a POST handler on the group.
-func (g *RouteGroup) POST(path string, handler HandlerFunc) { g.handle("POST", path, handler) }
+func (g *RouteGroup) POST(path string, handler HandlerFunc) *Route {
+	return g.handle("POST", path, handler)
+}
 
-// PUT registers a PUT handler on the group.
-func (g *RouteGroup) PUT(path string, handler HandlerFunc) { g.handle("PUT", path, handler) }
+func (g *RouteGroup) PUT(path string, handler HandlerFunc) *Route {
+	return g.handle("PUT", path, handler)
+}
 
-// DELETE registers a DELETE handler on the group.
-func (g *RouteGroup) DELETE(path string, handler HandlerFunc) { g.handle("DELETE", path, handler) }
+func (g *RouteGroup) DELETE(path string, handler HandlerFunc) *Route {
+	return g.handle("DELETE", path, handler)
+}
 
-// PATCH registers a PATCH handler on the group.
-func (g *RouteGroup) PATCH(path string, handler HandlerFunc) { g.handle("PATCH", path, handler) }
+func (g *RouteGroup) PATCH(path string, handler HandlerFunc) *Route {
+	return g.handle("PATCH", path, handler)
+}
 
-// HEAD registers a HEAD handler on the group.
-func (g *RouteGroup) HEAD(path string, handler HandlerFunc) { g.handle("HEAD", path, handler) }
+func (g *RouteGroup) HEAD(path string, handler HandlerFunc) *Route {
+	return g.handle("HEAD", path, handler)
+}
 
 // OPTIONS registers an OPTIONS handler on the group.
 func (g *RouteGroup) OPTIONS(path string, handler HandlerFunc) { g.handle("OPTIONS", path, handler) }
