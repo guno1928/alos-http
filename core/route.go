@@ -20,10 +20,13 @@ func (rt *Route) Limit(maxRequests int64, window time.Duration) *Route {
 		window = time.Minute
 	}
 
-	limiter := RateLimitMiddleware(RateLimitMiddlewareConfig{
+	cfg := RateLimitMiddlewareConfig{
 		MaxRequests: maxRequests,
 		Window:      window,
-	})
+	}
+	rt.applyServerRateLimitDefaults(&cfg)
+
+	limiter := RateLimitMiddleware(cfg)
 
 	rt.node.handler = limiter(rt.node.handler)
 	return rt
@@ -40,12 +43,28 @@ func (rt *Route) LimitByKey(maxRequests int64, window time.Duration, keyFunc fun
 		window = time.Minute
 	}
 
-	limiter := RateLimitMiddleware(RateLimitMiddlewareConfig{
+	cfg := RateLimitMiddlewareConfig{
 		MaxRequests: maxRequests,
 		Window:      window,
 		KeyFunc:     keyFunc,
-	})
+	}
+	rt.applyServerRateLimitDefaults(&cfg)
+
+	limiter := RateLimitMiddleware(cfg)
 
 	rt.node.handler = limiter(rt.node.handler)
 	return rt
+}
+
+func (rt *Route) applyServerRateLimitDefaults(cfg *RateLimitMiddlewareConfig) {
+	if rt.router == nil || rt.router.server == nil {
+		return
+	}
+	s := rt.router.server
+	cfg.OnLimit = func(event RateLimitEvent, req *Request, resp *Response) bool {
+		if s.RateLimit != nil && s.RateLimit.OnLimit != nil {
+			return s.RateLimit.OnLimit(event, req, resp)
+		}
+		return false
+	}
 }

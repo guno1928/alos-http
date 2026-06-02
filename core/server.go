@@ -39,6 +39,13 @@ var timeNow = time.Now
 //     TLS entirely.
 //   - DisableHTTP2: when true the server never negotiates HTTP/2 and only
 //     serves HTTP/1.1 over TLS.
+//   - ProxyMode: enable when the server runs behind a reverse proxy / load
+//     balancer. The server then trusts the X-Forwarded-For / X-Real-IP headers
+//     and rewrites RemoteAddr to the real client IP for every request (rate
+//     limiting, logging, and handlers all see the client). Leave it off when the
+//     server is internet-facing, otherwise clients can spoof their IP. When on,
+//     TrustedProxies is ignored (all peers are trusted); leave ProxyMode off and
+//     set TrustedProxies to trust forwarding headers only from specific peers.
 //   - IdleTimeout: how long an idle keep-alive connection stays open.
 //   - HandshakeTimeout: deadline for the TLS handshake.
 //   - MaxBodySize: reject request bodies larger than this (0 = unlimited).
@@ -88,6 +95,7 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	PlainHTTP       bool
 	DisableHTTP2    bool
+	ProxyMode       bool
 }
 
 // DefaultConfig returns a Config with sensible defaults. It listens on
@@ -108,7 +116,7 @@ func DefaultConfig() Config {
 		ServerName:        "ALOS",
 		CompressLevel:     6,
 		CompressMinSize:   256,
-		WorkerCount:       12,
+		WorkerCount:       0,
 		Listeners:         1,
 		Debug:             false,
 		LogRequests:       true,
@@ -168,6 +176,8 @@ type Server struct {
 	logRequests atomic.Bool
 
 	config         Config
+	caps           Capabilities
+	capsLogOnce    sync.Once
 	Router         *Router
 	CORS           *CORSEngine
 	RateLimit      *RateLimitEngine
@@ -278,15 +288,25 @@ func New(configs ...Config) *Server {
 	if cfg.CompressMinSize == 0 {
 		cfg.CompressMinSize = 256
 	}
+	if cfg.WorkerCount <= 0 {
+		cfg.WorkerCount = autoWorkerCount()
+	}
+	if cfg.Listeners <= 0 {
+		cfg.Listeners = autoListenerCount()
+	}
 
 	s := &Server{
 		config:    cfg,
+		caps:      DetectCapabilities(),
 		Router:    NewRouter(),
 		certStore: NewCertStore(),
 		done:      make(chan struct{}),
 		drainDone: make(chan struct{}),
 	}
-	if len(cfg.TrustedProxies) > 0 {
+	s.Router.server = s
+	if cfg.ProxyMode {
+		s.trustedProxies = newTrustedProxyMatcher(nil, true)
+	} else if len(cfg.TrustedProxies) > 0 {
 		s.trustedProxies = newTrustedProxyMatcher(cfg.TrustedProxies, false)
 	}
 	if cfg.MaxRequestsPerIP > 0 {
@@ -305,6 +325,26 @@ func New(configs ...Config) *Server {
 	}
 
 	return s
+}
+
+const autoWorkerCap = 128
+
+func autoWorkerCount() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	if n > autoWorkerCap {
+		n = autoWorkerCap
+	}
+	return n
+}
+
+func autoListenerCount() int {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return 1
+	}
+	return autoWorkerCount()
 }
 
 func NewServer(addr string) *Server {
@@ -360,6 +400,7 @@ func (s *Server) IsDebug() bool {
 //
 //	log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ListenAndServeTLS() error {
+	s.logCapabilities()
 	maybeRaiseProcessFileLimit()
 	logIOUringStartupProbe()
 	if err := s.loadCerts(); err != nil {
@@ -431,7 +472,18 @@ func (s *Server) ListenAndServeTLS() error {
 //	s := core.New(core.Config{Addr: ":80", PlainHTTP: true})
 //	s.Router.GET("/", handler)
 //	log.Fatal(s.ListenAndServe())
+func (s *Server) Capabilities() Capabilities { return s.caps }
+
+func (s *Server) logCapabilities() {
+	s.capsLogOnce.Do(func() {
+		c := s.caps
+		log.Printf("[INFO] capabilities: %s/%s cpu=%d gomaxprocs=%d workers=%d aes-ni=%t ktls-ulp=%t nic=%s ktls-hw-offload=%t => use-ktls=%t",
+			c.OS, c.Arch, c.NumCPU, c.GOMAXPROCS, s.config.WorkerCount, c.CPUHasAES, c.KTLSAvailable, c.NICIface, c.NICOffloadTX, c.UseKTLS())
+	})
+}
+
 func (s *Server) ListenAndServe() error {
+	s.logCapabilities()
 	workers := s.config.WorkerCount
 	if workers < 1 {
 		workers = runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2

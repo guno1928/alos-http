@@ -183,21 +183,29 @@ func (group *ioUringBufferRing) publishTail() {
 }
 
 func (ring *ioUring) prepAcceptMultishotUser(fd int, userData uint64, flags uint32) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
 	sqe.Opcode = ioUringOpAccept
-	sqe.FD = int32(fd)
-
+	sqe.Flags = 0
 	sqe.Ioprio = ioUringAcceptMultishot
+	sqe.FD = int32(fd)
+	sqe.Off = 0
+	sqe.Addr = 0
+	sqe.Len = 0
 	sqe.OpFlags = flags
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 
 func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64, pollFirst bool, bundle bool) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
@@ -211,10 +219,16 @@ func (ring *ioUring) prepRecvMultishotUser(fd int, bgid uint16, userData uint64,
 	}
 	sqe.Flags = ioUringSqeBufferSelect
 	sqe.FD = int32(fd)
+	sqe.Off = 0
+	sqe.Addr = 0
 	sqe.Len = 0
+	sqe.OpFlags = 0
 	sqe.UserData = userData
-
 	sqe.BufIndex = bgid
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 

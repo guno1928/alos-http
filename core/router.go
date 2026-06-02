@@ -124,6 +124,7 @@ type Router struct {
 	wrappedNotFound         HandlerFunc
 	wrappedMethodNotAllowed HandlerFunc
 	built                   bool
+	server                  *Server
 }
 
 // NewRouter creates a new Router with default 404 and 405 handlers. Register

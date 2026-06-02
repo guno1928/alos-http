@@ -36,6 +36,8 @@ const (
 	plainAcceptDepth       = 64
 	plainWorkerRingEntries = 4096
 	plainReadMinFree       = 4096
+	plainRecvBufRingSize   = 512
+	plainRecvBufSize       = 4096
 )
 
 var errPlainWorkerPark = errors.New("plain worker park")
@@ -56,6 +58,8 @@ type plainWorkerConn struct {
 	writeBorrowed bool
 	writeZeroCopy bool
 	keepAlive     bool
+	readArmed     bool
+	readPollFirst bool
 	readN         int
 	writeN        int
 	writeSent     int
@@ -80,6 +84,7 @@ type plainUringWorker struct {
 	wakeupWriteFD   int
 	handoffs        chan plainAcceptedConn
 	ring            *ioUring
+	recvBufs        *ioUringBufferRing
 	server          *Server
 	connections     []plainWorkerConn
 	freeHead        int32
@@ -126,6 +131,7 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 	shards, _ := ioUringShardLayout()
 	workerCount := plainUringWorkerCount(s.config, shards)
 	acceptShards := minInt(len(listeners), workerCount)
+	recvMultishotSupported, _ := probeIOUringRecvMultishot()
 	backend := &plainUringBackend{
 		server:  s,
 		workers: make([]*plainUringWorker, 0, workerCount),
@@ -140,13 +146,8 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 		listenerFDs[i] = fd
 	}
 	for workerID := 0; workerID < workerCount; workerID++ {
-		ring, err := newIOUring(plainWorkerRingEntries)
-		if err != nil {
-			return nil, fmt.Errorf("plain worker %d ring create: %w", workerID, err)
-		}
 		wakeupPair, err := openWakePipeALOS()
 		if err != nil {
-			ring.close()
 			return nil, fmt.Errorf("plain worker %d wake pipe: %w", workerID, err)
 		}
 		worker := &plainUringWorker{
@@ -155,10 +156,18 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 			wakeupReadFD:  wakeupPair[0],
 			wakeupWriteFD: wakeupPair[1],
 			handoffs:      make(chan plainAcceptedConn, ioUringInitialConnsPerShard),
-			ring:          ring,
 			server:        s,
 			connections:   make([]plainWorkerConn, ioUringInitialConnsPerShard),
 			freeHead:      0,
+		}
+		if recvMultishotSupported {
+			recvBufs, err := newIOUringBufferRing(plainRecvBufRingSize, plainRecvBufSize, uint16(workerID+1))
+			if err != nil {
+				_ = syscall.Close(wakeupPair[0])
+				_ = syscall.Close(wakeupPair[1])
+				return nil, fmt.Errorf("plain worker %d recv buf ring create: %w", workerID, err)
+			}
+			worker.recvBufs = recvBufs
 		}
 		if workerID < acceptShards {
 			worker.listenerFD = listenerFDs[workerID]
@@ -210,6 +219,11 @@ func (backend *plainUringBackend) wait() error {
 
 func (backend *plainUringBackend) closeResources() {
 	for _, worker := range backend.workers {
+		if worker.recvBufs != nil {
+			_ = worker.recvBufs.unregister(worker.ring)
+			worker.recvBufs.close()
+			worker.recvBufs = nil
+		}
 		if worker.ring != nil {
 			worker.ring.close()
 			worker.ring = nil
@@ -294,8 +308,19 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer worker.flushReqStats()
+	ring, err := newOwnedIOUring(plainWorkerRingEntries)
+	if err != nil {
+		return fmt.Errorf("plain worker %d ring create: %w", worker.id, err)
+	}
+	worker.ring = ring
 	if err := worker.ring.enable(); err != nil {
 		return fmt.Errorf("plain ring enable: %w", err)
+	}
+	if worker.recvBufs != nil {
+		if err := worker.recvBufs.register(worker.ring); err != nil {
+			worker.recvBufs.close()
+			worker.recvBufs = nil
+		}
 	}
 	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
 		return fmt.Errorf("plain initial fill accepts: %w", err)
@@ -402,21 +427,30 @@ func (worker *plainUringWorker) handleCompletion(backend *plainUringBackend, cqe
 		return worker.handleWake(now, cqe.Res)
 	case plainUringOpRead, plainUringOpWrite, plainUringOpClose:
 		if connIndex < 0 || connIndex >= len(worker.connections) {
+			if op == plainUringOpRead {
+				worker.recycleReadBuffer(cqe.Flags)
+			}
 			return nil
 		}
 		conn := &worker.connections[connIndex]
 		if (conn.fd < 0 && !(op == plainUringOpWrite && cqe.Flags&ioUringCqeNotif != 0)) || conn.generation != generation {
+			if op == plainUringOpRead {
+				worker.recycleReadBuffer(cqe.Flags)
+			}
 			return nil
 		}
 		if conn.state == plainConnStateClosing && op != plainUringOpClose {
 			if op == plainUringOpWrite && cqe.Flags&ioUringCqeNotif != 0 {
 				return worker.handleWriteNotification(conn)
 			}
+			if op == plainUringOpRead {
+				worker.recycleReadBuffer(cqe.Flags)
+			}
 			return nil
 		}
 		switch op {
 		case plainUringOpRead:
-			return worker.handleRead(conn, cqe.Res, now)
+			return worker.handleRead(conn, cqe.Res, cqe.Flags, now)
 		case plainUringOpWrite:
 			if cqe.Flags&ioUringCqeNotif != 0 {
 				return worker.handleWriteNotification(conn)
@@ -471,7 +505,11 @@ func (worker *plainUringWorker) handleAccept(backend *plainUringBackend, result 
 	return nil
 }
 
-func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, now int64) error {
+func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, flags uint32, now int64) error {
+	if worker.recvBufs != nil && flags&ioUringCqeBuffer != 0 {
+		return worker.handleBufferedRead(conn, result, flags, now)
+	}
+	conn.readArmed = false
 	if result < 0 {
 		err := syscall.Errno(-result)
 		if isIOUringTransient(err) {
@@ -491,6 +529,65 @@ func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, 
 		return worker.processHTTP2(conn)
 	}
 	return worker.processRequests(conn)
+}
+
+func (worker *plainUringWorker) handleBufferedRead(conn *plainWorkerConn, result int32, flags uint32, now int64) error {
+	conn.readArmed = flags&ioUringCqeMore != 0
+	bufferID := cqeBufferID(flags)
+	defer worker.recycleReadBuffer(flags)
+	if result < 0 {
+		if result == -int32(syscall.EINVAL) || result == -int32(syscall.ENOSYS) {
+			worker.recvBufs.close()
+			worker.recvBufs = nil
+			conn.readArmed = false
+			return worker.queueRead(conn)
+		}
+		err := syscall.Errno(-result)
+		if isIOUringTransient(err) && !conn.readArmed {
+			return worker.queueRead(conn)
+		}
+		return worker.closeConnection(conn)
+	}
+	if result == 0 {
+		return worker.closeConnection(conn)
+	}
+	conn.lastActive = now
+	conn.readPollFirst = flags&ioUringCqeSockNonEmpty == 0
+	n := int(result)
+	maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+	if !worker.ensureReadCapacity(conn, n, maxRead) {
+		return worker.closeConnection(conn)
+	}
+	if len(conn.readBuf) < conn.readN {
+		conn.readBuf = conn.readBuf[:conn.readN]
+	}
+	worker.appendBufferedRead(&conn.readBuf, bufferID, n)
+	conn.readN = len(conn.readBuf)
+	if conn.state == plainConnStateWriting {
+		return nil
+	}
+	if conn.protocol == plainConnProtoH2 {
+		return worker.processHTTP2(conn)
+	}
+	return worker.processRequests(conn)
+}
+
+func (worker *plainUringWorker) appendBufferedRead(dst *[]byte, startID uint16, total int) {
+	if worker.recvBufs == nil || total <= 0 {
+		return
+	}
+	buf := worker.recvBufs.buffer(startID)
+	if total > len(buf) {
+		total = len(buf)
+	}
+	*dst = append(*dst, buf[:total]...)
+}
+
+func (worker *plainUringWorker) recycleReadBuffer(flags uint32) {
+	if worker.recvBufs == nil || flags&ioUringCqeBuffer == 0 {
+		return
+	}
+	worker.recvBufs.recycle(cqeBufferID(flags))
 }
 
 func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
@@ -830,6 +927,8 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	conn.zcPending = 0
 	conn.lastActive = now
 	conn.protocol = plainConnProtoUnknown
+	conn.readArmed = false
+	conn.readPollFirst = false
 	conn.h2.reset()
 	if conn.readBuf == nil {
 		conn.readBuf = make([]byte, 0, 8192)
@@ -854,10 +953,21 @@ func (worker *plainUringWorker) queueRead(conn *plainWorkerConn) error {
 	if conn.fd < 0 || conn.state == plainConnStateClosing {
 		return nil
 	}
+	conn.state = plainConnStateReading
+	if worker.recvBufs != nil {
+		if conn.readArmed {
+			return nil
+		}
+		conn.readArmed = true
+		if err := worker.ring.prepRecvMultishotUser(conn.fd, worker.recvBufs.bgid, plainEncodeUserData(plainUringOpRead, int(conn.index), conn.generation), conn.readPollFirst, false); err != nil {
+			conn.readArmed = false
+			return err
+		}
+		return nil
+	}
 	if !worker.ensureReadCapacity(conn, plainReadMinFree, int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))) {
 		return worker.closeConnection(conn)
 	}
-	conn.state = plainConnStateReading
 	return worker.ring.prepRecvUser(conn.fd, conn.readBuf[conn.readN:cap(conn.readBuf)], plainEncodeUserData(plainUringOpRead, int(conn.index), conn.generation))
 }
 
@@ -923,6 +1033,8 @@ func (worker *plainUringWorker) recycleConnection(conn *plainWorkerConn) {
 	conn.requestCount = 0
 	conn.remoteAddr = ""
 	conn.protocol = plainConnProtoUnknown
+	conn.readArmed = false
+	conn.readPollFirst = false
 	conn.closeDone = false
 	conn.tracked = false
 	conn.writeZeroCopy = false
@@ -1199,14 +1311,24 @@ func defaultInt64(value int64, fallback int64) int64 {
 }
 
 func (ring *ioUring) prepAcceptUser(fd int, userData uint64, flags uint32) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
 	sqe.Opcode = ioUringOpAccept
+	sqe.Flags = 0
+	sqe.Ioprio = 0
 	sqe.FD = int32(fd)
+	sqe.Off = 0
+	sqe.Addr = 0
+	sqe.Len = 0
 	sqe.OpFlags = flags
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 
@@ -1215,18 +1337,28 @@ func (ring *ioUring) prepRecvUser(fd int, buf []byte, userData uint64) error {
 }
 
 func (ring *ioUring) prepRecvUserWithFlags(fd int, buf []byte, userData uint64, pollFirst bool) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
 	sqe.Opcode = ioUringOpRecv
+	sqe.Flags = 0
 	if pollFirst {
 		sqe.Ioprio = ioUringPollFirst
+	} else {
+		sqe.Ioprio = 0
 	}
 	sqe.FD = int32(fd)
+	sqe.Off = 0
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
 	sqe.Len = uint32(len(buf))
+	sqe.OpFlags = 0
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 
@@ -1243,7 +1375,7 @@ func (ring *ioUring) prepSendZCUser(fd int, buf []byte, userData uint64, pollFir
 }
 
 func (ring *ioUring) prepSendUserWithFlagsAndMode(fd int, buf []byte, userData uint64, pollFirst bool, zeroCopy bool) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
@@ -1252,39 +1384,69 @@ func (ring *ioUring) prepSendUserWithFlagsAndMode(fd int, buf []byte, userData u
 	} else {
 		sqe.Opcode = ioUringOpSend
 	}
+	sqe.Flags = 0
+	var ioprio uint16
 	if pollFirst {
-		sqe.Ioprio = ioUringPollFirst
+		ioprio = ioUringPollFirst
 	}
 	if zeroCopy {
-		sqe.Ioprio |= ioUringSendZCReportUsage
+		ioprio |= ioUringSendZCReportUsage
 	}
+	sqe.Ioprio = ioprio
 	sqe.FD = int32(fd)
+	sqe.Off = 0
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
 	sqe.Len = uint32(len(buf))
+	sqe.OpFlags = 0
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 
 func (ring *ioUring) prepCloseUser(fd int, userData uint64) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
 	sqe.Opcode = ioUringOpClose
+	sqe.Flags = 0
+	sqe.Ioprio = 0
 	sqe.FD = int32(fd)
+	sqe.Off = 0
+	sqe.Addr = 0
+	sqe.Len = 0
+	sqe.OpFlags = 0
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }
 
 func (ring *ioUring) prepReadvUser(fd int, iovec *syscall.Iovec, userData uint64) error {
-	sqe, err := ring.getSqe()
+	sqe, err := ring.getSqeNoClear()
 	if err != nil {
 		return err
 	}
 	sqe.Opcode = ioUringOpReadv
+	sqe.Flags = 0
+	sqe.Ioprio = 0
 	sqe.FD = int32(fd)
+	sqe.Off = 0
 	sqe.Addr = uint64(uintptr(unsafe.Pointer(iovec)))
 	sqe.Len = 1
+	sqe.OpFlags = 0
 	sqe.UserData = userData
+	sqe.BufIndex = 0
+	sqe.Personality = 0
+	sqe.SpliceFDIn = 0
+	sqe.Addr3 = 0
+	sqe.Pad2 = 0
 	return nil
 }

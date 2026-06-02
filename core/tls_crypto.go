@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ericlagergren/aegis"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -46,7 +47,14 @@ type CipherSuiteConfig struct {
 	labelServerAppTraffic hkdfLabelTemplate
 }
 
-var SupportedSuites = [3]CipherSuiteConfig{
+var SupportedSuites = [4]CipherSuiteConfig{
+	{
+		ID: 0x1306, KeyLen: 16, IVLen: 16,
+		HashFn: sha256.New, HashLen: 32,
+		MakeAEAD: func(key []byte) (cipher.AEAD, error) {
+			return aegis.New(key)
+		},
+	},
 	{
 		ID: 0x1301, KeyLen: 16, IVLen: 12,
 		HashFn: sha256.New, HashLen: 32,
@@ -89,16 +97,27 @@ func NegotiateSuite(clientIDs []uint16) *CipherSuiteConfig {
 	return nil
 }
 
+func FindSuiteByID(id uint16) *CipherSuiteConfig {
+	for i := range SupportedSuites {
+		if SupportedSuites[i].ID == id {
+			return &SupportedSuites[i]
+		}
+	}
+	return nil
+}
+
 type TrafficAEAD struct {
-	aead  cipher.AEAD
-	iv    [12]byte
-	ivLow uint64
-	oh    int
-	seq   uint64
+	aead      cipher.AEAD
+	iv        [16]byte
+	ivLow     uint64
+	oh        int
+	seq       uint64
+	nonceSize int
+	staticLen int
 }
 
 type trafficAEADScratch struct {
-	nonce [12]byte
+	nonce [16]byte
 	ad    [5]byte
 }
 
@@ -121,15 +140,17 @@ func NewTrafficAEAD(_ func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*
 	if err != nil {
 		return nil, err
 	}
-	t := &TrafficAEAD{aead: a, oh: a.Overhead()}
+	staticLen := cs.IVLen - 8
+	t := &TrafficAEAD{aead: a, oh: a.Overhead(), nonceSize: cs.IVLen, staticLen: staticLen}
 	copy(t.iv[:], iv)
-	t.ivLow = binary.BigEndian.Uint64(t.iv[4:])
+	t.ivLow = binary.BigEndian.Uint64(t.iv[staticLen:])
 	return t, nil
 }
 
 func (t *TrafficAEAD) prepareRecord(sp *trafficAEADScratch, recordLen uint16) {
-	copy(sp.nonce[:4], t.iv[:4])
-	binary.BigEndian.PutUint64(sp.nonce[4:], t.ivLow^t.seq)
+	sl := t.staticLen
+	copy(sp.nonce[:sl], t.iv[:sl])
+	binary.BigEndian.PutUint64(sp.nonce[sl:], t.ivLow^t.seq)
 	sp.ad[3] = byte(recordLen >> 8)
 	sp.ad[4] = byte(recordLen)
 }
@@ -146,7 +167,7 @@ func (t *TrafficAEAD) Encrypt(plaintext []byte) []byte {
 	recordLen := uint16(ciphertextLen)
 	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
 	t.prepareRecord(sp, recordLen)
-	ct := t.aead.Seal(plaintext[:0], sp.nonce[:], plaintext, sp.ad[:])
+	ct := t.aead.Seal(plaintext[:0], sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
 	trafficAEADScratchPool.Put(sp)
 	return ct
@@ -160,7 +181,7 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 	recordLen := uint16(ciphertextLen)
 	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
 	t.prepareRecord(sp, recordLen)
-	dst = t.aead.Seal(dst, sp.nonce[:], plaintext, sp.ad[:])
+	dst = t.aead.Seal(dst, sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
 	trafficAEADScratchPool.Put(sp)
 	return dst
@@ -170,7 +191,7 @@ func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	recordLen := uint16(len(ciphertext))
 	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
 	t.prepareRecord(sp, recordLen)
-	pt, err := t.aead.Open(ciphertext[:0], sp.nonce[:], ciphertext, sp.ad[:])
+	pt, err := t.aead.Open(ciphertext[:0], sp.nonce[:t.nonceSize], ciphertext, sp.ad[:])
 	if err != nil {
 		trafficAEADScratchPool.Put(sp)
 		return nil, err

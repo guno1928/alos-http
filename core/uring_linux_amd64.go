@@ -1220,6 +1220,32 @@ func (ring *ioUring) getSqe() (*ioUringSqe, error) {
 	}
 }
 
+func (ring *ioUring) getSqeNoClear() (*ioUringSqe, error) {
+	if ring == nil || ring.sqHead == nil || ring.sqEntries == nil || ring.sqMask == nil {
+		return nil, syscall.EBADF
+	}
+	for {
+		head := atomic.LoadUint32(ring.sqHead)
+		if ring.localSqTail-head < atomic.LoadUint32(ring.sqEntries) {
+			index := ring.localSqTail & atomic.LoadUint32(ring.sqMask)
+			ring.sqArray[index] = index
+			sqe := &ring.sqes[index]
+			ring.localSqTail++
+			return sqe, nil
+		}
+		if _, err := ring.submitAndWait(0); err != nil {
+			return nil, err
+		}
+		head = atomic.LoadUint32(ring.sqHead)
+		if ring.localSqTail-head < atomic.LoadUint32(ring.sqEntries) {
+			continue
+		}
+		if _, err := ring.submitAndWait(1); err != nil {
+			return nil, err
+		}
+	}
+}
+
 func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
 	if ring == nil || ring.fd < 0 || ring.sqTail == nil {
 		return 0, syscall.EBADF

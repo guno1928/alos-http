@@ -1948,10 +1948,7 @@ func tlsUringWorkerCount(cfg Config, maxShards int) int {
 		}
 		return cfg.WorkerCount
 	}
-	workers := runtime.GOMAXPROCS(0) * 2
-	if workers < 1 {
-		workers = 1
-	}
+	workers := autoWorkerCount()
 	if maxShards > 0 && workers > maxShards {
 		workers = maxShards
 	}

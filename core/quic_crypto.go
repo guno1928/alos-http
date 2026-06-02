@@ -19,9 +19,11 @@ var quicV1Salt = [20]byte{
 type quicKeys struct {
 	aead      cipher.AEAD
 	hp        headerProtector
-	iv        [12]byte
+	iv        [16]byte
 	valid     bool
 	suiteID   uint16
+	nonceSize int
+	staticLen int
 }
 
 type headerProtector interface {
@@ -90,15 +92,18 @@ func quicDeriveKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*
 		return nil, err
 	}
 
+	staticLen := cs.IVLen - 8
 	qk := &quicKeys{
-		aead:    aead,
-		valid:   true,
-		suiteID: cs.ID,
+		aead:      aead,
+		valid:     true,
+		suiteID:   cs.ID,
+		nonceSize: cs.IVLen,
+		staticLen: staticLen,
 	}
 	copy(qk.iv[:], iv)
 
 	switch cs.ID {
-	case 0x1301, 0x1302:
+	case 0x1301, 0x1302, 0x1306:
 		block, err := aes.NewCipher(hpKey)
 		if err != nil {
 			return nil, err
@@ -115,7 +120,7 @@ func quicDeriveKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*
 
 func quicDeriveInitialKeys(dcid []byte) (client, server *quicKeys, err error) {
 	h := sha256.New
-	cs := &SupportedSuites[0]
+	cs := FindSuiteByID(0x1301)
 
 	initialSecret := TLSExtract(h, quicV1Salt[:], dcid)
 
@@ -144,20 +149,22 @@ func quicDeriveAppKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig)
 }
 
 func (qk *quicKeys) encrypt(dst, header, payload []byte, pn uint64, pnOffset int) []byte {
-	var nonce [12]byte
-	copy(nonce[:], qk.iv[:])
-	binary.BigEndian.PutUint64(nonce[4:], binary.BigEndian.Uint64(nonce[4:])^pn)
+	var nonce [16]byte
+	sl := qk.staticLen
+	copy(nonce[:sl], qk.iv[:sl])
+	binary.BigEndian.PutUint64(nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
 
-	dst = qk.aead.Seal(dst, nonce[:], payload, header)
+	dst = qk.aead.Seal(dst, nonce[:qk.nonceSize], payload, header)
 	return dst
 }
 
 func (qk *quicKeys) decrypt(dst, header, payload []byte, pn uint64) ([]byte, error) {
-	var nonce [12]byte
-	copy(nonce[:], qk.iv[:])
-	binary.BigEndian.PutUint64(nonce[4:], binary.BigEndian.Uint64(nonce[4:])^pn)
+	var nonce [16]byte
+	sl := qk.staticLen
+	copy(nonce[:sl], qk.iv[:sl])
+	binary.BigEndian.PutUint64(nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
 
-	return qk.aead.Open(dst, nonce[:], payload, header)
+	return qk.aead.Open(dst, nonce[:qk.nonceSize], payload, header)
 }
 
 func (qk *quicKeys) applyHeaderProtection(packet []byte, pnOffset int, pnLen int) {
