@@ -551,9 +551,24 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 		remaining = remaining[rp:]
 	}
 
+	// Nearest ancestor catch-all seen on the way down, with the path suffix and
+	// param count as they were AT that node. When the walk descends into a
+	// static branch that shares a prefix with the lookup path (e.g. /dashboard/shop
+	// vs registered /dashboard/shop-editor) and then diverges, it must fall back
+	// to this catch-all with the correct suffix ("shop"), not the whole path.
+	var pendingCatch *node
+	var pendingRemaining string
+	var pendingParamCount int
+
 	for {
 		if len(remaining) == 0 {
 			return current.wrappedHandler
+		}
+
+		if current.catchAll != nil {
+			pendingCatch = current.catchAll
+			pendingRemaining = remaining
+			pendingParamCount = req.ParamCount
 		}
 
 		c := remaining[0]
@@ -648,18 +663,15 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 			return current.catchAll.wrappedHandler
 		}
 
-		if current.inheritedCatchAll != nil {
+		if pendingCatch != nil {
+			req.ParamCount = pendingParamCount
 			if req.ParamCount < len(req.Params) {
 				p := &req.Params[req.ParamCount]
-				p.Key = current.inheritedCatchAll.catchName
-				if len(path) > 1 {
-					p.Value = path[1:]
-				} else {
-					p.Value = ""
-				}
+				p.Key = pendingCatch.catchName
+				p.Value = pendingRemaining
 				req.ParamCount++
 			}
-			return current.inheritedCatchAll.wrappedHandler
+			return pendingCatch.wrappedHandler
 		}
 
 		return nil
@@ -671,12 +683,22 @@ func (r *Router) findInTree(root *node, path string, req *Request) HandlerFunc {
 	remaining := path
 	req.ParamCount = 0
 
+	var pendingCatch *node
+	var pendingRemaining string
+	var pendingParamCount int
+
 	for {
 		if len(remaining) == 0 {
 			if current.handler != nil {
 				return current.handler
 			}
 			return nil
+		}
+
+		if current.catchAll != nil {
+			pendingCatch = current.catchAll
+			pendingRemaining = remaining
+			pendingParamCount = req.ParamCount
 		}
 
 		c := remaining[0]
@@ -751,6 +773,18 @@ func (r *Router) findInTree(root *node, path string, req *Request) HandlerFunc {
 				req.ParamCount++
 			}
 			return current.catchAll.handler
+		}
+
+		if pendingCatch != nil {
+			req.ParamCount = pendingParamCount
+			if req.ParamCount < len(req.Params) {
+				req.Params[req.ParamCount] = Param{
+					Key:   pendingCatch.catchName,
+					Value: pendingRemaining,
+				}
+				req.ParamCount++
+			}
+			return pendingCatch.handler
 		}
 
 		return nil
