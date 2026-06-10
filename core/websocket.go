@@ -22,22 +22,21 @@ const (
 	wsOpPong         byte = 0xA
 )
 
-// WSConn is a server-side WebSocket connection (RFC 6455). Create one by calling
-// UpgradeWebSocket inside a route handler, then use ReadMessage and WriteMessage
+// WSConn is a server-side WebSocket connection (RFC 6455). Create one with
+// ServeWebSocket inside a route handler, then use ReadMessage and WriteMessage
 // (or WriteText / WriteBinary) to exchange data.
 //
-//	ws := core.UpgradeWebSocket(req, resp)
-//	if ws == nil {
-//	    return
-//	}
-//	defer ws.Close()
-//	for {
-//	    op, msg, err := ws.ReadMessage()
-//	    if err != nil {
-//	        break
-//	    }
-//	    ws.WriteText("echo: " + string(msg))
-//	}
+//	r.GET("/ws", func(req *core.Request, resp *core.Response) {
+//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
+//	        for {
+//	            _, msg, err := ws.ReadMessage()
+//	            if err != nil {
+//	                return
+//	            }
+//	            ws.WriteText("echo: " + string(msg))
+//	        }
+//	    })
+//	})
 type WSConn struct {
 	conn   net.Conn
 	closed atomic.Bool
@@ -60,19 +59,23 @@ func wsAcceptKey(clientKey string) string {
 // Returns a *WSConn on success, or nil if the handshake fails (in which case an
 // error response is already written).
 //
+// WARNING: route handlers run INLINE on a fixed pool of server worker event
+// loops. A handler that keeps reading the socket until it closes pins that
+// worker's entire event loop for the connection's lifetime — a handful of open
+// sockets starves the pool and every other request on those workers hangs.
+// After UpgradeWebSocket the handler must RETURN immediately and service the
+// connection on its own goroutine. Use ServeWebSocket, which does this for you:
+//
 //	r.GET("/ws", func(req *core.Request, resp *core.Response) {
-//	    ws := core.UpgradeWebSocket(req, resp)
-//	    if ws == nil {
-//	        return
-//	    }
-//	    defer ws.Close()
-//	    for {
-//	        _, msg, err := ws.ReadMessage()
-//	        if err != nil {
-//	            break
+//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
+//	        for {
+//	            _, msg, err := ws.ReadMessage()
+//	            if err != nil {
+//	                return
+//	            }
+//	            ws.WriteText(string(msg))
 //	        }
-//	        ws.WriteText(string(msg))
-//	    }
+//	    })
 //	})
 func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 	upgradeHdr := req.Header("upgrade")
@@ -112,6 +115,12 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		return nil
 	}
 
+	// The connection inherits the server's absolute idle deadline, which would
+	// silently kill the WebSocket once it elapses. Clear it: liveness is the
+	// protocol's job (ping/pong), not the HTTP idle timeout's.
+	conn.SetReadDeadline(time.Time{})
+	conn.SetWriteDeadline(time.Time{})
+
 	acceptKey := wsAcceptKey(wsKey)
 
 	var buf [256]byte
@@ -134,6 +143,40 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 
 	return &WSConn{conn: conn}
 }
+
+// ServeWebSocket upgrades the request and services the connection on its own
+// goroutine, returning immediately so the worker that dispatched the handler is
+// released. This is the safe way to host a WebSocket: see the UpgradeWebSocket
+// warning about handlers that block on the socket. fn runs until it returns;
+// the connection is closed afterwards. Returns false if the upgrade failed (an
+// error response has already been written).
+//
+//	r.GET("/ws", func(req *core.Request, resp *core.Response) {
+//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
+//	        for {
+//	            _, msg, err := ws.ReadMessage()
+//	            if err != nil {
+//	                return
+//	            }
+//	            ws.WriteText(string(msg))
+//	        }
+//	    })
+//	})
+func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
+	ws := UpgradeWebSocket(req, resp)
+	if ws == nil {
+		return false
+	}
+	go func() {
+		defer ws.Close()
+		fn(ws)
+	}()
+	return true
+}
+
+// NetConn exposes the underlying hijacked connection, e.g. to set per-write
+// deadlines so a dead peer cannot block WriteMessage forever.
+func (ws *WSConn) NetConn() net.Conn { return ws.conn }
 
 // ReadMessage reads the next WebSocket frame. It returns the opcode (0x1 for
 // text, 0x2 for binary), the payload, and any error. Close frames are handled
