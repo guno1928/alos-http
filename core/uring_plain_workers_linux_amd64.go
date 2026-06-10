@@ -715,6 +715,15 @@ func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, 
 			if conn.fd < 0 {
 				return
 			}
+			// The worker keeps a multishot recv armed on this fd. Without
+			// disarming it first, bytes the peer sends after the handoff (e.g.
+			// the first WebSocket frames right after the 101) race into the
+			// worker's buffer ring and are dropped as stale — lost frames.
+			// Closing the fd would NOT help: pending io_uring ops hold their own
+			// file reference. Sync-cancel the recv before the fd changes hands;
+			// this runs before the protocol-switch response is written, so a
+			// conforming peer cannot have sent post-upgrade bytes yet.
+			_ = worker.ring.cancelFD(conn.fd, ioUringOpRecv)
 			wrapped, err := newIOUringConn(conn.fd)
 			if err != nil {
 				return
