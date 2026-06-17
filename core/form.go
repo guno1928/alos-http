@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// maxMultipartParts bounds how many parts parseMultipart will materialize.
+// bytes.Split would otherwise allocate one slice header per boundary, so a body
+// of thousands of empty parts turns O(body) bytes into O(body) slice headers
+// plus per-part copies. The overall body is already capped by MaxBodySize; this
+// caps the part fan-out independently. SplitN stops splitting past the limit, so
+// any excess parts remain in the final (ignored) chunk rather than being parsed.
+const maxMultipartParts = 1024
+
 type FileHeader struct {
 	Filename    string
 	Size        int64
@@ -23,7 +31,11 @@ func parseMultipart(body []byte, boundary string) (map[string][]string, map[stri
 	delim := []byte("--" + boundary)
 	endMarker := []byte("--" + boundary + "--")
 
-	parts := bytes.Split(body, delim)
+	// SplitN caps the slice-header fan-out: at most maxMultipartParts boundary
+	// splits are made, so a body crafted from many tiny parts cannot inflate
+	// allocations beyond the bound. The leading/preamble chunk consumes one
+	// slot, hence the +1.
+	parts := bytes.SplitN(body, delim, maxMultipartParts+1)
 	for _, part := range parts {
 		if len(part) == 0 {
 			continue

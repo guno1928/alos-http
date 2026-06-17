@@ -47,7 +47,9 @@ var timeNow = time.Now
 //     set TrustedProxies to trust forwarding headers only from specific peers.
 //   - IdleTimeout: how long an idle keep-alive connection stays open.
 //   - HandshakeTimeout: deadline for the TLS handshake.
-//   - MaxBodySize: reject request bodies larger than this (0 = unlimited).
+//   - MaxBodySize: reject request bodies larger than this. A zero value
+//     selects the 10 MiB default; set -1 to explicitly disable the cap
+//     (unlimited). Any positive value is used as-is.
 //   - MaxReadSize / MaxWriteSize: per-connection I/O caps.
 //   - MaxHeaderSize: maximum header block in bytes.
 //   - MaxConcurrentReqs: server-wide concurrency cap (0 = unlimited).
@@ -97,6 +99,10 @@ type Config struct {
 	ProxyMode       bool
 }
 
+// DefaultMaxBodySize is the request body cap applied when Config.MaxBodySize
+// is left at its zero value. Set MaxBodySize to -1 to disable the cap.
+const DefaultMaxBodySize int64 = 10 << 20 // 10 MiB
+
 // DefaultConfig returns a Config with sensible defaults. It listens on
 // :8443 with a 120s idle timeout, 30s handshake timeout, 8 KiB header
 // limit, gzip level 6, and request logging enabled.
@@ -107,7 +113,7 @@ func DefaultConfig() Config {
 		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 		HandshakeTimeout:  30 * time.Second,
-		MaxBodySize:       0,
+		MaxBodySize:       DefaultMaxBodySize,
 		MaxReadSize:       0,
 		MaxWriteSize:      0,
 		MaxHeaderSize:     8192,
@@ -174,34 +180,34 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config         Config
-	caps           Capabilities
-	capsLogOnce    sync.Once
-	Router         *Router
-	CORS           *CORSEngine
-	RateLimit      *RateLimitEngine
-	certStore      *CertStore
-	fallbackTLS    atomic.Pointer[tls.Config]
-	proxy          atomic.Pointer[ProxyEngine]
-	httpRouter     *HTTPRouter
-	acme           *acmeIntegration
-	listeners      []net.Listener
-	done           chan struct{}
-	tlsRuntimeOnce sync.Once
-	x25519Pool     *x25519KeyPool
-	activeConns    atomic.Int64
-	shuttingDown   atomic.Bool
-	drainDone      chan struct{}
-	drainOnce      sync.Once
-	shutdownOnce   sync.Once
-	connLimiter    *ConnectionLimiter
-	globalLimiter  *GlobalLimiter
-	activeReqs     atomic.Int64
-	fastDispatch   atomic.Bool
-	plainRootFast  plainRootFastResponse
-	h2RootFast     h2RootFastResponse
-	trustedProxies trustedProxyMatcher
-	perIPLimiter   *perIPRequestLimiter
+	config          Config
+	caps            Capabilities
+	capsLogOnce     sync.Once
+	Router          *Router
+	CORS            *CORSEngine
+	RateLimit       *RateLimitEngine
+	certStore       *CertStore
+	fallbackTLS     atomic.Pointer[tls.Config]
+	proxy           atomic.Pointer[ProxyEngine]
+	httpRouter      *HTTPRouter
+	acme            *acmeIntegration
+	listeners       []net.Listener
+	done            chan struct{}
+	tlsRuntimeOnce  sync.Once
+	x25519Pool      *x25519KeyPool
+	activeConns     atomic.Int64
+	shuttingDown    atomic.Bool
+	drainDone       chan struct{}
+	drainOnce       sync.Once
+	shutdownOnce    sync.Once
+	connLimiter     *ConnectionLimiter
+	globalLimiter   *GlobalLimiter
+	activeReqs      atomic.Int64
+	fastDispatch    atomic.Bool
+	plainRootFast   plainRootFastResponse
+	h2RootFast      h2RootFastResponse
+	trustedProxies  trustedProxyMatcher
+	perIPLimiter    *perIPRequestLimiter
 	trackedConnMu   sync.Mutex
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool
@@ -277,6 +283,12 @@ func New(configs ...Config) *Server {
 	}
 	if cfg.MaxHeaderSize == 0 {
 		cfg.MaxHeaderSize = 8192
+	}
+	// A zero value means "unset": fail closed with the bounded default rather
+	// than the old fail-open behavior. Callers opt into unlimited via -1, which
+	// every reader (which gates on MaxBodySize > 0) already treats as no cap.
+	if cfg.MaxBodySize == 0 {
+		cfg.MaxBodySize = DefaultMaxBodySize
 	}
 	if cfg.ServerName == "" {
 		cfg.ServerName = "ALOS"
