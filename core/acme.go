@@ -9,9 +9,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -264,13 +267,12 @@ func (ai *acmeIntegration) HandleHTTP01(path string) ([]byte, bool) {
 	}
 	token := path[len(prefix):]
 
-	for i := 0; i < len(token); i++ {
-		if token[i] == '/' || token[i] == '\\' || token[i] == '.' || token[i] == 0 {
-			acmePrintf("[ACME] HTTP-01 challenge rejected: invalid token characters")
-			return nil, false
-		}
-	}
-	if token == "" {
+	// The token must be a single, plain path element. Rejecting separators and
+	// "." / ".." up front keeps the fast path cheap; the os.Root read below is
+	// the authoritative defense that confines the disk read to challengeDir even
+	// if this check is ever loosened.
+	if !validChallengeToken(token) {
+		acmePrintf("[ACME] HTTP-01 challenge rejected: invalid token")
 		return nil, false
 	}
 
@@ -290,15 +292,48 @@ func (ai *acmeIntegration) HandleHTTP01(path string) ([]byte, bool) {
 		return UnsafeBytes(found.auth), true
 	}
 
-	filePath := filepath.Join(ai.challengeDir, token)
-	data, err := os.ReadFile(filePath)
+	data, err := readChallengeFromDir(ai.challengeDir, token)
 	if err == nil && len(data) > 0 {
-		acmePrintf("[ACME] HTTP-01 challenge served from disk: %s len=%d", filePath, len(data))
+		acmePrintf("[ACME] HTTP-01 challenge served from disk: %s/%s len=%d", ai.challengeDir, token, len(data))
 		return data, true
 	}
 
-	acmePrintf("[ACME] HTTP-01 challenge NOT FOUND: token=%s (checked memory + disk at %s)", token, filePath)
+	acmePrintf("[ACME] HTTP-01 challenge NOT FOUND: token=%s (checked memory + disk in %s)", token, ai.challengeDir)
 	return nil, false
+}
+
+// validChallengeToken reports whether token is a single safe path element: a
+// non-empty name with no separators, NUL bytes, or "." / ".." traversal.
+func validChallengeToken(token string) bool {
+	if token == "" || token == "." || token == ".." {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		switch token[i] {
+		case '/', '\\', 0:
+			return false
+		}
+	}
+	return true
+}
+
+// readChallengeFromDir reads a challenge file confined to dir using os.Root, so a
+// token that escaped validChallengeToken still cannot traverse outside the
+// challenge directory (symlinks and ".." are resolved within the root).
+func readChallengeFromDir(dir, token string) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	f, err := root.Open(token)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return io.ReadAll(f)
 }
 
 func (ai *acmeIntegration) Start() {
@@ -642,6 +677,14 @@ func (ai *acmeIntegration) deferredObtain(domain string) {
 	ai.obtainWithRetry(domain)
 }
 
+// acmeAlreadyRegistered reports whether err is the CA's "account already exists"
+// response. It matches on the typed *acme.Error status code (409 Conflict) so a
+// localized or reworded CA error body can never be mistaken for success.
+func acmeAlreadyRegistered(err error) bool {
+	var acmeErr *acme.Error
+	return errors.As(err, &acmeErr) && acmeErr.StatusCode == http.StatusConflict
+}
+
 func (ai *acmeIntegration) obtain(domain string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -652,20 +695,17 @@ func (ai *acmeIntegration) obtain(domain string) error {
 	}
 	acmePrintf("[ACME] registering account with Let's Encrypt...")
 	_, err := ai.client.Register(ctx, acct, acme.AcceptTOS)
-	if err != nil {
-		errStr := err.Error()
-		if strings.Contains(errStr, "already") || strings.Contains(errStr, "existing") || strings.Contains(errStr, "conflict") {
-			acmePrintf("[ACME] account already registered (ok)")
-		} else {
-			if acmeErr, ok := err.(*acme.Error); ok && acmeErr.StatusCode == 409 {
-				acmePrintf("[ACME] account already registered (409, ok)")
-			} else {
-				acmePrintf("[ACME] registration failed: %v", err)
-				return err
-			}
-		}
-	} else {
+	switch {
+	case err == nil:
 		acmePrintf("[ACME] account registered successfully")
+	case acmeAlreadyRegistered(err):
+		// A 409 Conflict is the CA's canonical signal that this key is already
+		// bound to an account; classify on the typed status code rather than the
+		// human-readable message, which is localizable and CA-specific.
+		acmePrintf("[ACME] account already registered (409, ok)")
+	default:
+		acmePrintf("[ACME] registration failed: %v", err)
+		return err
 	}
 
 	acmePrintf("[ACME] creating order for %s...", domain)
