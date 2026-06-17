@@ -24,13 +24,13 @@ const (
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +43,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -264,6 +264,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		qc.recvLargest[space] = int64(pn)
 	}
 	needsAck := false
+	protocolViolation := false
 
 	visitor := &quicFrameVisitor{
 		onACK: func(f quicAckFrame) {
@@ -305,15 +306,26 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 			qc.close()
 		},
 		onHandshakeDone: func() {
-			needsAck = true
+			// HANDSHAKE_DONE is sent only server->client (RFC 9000 §19.20),
+			// so a server receiving it is a protocol violation.
+			protocolViolation = true
 		},
 		onPing: func() {
 			needsAck = true
 		},
 	}
 
-	if err := quicParseFrames(frames, visitor); err != nil {
+	if err := quicParseFrames(space, frames, visitor); err != nil {
+		if err == ErrQUICProtocolViolation {
+			qc.failProtocolViolation("frame not permitted in packet-number space")
+			return
+		}
 		log.Printf("[QUIC] frame parse error: %v", err)
+		return
+	}
+
+	if protocolViolation {
+		qc.failProtocolViolation("handshake_done received by server")
 		return
 	}
 
@@ -665,6 +677,18 @@ func (qc *QUICConn) sendConnectionClose(errorCode uint64, reason string) {
 	}
 
 	qc.sendFrames(space, frames, false)
+}
+
+// failProtocolViolation tears down the connection with a PROTOCOL_VIOLATION
+// connection close (RFC 9000 §12.4) after a frame arrives in a space where it
+// is not permitted. It fails closed: the close frame is best-effort and the
+// connection is torn down regardless.
+func (qc *QUICConn) failProtocolViolation(reason string) {
+	if qc.closed.Load() {
+		return
+	}
+	qc.sendConnectionClose(quicErrProtocolViolation, reason)
+	qc.close()
 }
 
 func (qc *QUICConn) runIdleTimer() {

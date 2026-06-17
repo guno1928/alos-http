@@ -34,6 +34,39 @@ const (
 	quicStreamFlagFin byte = 0x01
 )
 
+// QUIC transport error codes (RFC 9000 §20.1).
+const (
+	quicErrProtocolViolation uint64 = 0x0a
+)
+
+// ErrQUICProtocolViolation is returned by the frame parser when a frame type is
+// not permitted in the packet-number space it arrived in (RFC 9000 §12.4), so
+// the caller can fail closed with a PROTOCOL_VIOLATION connection close.
+var ErrQUICProtocolViolation = errQUICProtocolViolation{}
+
+type errQUICProtocolViolation struct{}
+
+func (errQUICProtocolViolation) Error() string {
+	return "quic: frame not permitted in packet-number space"
+}
+
+// quicFrameAllowedInSpace reports whether a frame type may appear in the given
+// packet-number space. Per RFC 9000 §12.4, Initial and Handshake spaces permit
+// only PADDING, PING, ACK, CRYPTO and CONNECTION_CLOSE (type 0x1c); the
+// application (1-RTT) space permits all frame types.
+func quicFrameAllowedInSpace(space int, frameType uint64) bool {
+	if space == quicSpaceAppData {
+		return true
+	}
+
+	switch frameType {
+	case quicFramePadding, quicFramePing, quicFrameACK, quicFrameACKECN, quicFrameCrypto, quicFrameConnClose:
+		return true
+	default:
+		return false
+	}
+}
+
 type quicCryptoFrame struct {
 	offset uint64
 	data   []byte
@@ -76,7 +109,7 @@ type quicMaxStreamDataFrame struct {
 
 type quicMaxStreamsFrame struct {
 	maxStreams uint64
-	bidi      bool
+	bidi       bool
 }
 
 type quicNewConnIDFrame struct {
@@ -222,14 +255,14 @@ type quicFrameVisitor struct {
 	onStream        func(f quicStreamFrame)
 	onMaxData       func(f quicMaxDataFrame)
 	onMaxStreamData func(f quicMaxStreamDataFrame)
-	onMaxStreams     func(f quicMaxStreamsFrame)
+	onMaxStreams    func(f quicMaxStreamsFrame)
 	onConnClose     func(f quicConnCloseFrame)
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)
 	onNewToken      func(token []byte)
 }
 
-func quicParseFrames(data []byte, v *quicFrameVisitor) error {
+func quicParseFrames(space int, data []byte, v *quicFrameVisitor) error {
 	p := quicFrameParser{data: data}
 
 	for p.remaining() > 0 {
@@ -244,6 +277,12 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 		frameType, ok := p.readVarint()
 		if !ok {
 			return ErrTruncated
+		}
+
+		// RFC 9000 §12.4: reject frame types not permitted in this
+		// packet-number space before consuming their payload. Fail closed.
+		if !quicFrameAllowedInSpace(space, frameType) {
+			return ErrQUICProtocolViolation
 		}
 
 		switch {
