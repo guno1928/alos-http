@@ -24,13 +24,13 @@ const (
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +43,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -264,10 +264,18 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		qc.recvLargest[space] = int64(pn)
 	}
 	needsAck := false
+	var ackErr error
 
 	visitor := &quicFrameVisitor{
 		onACK: func(f quicAckFrame) {
-			lostFrames := qc.loss.onAckReceived(space, f, quicMaxAckDelay)
+			if ackErr != nil {
+				return
+			}
+			lostFrames, err := qc.loss.onAckReceived(space, f, qc.sendPN[space], quicMaxAckDelay)
+			if err != nil {
+				ackErr = err
+				return
+			}
 			for _, frames := range lostFrames {
 				qc.retransmitFrames(space, frames)
 			}
@@ -314,6 +322,15 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 
 	if err := quicParseFrames(frames, visitor); err != nil {
 		log.Printf("[QUIC] frame parse error: %v", err)
+		return
+	}
+
+	// A structurally invalid ACK (range underflow or ack of an unsent packet) is
+	// a transport protocol violation: close with FRAME_ENCODING_ERROR rather than
+	// acting on corrupted loss/RTT state.
+	if ackErr != nil {
+		qc.sendConnectionClose(quicErrFrameEncoding, "invalid ACK frame")
+		qc.close()
 		return
 	}
 

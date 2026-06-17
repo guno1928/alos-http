@@ -76,4 +76,10 @@ var (
 	// ErrWebSocketProtocol is returned when a WebSocket frame violates
 	// RFC 6455 (bad opcode, missing mask, unexpected continuation, etc.).
 	ErrWebSocketProtocol = &staticError{"websocket protocol error"}
+
+	// errQuicAckInvalid is returned when a peer ACK frame is structurally
+	// invalid: a range bound that would underflow on uint64, or an
+	// acknowledgement of a packet number the endpoint never sent. The QUIC
+	// connection is closed with FRAME_ENCODING_ERROR in response.
+	errQuicAckInvalid = &staticError{"quic: invalid ACK frame"}
 )
