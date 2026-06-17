@@ -404,6 +404,7 @@ func (s *Server) ServeH2Plain(conn net.Conn) {
 	hc.maxFrameSize.Store(H2DefaultMaxFrameSize)
 	hc.recvConnWindow.Store(int64(H2ConnectionWindowSize))
 	hc.flowCond = sync.NewCond(&hc.flowMu)
+	hc.initFloodDefenses()
 
 	go hc.writerLoop()
 

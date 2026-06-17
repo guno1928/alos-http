@@ -42,6 +42,7 @@ type H2Conn struct {
 	headerFlags        byte
 	headerEndStream    bool
 	headersBuf         [][2]string
+	continuationCount  int
 
 	pendingConnWindow atomic.Uint32
 	activeStreams     atomic.Int32
@@ -49,6 +50,53 @@ type H2Conn struct {
 	flowCond          *sync.Cond
 
 	recvConnWindow atomic.Int64
+
+	// C6 flood defenses. The leaky buckets and continuationCount are
+	// touched only by the single read-loop goroutine and need no locking.
+	// now is the injected monotonic clock (nanos) used by the buckets —
+	// see initFloodDefenses.
+	now            func() int64
+	settingsBucket leakyBucket
+	pingBucket     leakyBucket
+	emptyBucket    leakyBucket
+
+	// rstStreamCount is the running Rapid-Reset counter (CVE-2023-44487).
+	// The read loop increments it on each abnormal reset; dispatchRequest
+	// decrements it when a stream completes legitimately. dispatch runs on
+	// its own goroutine, so this is atomic.
+	rstStreamCount atomic.Int64
+
+	// closeRequested is set by a flood/abuse check after it has queued a
+	// GOAWAY; serveLoop observes it and returns, letting the normal defer
+	// tear the connection down. It is an atomic only because it may be
+	// read for diagnostics; the read loop is the sole writer.
+	closeRequested atomic.Bool
+}
+
+// leakyBucket bounds how many of a given frame type a peer may send. count
+// rises on each frame; it leaks back down at refillPerSec based on elapsed
+// monotonic time. Exceeding capacity after leaking is a flood. All access
+// is from the single read-loop goroutine, so no synchronization is needed.
+type leakyBucket struct {
+	count        float64
+	capacity     float64
+	refillPerSec float64
+	lastNanos    int64
+}
+
+func (b *leakyBucket) admit(nowNanos int64) bool {
+	if b.lastNanos != 0 {
+		elapsedSec := float64(nowNanos-b.lastNanos) / 1e9
+		if elapsedSec > 0 {
+			b.count -= elapsedSec * b.refillPerSec
+			if b.count < 0 {
+				b.count = 0
+			}
+		}
+	}
+	b.lastNanos = nowNanos
+	b.count++
+	return b.count <= b.capacity
 }
 
 func appendWriteBatch(dst []byte, batch [writeRequestBatchSize]WriteRequest, n int) []byte {
@@ -124,6 +172,7 @@ func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 	hc.maxFrameSize.Store(H2DefaultMaxFrameSize)
 	hc.recvConnWindow.Store(int64(H2ConnectionWindowSize))
 	hc.flowCond = sync.NewCond(&hc.flowMu)
+	hc.initFloodDefenses()
 
 	Dbg("[H2] %s starting HTTP/2 connection", hc.remoteAddr)
 
@@ -305,6 +354,44 @@ func (hc *H2Conn) sendWindowUpdate(streamID, increment uint32) {
 	hc.enqueueWrite(frame)
 }
 
+// initFloodDefenses installs the monotonic clock and sizes the per-frame
+// leaky buckets. Call once after constructing an H2Conn, before serveLoop.
+// If hc.now is already set (tests inject a fake clock) it is preserved.
+func (hc *H2Conn) initFloodDefenses() {
+	if hc.now == nil {
+		hc.now = MonotonicNanotime
+	}
+	hc.settingsBucket = leakyBucket{capacity: H2MaxSettingsFrames, refillPerSec: H2SettingsRefillPerSec}
+	hc.pingBucket = leakyBucket{capacity: H2MaxPingFrames, refillPerSec: H2PingRefillPerSec}
+	hc.emptyBucket = leakyBucket{capacity: H2MaxEmptyFrames, refillPerSec: H2EmptyFramesRefillPerSec}
+}
+
+// connFlood queues a GOAWAY with the given error code and requests teardown
+// of the connection. serveLoop returns on the next iteration. Safe to call
+// more than once; only the first GOAWAY is meaningful.
+func (hc *H2Conn) connFlood(errCode uint32) {
+	if hc.closeRequested.Swap(true) {
+		return
+	}
+	Dbg("[H2] %s flood defense tripped errCode=0x%x", hc.remoteAddr, errCode)
+	hc.sendGoAway(errCode)
+}
+
+// relieveRapidReset decrements the Rapid-Reset counter on legitimate stream
+// completion, clamped at zero so a long-lived connection's idle baseline is
+// never negative. Compare-and-swap loop because dispatch goroutines race.
+func (hc *H2Conn) relieveRapidReset() {
+	for {
+		cur := hc.rstStreamCount.Load()
+		if cur <= 0 {
+			return
+		}
+		if hc.rstStreamCount.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
 func (hc *H2Conn) sendGoAway(errCode uint32) {
 	lastID := hc.lastStreamID.Load()
 	Dbg("[H2] %s sending GOAWAY errCode=0x%x lastStream=%d", hc.remoteAddr, errCode, lastID)
@@ -409,6 +496,15 @@ func (hc *H2Conn) serveLoop() {
 			Dbg("[H2] frame type=0x%02x flags=0x%02x stream=%d len=%d", frame.Type, frame.Flags, frame.StreamID, frame.Length)
 		}
 
+		// Bound zero-length frames regardless of type: an empty DATA /
+		// HEADERS / CONTINUATION / WINDOW_UPDATE stream does real per-frame
+		// parsing work while carrying no payload, a classic flood shape.
+		if frame.Length == 0 && !hc.emptyBucket.admit(hc.now()) {
+			releaseH2Frame(frame)
+			hc.connFlood(H2ErrEnhanceYourCalm)
+			return
+		}
+
 		if hc.expectContinuation != 0 {
 			if frame.Type != H2FrameContinuation || frame.StreamID != hc.expectContinuation {
 				releaseH2Frame(frame)
@@ -417,11 +513,17 @@ func (hc *H2Conn) serveLoop() {
 			}
 			hc.handleContinuation(frame)
 			releaseH2Frame(frame)
+			if hc.closeRequested.Load() {
+				return
+			}
 			continue
 		}
 
 		hc.handleFrame(frame)
 		releaseH2Frame(frame)
+		if hc.closeRequested.Load() {
+			return
+		}
 		hc.compactAppBuf(false)
 
 		select {
@@ -437,6 +539,10 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 	case H2FrameSettings:
 		if f.StreamID != 0 {
 			hc.sendGoAway(H2ErrProtocol)
+			return
+		}
+		if !hc.settingsBucket.admit(hc.now()) {
+			hc.connFlood(H2ErrEnhanceYourCalm)
 			return
 		}
 		if f.Flags&H2FlagAck != 0 {
@@ -497,6 +603,10 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 			hc.sendGoAway(H2ErrProtocol)
 			return
 		}
+		if !hc.pingBucket.admit(hc.now()) {
+			hc.connFlood(H2ErrEnhanceYourCalm)
+			return
+		}
 		if len(f.Payload) != 8 {
 			hc.sendGoAway(H2ErrFrameSize)
 			return
@@ -515,6 +625,18 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 		}
 		if len(f.Payload) != 4 {
 			hc.sendGoAway(H2ErrFrameSize)
+			return
+		}
+		// Rapid Reset (CVE-2023-44487): a peer that opens streams and
+		// resets them before they complete forces unbounded handler
+		// churn while never binding MAX_CONCURRENT_STREAMS. Count every
+		// reset of a stream the peer already pushed past idle but that
+		// has not finished; dispatchRequest decrements on legitimate
+		// completion. A RST for an unknown/already-gone stream also
+		// counts — that is exactly the loop's steady state once the
+		// handler goroutine has drained the entry.
+		if hc.rstStreamCount.Add(1) > H2MaxRapidResets {
+			hc.connFlood(H2ErrEnhanceYourCalm)
 			return
 		}
 		if v, ok := hc.streams.Load(alosmap.I(int64(f.StreamID))); ok {
@@ -619,19 +741,50 @@ func (hc *H2Conn) handleHeaders(f *H2Frame) {
 		hc.headerAccum = append(hc.headerAccum[:0], payload...)
 		hc.headerFlags = f.Flags
 		hc.headerEndStream = f.Flags&H2FlagEndStream != 0
+		hc.continuationCount = 0
+		// A header block that already overflows in the first HEADERS frame
+		// can never become valid; fail closed before buffering more.
+		if len(hc.headerAccum) > hc.maxHeaderBlockBytes() {
+			hc.expectContinuation = 0
+			hc.connFlood(H2ErrEnhanceYourCalm)
+		}
 		return
 	}
 
 	hc.processDecodedHeaders(f.StreamID, payload, f.Flags&H2FlagEndStream != 0)
 }
 
+// maxHeaderBlockBytes is the hard cap on the total HEADERS+CONTINUATION
+// header-block size for one request. It honors the operator-configured
+// MaxHeaderSize, falling back to the protocol advertised limit. The
+// generous 4x multiplier accounts for HPACK expansion vs. the on-wire
+// uncompressed list size while still bounding per-connection memory.
+func (hc *H2Conn) maxHeaderBlockBytes() int {
+	limit := H2MaxHeaderListSize
+	if hc.server != nil && hc.server.config.MaxHeaderSize > limit {
+		limit = hc.server.config.MaxHeaderSize
+	}
+	return limit * 4
+}
+
 func (hc *H2Conn) handleContinuation(f *H2Frame) {
-	hc.headerAccum = append(hc.headerAccum, f.Payload...)
-	if len(hc.headerAccum) > H2MaxHeaderListSize*4 {
+	// Cap CONTINUATION frames per header block. A stream of zero-length
+	// CONTINUATION frames (CVE-2024-27316 shape) adds no bytes and so would
+	// never trip the byte cap below — this frame-count cap stops it.
+	hc.continuationCount++
+	if hc.continuationCount > H2MaxContinuationFrames {
 		hc.expectContinuation = 0
-		hc.sendGoAway(H2ErrEnhanceYourCalm)
+		hc.connFlood(H2ErrEnhanceYourCalm)
 		return
 	}
+
+	hc.headerAccum = append(hc.headerAccum, f.Payload...)
+	if len(hc.headerAccum) > hc.maxHeaderBlockBytes() {
+		hc.expectContinuation = 0
+		hc.connFlood(H2ErrEnhanceYourCalm)
+		return
+	}
+
 	if f.Flags&H2FlagEndHeaders != 0 {
 		streamID := hc.expectContinuation
 		endStream := hc.headerEndStream
@@ -860,6 +1013,12 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 
 func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	defer hc.dispatchWg.Done()
+	// Legitimate completion relieves Rapid-Reset pressure: a stream that
+	// ran a handler to completion is not part of an abusive churn loop, so
+	// drain one unit from the reset counter (clamped at zero). This is what
+	// keeps a well-behaved client that cancels occasionally from drifting
+	// toward the threshold while still tripping on a HEADERS+RST loop.
+	defer hc.relieveRapidReset()
 	Stats.TotalReqs.Add(1)
 	if hc.server.logRequests.Load() {
 		log.Printf("[H2] stream %d: %s %s", stream.ID, stream.Method, stream.Path)
