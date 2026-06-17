@@ -22,6 +22,11 @@ const (
 	wsOpPong         byte = 0xA
 )
 
+// wsStatusProtocolError is the RFC 6455 §7.4.1 close status code (1002) sent
+// when the peer commits a protocol violation, such as an oversized or
+// fragmented control frame.
+const wsStatusProtocolError uint16 = 1002
+
 // WSConn is a server-side WebSocket connection (RFC 6455). Create one with
 // ServeWebSocket inside a route handler, then use ReadMessage and WriteMessage
 // (or WriteText / WriteBinary) to exchange data.
@@ -206,6 +211,18 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 		}
 
 		if opcode >= wsOpClose {
+			// RFC 6455 §5.5: control frames carry at most 125 bytes, must not
+			// be fragmented (FIN=1), and only opcodes 0x8/0x9/0xA are defined.
+			// Reject before reading/allocating the payload so a hostile peer
+			// cannot force a large allocation or a large pong echo
+			// (amplification DoS). The length lives in the lower 7 bits of the
+			// second header byte; for a valid control frame it is the literal
+			// length (never the 126/127 extended-length sentinels).
+			controlLen := header[1] & 0x7F
+			if controlLen > 125 || !fin || opcode > wsOpPong {
+				ws.closeWithStatus(wsStatusProtocolError)
+				return 0, nil, ErrWebSocketProtocol
+			}
 			payload, err := ws.readFramePayload(header[1], masked)
 			if err != nil {
 				return 0, nil, err
@@ -359,6 +376,21 @@ func (ws *WSConn) WriteBinary(data []byte) error {
 // with a pong automatically.
 func (ws *WSConn) Ping() error {
 	return ws.WriteMessage(wsOpPing, nil)
+}
+
+// closeWithStatus sends a close frame carrying the given RFC 6455 §5.5.1 status
+// code and then closes the underlying connection. Used to signal protocol
+// errors (e.g. status 1002) to the peer before tearing down. Safe to call
+// concurrently with Close; the first caller wins.
+func (ws *WSConn) closeWithStatus(status uint16) error {
+	if ws.closed.CompareAndSwap(false, true) {
+		var code [2]byte
+		code[0] = byte(status >> 8)
+		code[1] = byte(status)
+		ws.WriteMessage(wsOpClose, code[:])
+		return ws.conn.Close()
+	}
+	return nil
 }
 
 // Close sends a close frame and closes the underlying connection. Safe to call
