@@ -631,6 +631,15 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			} else {
 				tmpReq.store = nil
 			}
+			// store was cloned above, but the query/form caches were left
+			// aliasing the original request's maps. The handler runs in a
+			// detached goroutine that can outlive the timeout; once the original
+			// request is recycled for the next request on the connection, the
+			// handler and the recycled request would race on these shared maps
+			// (concurrent map write -> panic). They are pure derivations of the
+			// already-copied Query/Body and are reparsed lazily, so nil suffices.
+			tmpReq.queryCache = nil
+			tmpReq.formCache = nil
 			tmpReq.StreamWriter = nil
 			tmpReq.conn = nil
 			tmpReq.tlsReader = nil
