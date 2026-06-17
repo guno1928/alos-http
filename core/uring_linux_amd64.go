@@ -178,6 +178,9 @@ type ioUring struct {
 	cqHead          *uint32
 	cqTail          *uint32
 	cqMask          *uint32
+	cqOverflow      *uint32
+	lastCqOverflow  uint32
+	overflowLogged  bool
 	localSqTail     uint32
 	submitted       uint32
 	flags           uint32
@@ -395,6 +398,7 @@ func (s *Server) ioUringRedirectAcceptLoop(acceptor *ioUringAcceptor, errCh chan
 			return
 		}
 		count := acceptor.ring.peekBatch(completions[:])
+		acceptor.ring.observeCqOverflow()
 		if count == 0 {
 			cqe, err := acceptor.ring.waitCqe()
 			if err != nil {
@@ -951,6 +955,8 @@ func newIOUringConfigured(entries uint32, flags uint32) (*ioUring, error) {
 	ring.cqHead = byteOffsetPtr[uint32](cqRing, params.CqOff.Head)
 	ring.cqTail = byteOffsetPtr[uint32](cqRing, params.CqOff.Tail)
 	ring.cqMask = byteOffsetPtr[uint32](cqRing, params.CqOff.RingMask)
+	ring.cqOverflow = byteOffsetPtr[uint32](cqRing, params.CqOff.Overflow)
+	ring.lastCqOverflow = atomic.LoadUint32(ring.cqOverflow)
 	ring.cqes = byteOffsetSlice[ioUringCqe](cqRing, params.CqOff.Cqes, int(params.CqEntries))
 	ring.sqes = unsafe.Slice((*ioUringSqe)(unsafe.Pointer(unsafe.SliceData(sqesBytes))), int(params.SqEntries))
 	ring.localSqTail = atomic.LoadUint32(ring.sqTail)
@@ -997,6 +1003,7 @@ func (ring *ioUring) close() {
 	ring.cqHead = nil
 	ring.cqTail = nil
 	ring.cqMask = nil
+	ring.cqOverflow = nil
 }
 
 func (ring *ioUring) accept(fd int, flags uint32) (int, error) {
@@ -1444,6 +1451,76 @@ func (ring *ioUring) peekBatch(dst []ioUringCqe) int {
 	}
 	atomic.StoreUint32(ring.cqHead, head+uint32(available))
 	return available
+}
+
+// readCqOverflow atomically loads a CQ overflow counter from the ring memory.
+// The kernel increments this field (mapped at CqOff.Overflow) each time a
+// completion cannot be posted because the CQ ring is full. It is extracted as a
+// free function so the read can be unit-tested against a caller-provided counter
+// without a live io_uring instance.
+func readCqOverflow(counter *uint32) uint32 {
+	if counter == nil {
+		return 0
+	}
+	return atomic.LoadUint32(counter)
+}
+
+// observeCqOverflow checks whether the kernel dropped completions since the last
+// reap. CQ overflow means a completion (e.g. a write or close) was never
+// delivered to userspace, which can wedge a connection's state machine and leak
+// its slot/gauge. When the counter advances we surface it once (and behind the
+// debug flag thereafter, rate-limited to counter movement) and flush the kernel
+// overflow list back into the CQ ring so delivery resumes.
+//
+// Recovery relies on io_uring_enter(IORING_ENTER_GETEVENTS): once peekBatch has
+// freed CQ space, that enter causes the kernel to copy any overflowed entries
+// back into the now-available ring slots. This kernel-side flush cannot be
+// exercised without a live ring; see the unit test for the observable parts.
+func (ring *ioUring) observeCqOverflow() {
+	if ring == nil || ring.cqOverflow == nil {
+		return
+	}
+	current := readCqOverflow(ring.cqOverflow)
+	if current == ring.lastCqOverflow {
+		return
+	}
+
+	dropped := current - ring.lastCqOverflow
+	ring.lastCqOverflow = current
+
+	if !ring.overflowLogged || debugFlag.Load() {
+		log.Printf("[HTTP] io_uring CQ overflow: kernel dropped %d completion(s) (total=%d); flushing to recover", dropped, current)
+		ring.overflowLogged = true
+	}
+
+	// Re-enter with GETEVENTS so the kernel flushes overflowed CQEs back into
+	// the freed ring space. minComplete=0 keeps this non-blocking.
+	_ = ring.flushCqOverflow()
+}
+
+// flushCqOverflow issues a non-blocking io_uring_enter with IORING_ENTER_GETEVENTS
+// to drain the kernel's overflow list into the CQ ring without waiting for new
+// completions.
+func (ring *ioUring) flushCqOverflow() error {
+	if ring == nil || ring.fd < 0 {
+		return syscall.EBADF
+	}
+	flags := uintptr(ioUringEnterGetEvents)
+	fd := ring.fd
+	if ring.registeredRing && ring.enterFD >= 0 {
+		fd = ring.enterFD
+		flags |= ioUringEnterRegistered
+	}
+	for {
+		_, _, errno := syscall.Syscall6(ioUringEnterSyscall, uintptr(fd), 0, 0, flags, 0, 0)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
 }
 
 func (ring *ioUring) tryCqe() (ioUringCqe, bool) {

@@ -454,6 +454,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 			continue
 		}
 		count := worker.ring.peekBatch(worker.completions[:])
+		worker.ring.observeCqOverflow()
 		if count == 0 {
 			cqe, err := worker.ring.waitCqe()
 			if err != nil {
