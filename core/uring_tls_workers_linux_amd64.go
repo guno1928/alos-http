@@ -1909,7 +1909,15 @@ func (worker *tlsUringWorker) handleBridgeWrite(conn *tlsWorkerConn, result int3
 	}
 	conn.writeSent = 0
 	conn.writeN = 0
-	conn.writeBuf = conn.writeBuf[:0]
+	// conn.writeBuf aliases the bridge write request's pooled buffer (set in
+	// processBridge: conn.writeBuf = data). releaseTLSBridgeWriteReq below
+	// returns that backing array to its sync.Pool, so a [:0] alias would leave
+	// conn.writeBuf pointing into a pooled buffer another connection can check
+	// out — and after recycle/reattach, processClientHello rebuilds the
+	// ServerHello flight into conn.writeBuf[:0], corrupting whoever now owns it.
+	// Drop the alias; the next bridge write reassigns it and acquireConnection
+	// allocates a fresh buffer on reattach (the conn.writeBuf == nil path).
+	conn.writeBuf = nil
 
 	bridge.mu.Lock()
 	active := bridge.writeActive
