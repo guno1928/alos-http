@@ -72,6 +72,7 @@ var (
 
 	ErrTooManyHeaders         = &staticError{"too many headers"}
 	ErrHpackTableSizeExceeded = &staticError{"hpack: dynamic table size exceeds protocol limit"}
+	ErrHuffmanDecode          = &staticError{"invalid huffman encoding"}
 
 	// ErrWebSocketProtocol is returned when a WebSocket frame violates
 	// RFC 6455 (bad opcode, missing mask, unexpected continuation, etc.).
