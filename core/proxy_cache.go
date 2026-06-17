@@ -106,6 +106,7 @@ type ProxyCache struct {
 	totalEntries atomic.Int64
 	totalHits    atomic.Uint64
 	totalMisses  atomic.Uint64
+	evicting     atomic.Bool
 	stopCh       chan struct{}
 	gzipPool     sync.Pool
 }
@@ -611,6 +612,15 @@ func (pc *ProxyCache) evictExpired() {
 }
 
 func (pc *ProxyCache) evictOldest() {
+	// Single-flight: evictOldest is spawned as a goroutine from multiple
+	// putEntry sites under load. Without this guard, many goroutines scan the
+	// whole entry set and remove concurrently — wasted CPU and over-eviction.
+	// Let one pass run; others return immediately.
+	if !pc.evicting.CompareAndSwap(false, true) {
+		return
+	}
+	defer pc.evicting.Store(false)
+
 	cfg := pc.config.Load()
 	target := cfg.MaxTotalBytes * 90 / 100
 
