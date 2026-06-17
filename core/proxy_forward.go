@@ -586,12 +586,17 @@ func isProxyFilteredHeaderFold(name string) bool {
 		return EqualFoldASCII(name, "host")
 	case 7:
 		return EqualFoldASCII(name, "trailer")
+	case 9:
+		// Drop client-supplied forwarding headers so the single proxy-appended
+		// X-Forwarded-For (line ~552) is authoritative; otherwise a spoofed
+		// inbound value would be forwarded and could be trusted by the backend.
+		return EqualFoldASCII(name, "forwarded") || EqualFoldASCII(name, "x-real-ip")
 	case 10:
 		return EqualFoldASCII(name, "keep-alive")
 	case 14:
 		return EqualFoldASCII(name, "content-length")
 	case 15:
-		return EqualFoldASCII(name, "accept-encoding")
+		return EqualFoldASCII(name, "accept-encoding") || EqualFoldASCII(name, "x-forwarded-for")
 	case 17:
 		return EqualFoldASCII(name, "transfer-encoding")
 	case 18:
