@@ -67,6 +67,8 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 		if debugFlag.Load() { log.Printf("[QUIC-TLS] bad ClientHello: %v", err) }
 		return
 	}
+
+	qc.applyPeerTransportParams(ch.QUICTransportParams)
 	if debugFlag.Load() { log.Printf("[H3-TLS] ClientHello: SNI=%q TLS13=%v suites=%v x25519=%v sessionID_len=%d",
 		ch.ServerName, ch.SupportsTLS13(), ch.CipherSuites, ch.X25519PubKey != nil, len(ch.SessionID)) }
 	if debugFlag.Load() { log.Printf("[H3-TLS] ClientHello first 20 bytes: %x", data[:min(20, len(data))]) }
@@ -246,6 +248,40 @@ const (
 	quicTPInitialSrcCID           = 0x0f
 	quicTPActiveConnIDLimit       = 0x0e
 )
+
+// quicParsePeerTransportParams extracts the peer's send-relevant flow-control
+// limits from the QUIC transport parameters extension (RFC 9000 §18.2). Missing
+// parameters are reported as 0 so callers fall back to a conservative default.
+// Honoring them is required to avoid overrunning the peer's receive window,
+// which would trigger a FLOW_CONTROL_ERROR connection abort.
+func quicParsePeerTransportParams(data []byte) (initialMaxData, maxStreamDataBidiLocal, maxStreamDataBidiRemote, maxStreamDataUni uint64) {
+	for len(data) > 0 {
+		id, n := quicParseVarint(data)
+		if n == 0 {
+			return
+		}
+		data = data[n:]
+		plen, m := quicParseVarint(data)
+		if m == 0 || uint64(len(data)-m) < plen {
+			return
+		}
+		data = data[m:]
+		val := data[:plen]
+		data = data[plen:]
+
+		switch id {
+		case quicTPInitialMaxData:
+			initialMaxData, _ = quicParseVarint(val)
+		case quicTPInitialMaxStreamBidiL:
+			maxStreamDataBidiLocal, _ = quicParseVarint(val)
+		case quicTPInitialMaxStreamBidiR:
+			maxStreamDataBidiRemote, _ = quicParseVarint(val)
+		case quicTPInitialMaxStreamUni:
+			maxStreamDataUni, _ = quicParseVarint(val)
+		}
+	}
+	return
+}
 
 func quicBuildTransportParams(qc *QUICConn) []byte {
 	var tp []byte

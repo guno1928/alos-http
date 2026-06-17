@@ -16,9 +16,9 @@ import (
 var udpDeadlineZero time.Time
 
 const (
-	ioUringOpRecvmsg   = 5
-	ioUringOpSendmsg   = 9
-	soReusePort        = 15
+	ioUringOpRecvmsg = 5
+	ioUringOpSendmsg = 9
+	soReusePort      = 15
 )
 
 type iovec struct {
@@ -161,7 +161,15 @@ func (c *ioUringUDPConn) sendTo(buf []byte, addr *net.UDPAddr) (int, error) {
 		return 0, net.ErrClosed
 	}
 
+	// Fast path: non-blocking send. On a momentarily full socket buffer
+	// (EAGAIN/ENOBUFS) retry with a blocking send instead of silently dropping
+	// the datagram: a drop here is invisible to the caller (still counted as
+	// "sent") and forces the peer to wait for a much later retransmit, stalling
+	// large transfers. Congestion control bounds the burst, so the block is brief.
 	err := syscall.Sendto(c.fd, buf, syscall.MSG_DONTWAIT, sa)
+	for (err == syscall.EAGAIN || err == syscall.EWOULDBLOCK || err == syscall.ENOBUFS) && !c.closed.Load() {
+		err = syscall.Sendto(c.fd, buf, 0, sa)
+	}
 	if err != nil {
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] sendTo: FAILED %d bytes to %s: %v", len(buf), addr, err)

@@ -57,6 +57,12 @@ func run() int {
 	s.Router.GET("/big", func(req *core.Request, resp *core.Response) {
 		resp.Status(200).String(big)
 	})
+	// 8 MiB exceeds the peer's initial flow-control window many times over, so it
+	// exercises flow control, congestion control, and loss recovery end to end.
+	huge := strings.Repeat("B", 8<<20)
+	s.Router.GET("/huge", func(req *core.Request, resp *core.Response) {
+		resp.Status(200).String(huge)
+	})
 
 	go func() { _ = s.ListenAndServeQUIC() }()
 	time.Sleep(1500 * time.Millisecond)
@@ -92,9 +98,37 @@ func run() int {
 		err == nil && len(body) == 512<<10 && strings.Trim(body, "A") == "",
 		fmt.Sprintf("len=%d err=%v", len(body), err))
 
+	body, _, err = do(client, "GET", "https://"+addr+"/big", nil)
+	_ = body
+	body, _, err = do(client, "GET", "https://"+addr+"/huge", nil)
+	check("GET /huge (8 MiB integrity, flow + congestion control)",
+		err == nil && len(body) == 8<<20 && strings.Trim(body, "B") == "",
+		fmt.Sprintf("len=%d err=%v", len(body), err))
+
 	body, _, err = do(client, "GET", "https://"+addr+"/hello", nil)
-	check("GET /hello after /big (connection not wedged by key update)",
+	check("GET /hello after /huge (connection still usable)",
 		err == nil && body == "hello-over-h3", fmt.Sprintf("body=%q err=%v", body, err))
+
+	// Several multi-MB responses concurrently: stresses per-stream + connection
+	// flow control and the shared congestion window together.
+	var hugeWg sync.WaitGroup
+	var hugeMu sync.Mutex
+	hugeOK := 0
+	for i := 0; i < 6; i++ {
+		hugeWg.Add(1)
+		go func() {
+			defer hugeWg.Done()
+			b, _, e := do(client, "GET", "https://"+addr+"/huge", nil)
+			if e == nil && len(b) == 8<<20 {
+				hugeMu.Lock()
+				hugeOK++
+				hugeMu.Unlock()
+			}
+		}()
+	}
+	hugeWg.Wait()
+	check(fmt.Sprintf("6x 8 MiB concurrent (%d/6)", hugeOK), hugeOK == 6,
+		fmt.Sprintf("%d/6 succeeded", hugeOK))
 
 	const n = 40
 	var wg sync.WaitGroup

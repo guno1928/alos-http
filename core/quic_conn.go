@@ -72,6 +72,17 @@ type QUICConn struct {
 	dataSent      uint64
 	dataRecv      uint64
 
+	// Send-side flow control (RFC 9000 §4) and congestion control are driven by
+	// a dedicated sendLoop goroutine so the receive loop never blocks on
+	// transmission. sendFlowMu guards connection-level send accounting; lossMu
+	// guards the loss/congestion state shared between sendLoop and the receive
+	// loop; sendSignal wakes the sender after new data, ACKs, or window updates.
+	sendFlowMu                 sync.Mutex
+	lossMu                     sync.Mutex
+	sendSignal                 chan struct{}
+	peerMaxStreamDataBidiLocal uint64
+	peerMaxStreamDataUni       uint64
+
 	server     *Server
 	remoteAddr net.Addr
 	udpConn    net.PacketConn
@@ -109,6 +120,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	}
 
 	qc.inbound = make(chan []byte, 256)
+	qc.sendSignal = make(chan struct{}, 1)
 	qc.recvLargest[0] = -1
 	qc.recvLargest[1] = -1
 	qc.recvLargest[2] = -1
@@ -120,6 +132,118 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	qc.dstCIDLen = copy(qc.dstConnID[:], scid)
 
 	return qc
+}
+
+// quicFallbackStreamWindow is the initial per-stream send window used only when
+// the peer's transport parameters could not be parsed; small enough to stay
+// within any reasonable peer limit until a MAX_STREAM_DATA frame opens it.
+const quicFallbackStreamWindow = 64 << 10
+
+// applyPeerTransportParams records the peer's advertised flow-control limits so
+// the server never sends past what the peer can receive (RFC 9000 §4).
+func (qc *QUICConn) applyPeerTransportParams(tp []byte) {
+	maxData, bidiLocal, _, uni := quicParsePeerTransportParams(tp)
+	qc.sendFlowMu.Lock()
+	if maxData > 0 {
+		qc.maxDataRemote = maxData
+	}
+	qc.sendFlowMu.Unlock()
+	if bidiLocal == 0 {
+		bidiLocal = quicFallbackStreamWindow
+	}
+	if uni == 0 {
+		uni = quicFallbackStreamWindow
+	}
+	qc.peerMaxStreamDataBidiLocal = bidiLocal
+	qc.peerMaxStreamDataUni = uni
+}
+
+// connSendWindow reports remaining connection-level send credit.
+func (qc *QUICConn) connSendWindow() uint64 {
+	qc.sendFlowMu.Lock()
+	defer qc.sendFlowMu.Unlock()
+	if qc.dataSent >= qc.maxDataRemote {
+		return 0
+	}
+	return qc.maxDataRemote - qc.dataSent
+}
+
+func (qc *QUICConn) addDataSent(n uint64) {
+	qc.sendFlowMu.Lock()
+	qc.dataSent += n
+	qc.sendFlowMu.Unlock()
+}
+
+func (qc *QUICConn) lossCanSend() bool {
+	qc.lossMu.Lock()
+	defer qc.lossMu.Unlock()
+	return qc.loss.canSend()
+}
+
+// wakeSender nudges the dedicated send goroutine. It never blocks: a pending
+// signal already guarantees another flush pass.
+func (qc *QUICConn) wakeSender() {
+	select {
+	case qc.sendSignal <- struct{}{}:
+	default:
+	}
+}
+
+// sendLoop is the sole owner of stream-data transmission for a connection.
+// Decoupling it from the receive loop means inbound packets (ACKs, window
+// updates) are always processed promptly, and all flow-control/congestion
+// accounting happens in one goroutine, free of races.
+func (qc *QUICConn) sendLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[QUIC-PANIC] sendLoop panic: %v", r)
+		}
+	}()
+	for {
+		select {
+		case <-qc.sendSignal:
+			qc.flushStreams()
+		case <-qc.done:
+			return
+		}
+	}
+}
+
+func (qc *QUICConn) flushStreams() {
+	qc.streamsMu.Lock()
+	streams := make([]*QUICStream, 0, len(qc.streams))
+	for _, s := range qc.streams {
+		streams = append(streams, s)
+	}
+	qc.streamsMu.Unlock()
+	for _, s := range streams {
+		qc.drainStream(s)
+	}
+}
+
+// drainStream transmits as much of one stream's buffered data as the congestion
+// window and the peer's flow-control limits permit. It stops (leaving the rest
+// buffered) when blocked; a later ACK or window-update wakes the sender again.
+func (qc *QUICConn) drainStream(s *QUICStream) {
+	for {
+		if !qc.lossCanSend() {
+			return // congestion-window blocked; ACK clocking resumes us
+		}
+		data, offset, fin, blocked := s.drainSendBuf(quicMaxPacketSize-100, qc.connSendWindow())
+		if blocked {
+			return // flow-control blocked
+		}
+		if len(data) == 0 && !fin {
+			return
+		}
+		var frames []byte
+		frames = quicAppendStreamFrame(frames, s.id, offset, data, fin)
+		qc.sendFrames(quicSpaceAppData, frames, true)
+		qc.addDataSent(uint64(len(data)))
+		if fin || len(data) == 0 {
+			return
+		}
+	}
 }
 
 func (qc *QUICConn) srcCID() []byte {
@@ -373,10 +497,14 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 
 	visitor := &quicFrameVisitor{
 		onACK: func(f quicAckFrame) {
+			qc.lossMu.Lock()
 			lostFrames := qc.loss.onAckReceived(space, f, quicMaxAckDelay)
+			qc.lossMu.Unlock()
 			for _, frames := range lostFrames {
 				qc.retransmitFrames(space, frames)
 			}
+			// Acks free congestion-window space; resume any blocked stream sends.
+			qc.wakeSender()
 		},
 		onCrypto: func(f quicCryptoFrame) {
 			needsAck = true
@@ -388,9 +516,12 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		},
 		onMaxData: func(f quicMaxDataFrame) {
 			needsAck = true
+			qc.sendFlowMu.Lock()
 			if f.maxData > qc.maxDataRemote {
 				qc.maxDataRemote = f.maxData
 			}
+			qc.sendFlowMu.Unlock()
+			qc.wakeSender()
 		},
 		onMaxStreamData: func(f quicMaxStreamDataFrame) {
 			needsAck = true
@@ -403,6 +534,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 				s.mu.Unlock()
 			}
 			qc.streamsMu.Unlock()
+			qc.wakeSender()
 		},
 		onMaxStreams: func(f quicMaxStreamsFrame) {
 			needsAck = true
@@ -474,6 +606,9 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 	s, ok := qc.streams[f.streamID]
 	if !ok {
 		s = newQUICStream(f.streamID, qc)
+		if quicStreamIsBidi(f.streamID) && qc.peerMaxStreamDataBidiLocal > 0 {
+			s.maxSend = qc.peerMaxStreamDataBidiLocal
+		}
 		qc.streams[f.streamID] = s
 	}
 	qc.streamsMu.Unlock()
@@ -511,6 +646,9 @@ func (qc *QUICConn) openLocalUniStream() *QUICStream {
 	id := qc.nextUniLocal
 	qc.nextUniLocal += 4
 	s := newQUICStream(id, qc)
+	if qc.peerMaxStreamDataUni > 0 {
+		s.maxSend = qc.peerMaxStreamDataUni
+	}
 	qc.streams[id] = s
 	qc.streamsMu.Unlock()
 	return s
@@ -559,7 +697,9 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 
 	pn := qc.sendPN[space]
 	qc.sendPN[space]++
+	qc.lossMu.Lock()
 	largestAcked := qc.loss.largestAcked[space]
+	qc.lossMu.Unlock()
 
 	var packet []byte
 	switch space {
@@ -590,24 +730,9 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 			log.Printf("[QUIC-DBG] sendFrames: space=%d pn=%d pktLen=%d framesLen=%d sendErr=%v dst=%v",
 				space, pn, len(packet), len(frames), sendErr, qc.udpAddr)
 		}
+		qc.lossMu.Lock()
 		qc.loss.onPacketSent(space, pn, len(packet), ackEliciting, frames)
-	}
-}
-
-func (qc *QUICConn) sendStreamData(s *QUICStream) {
-	for {
-		data, offset, fin := s.drainSendBuf(quicMaxPacketSize - 100)
-		if len(data) == 0 && !fin {
-			return
-		}
-
-		var frames []byte
-		frames = quicAppendStreamFrame(frames, s.id, offset, data, fin)
-		qc.sendFrames(quicSpaceAppData, frames, true)
-
-		if fin || len(data) == 0 {
-			return
-		}
+		qc.lossMu.Unlock()
 	}
 }
 
@@ -661,7 +786,9 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 
 	pn0 := qc.sendPN[quicSpaceInitial]
 	qc.sendPN[quicSpaceInitial]++
+	qc.lossMu.Lock()
 	la0 := qc.loss.largestAcked[quicSpaceInitial]
+	qc.lossMu.Unlock()
 
 	var hsMessages []byte
 	hsMessages = append(hsMessages, ee...)
@@ -679,7 +806,9 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	firstHSFrames = quicAppendCryptoFrame(firstHSFrames, 0, firstHSChunk)
 	pnHS0 := qc.sendPN[quicSpaceHandshake]
 	qc.sendPN[quicSpaceHandshake]++
+	qc.lossMu.Lock()
 	laHS := qc.loss.largestAcked[quicSpaceHandshake]
+	qc.lossMu.Unlock()
 	firstHSPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), firstHSFrames, pnHS0, laHS, hsKeys)
 
 	if debugFlag.Load() {
@@ -710,8 +839,10 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 			datagram[len(initialPkt):min(len(initialPkt)+20, len(datagram))])
 	}
 	sendDatagram(datagram)
+	qc.lossMu.Lock()
 	qc.loss.onPacketSent(quicSpaceInitial, pn0, quicMaxPacketSize, true, initialFrames)
 	qc.loss.onPacketSent(quicSpaceHandshake, pnHS0, len(firstHSPkt), true, firstHSFrames)
+	qc.lossMu.Unlock()
 
 	hsOffset := uint64(len(firstHSChunk))
 	remaining := hsMessages[len(firstHSChunk):]
@@ -731,7 +862,9 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 				chunkIdx+1, chunkIdx, len(hsPkt), hsOffset, len(chunk))
 		}
 		sendDatagram(hsPkt)
+		qc.lossMu.Lock()
 		qc.loss.onPacketSent(quicSpaceHandshake, pnHS, len(hsPkt), true, hsFrames)
+		qc.lossMu.Unlock()
 		hsOffset += uint64(len(chunk))
 		remaining = remaining[len(chunk):]
 		chunkIdx++

@@ -219,6 +219,7 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 	connMap.Store(srcCIDKey, qc)
 
 	go qc.recvLoop()
+	go qc.sendLoop()
 	go qc.runIdleTimer()
 
 	Stats.TotalConns.Add(1)

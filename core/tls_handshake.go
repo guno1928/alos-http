@@ -242,15 +242,16 @@ func ComputeFinished(h func() hash.Hash, hashLen int, baseSecret, transcriptHash
 }
 
 type ParsedClientHello struct {
-	SessionID         []byte
-	CipherSuites      []uint16
-	X25519PubKey      []byte
-	ALPNProtos        []string
-	ServerName        string
-	SupportedVersions []uint16
-	SupportedGroups   []uint16
-	SignatureSchemes  []uint16
-	Random            [32]byte
+	SessionID           []byte
+	CipherSuites        []uint16
+	X25519PubKey        []byte
+	ALPNProtos          []string
+	ServerName          string
+	QUICTransportParams []byte
+	SupportedVersions   []uint16
+	SupportedGroups     []uint16
+	SignatureSchemes    []uint16
+	Random              [32]byte
 
 	hasUncompressedPoint bool
 
@@ -282,6 +283,7 @@ func (ch *ParsedClientHello) Reset() {
 	ch.SupportedVersions = nil
 	ch.SupportedGroups = nil
 	ch.SignatureSchemes = nil
+	ch.QUICTransportParams = nil
 	ch.hasUncompressedPoint = false
 	ch.cipherSuitesOverflow = nil
 	ch.supportedVersOverflow = nil
@@ -401,6 +403,8 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 			result.X25519PubKey = findX25519KeyShare(result, extData)
 		case 0x000a:
 			result.SupportedGroups = parseU16List(extData)
+		case 0x0039:
+			result.QUICTransportParams = extData
 		case 0x000d:
 			result.SignatureSchemes = parseU16List(extData)
 		case 0x000b:

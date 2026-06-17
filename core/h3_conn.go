@@ -32,7 +32,7 @@ func (h3 *H3Conn) sendControlStream() {
 	buf = h3AppendStreamType(buf, h3StreamControl)
 	buf = h3AppendSettingsFrame(buf)
 	s.Write(buf)
-	h3.qconn.sendStreamData(s)
+	h3.qconn.wakeSender()
 }
 
 func (h3 *H3Conn) sendQPACKStreams() {
@@ -40,13 +40,13 @@ func (h3 *H3Conn) sendQPACKStreams() {
 	var encBuf []byte
 	encBuf = h3AppendStreamType(encBuf, h3StreamQPACKEnc)
 	enc.Write(encBuf)
-	h3.qconn.sendStreamData(enc)
+	h3.qconn.wakeSender()
 
 	dec := h3.qconn.openLocalUniStream()
 	var decBuf []byte
 	decBuf = h3AppendStreamType(decBuf, h3StreamQPACKDec)
 	dec.Write(decBuf)
-	h3.qconn.sendStreamData(dec)
+	h3.qconn.wakeSender()
 }
 
 func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
@@ -168,5 +168,5 @@ func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 
 	s.Write(frames)
 	s.FinishWrite()
-	h3.qconn.sendStreamData(s)
+	h3.qconn.wakeSender()
 }

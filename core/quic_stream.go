@@ -165,28 +165,48 @@ func (s *QUICStream) Close() {
 	}
 }
 
-func (s *QUICStream) drainSendBuf(maxBytes int) (data []byte, offset uint64, fin bool) {
+// drainSendBuf removes up to maxBytes for transmission, capped by both the
+// per-stream send window (s.maxSend - s.sendOff) and the supplied
+// connection-level window. blocked is true when data remains buffered but no
+// flow-control credit is available, so the caller must wait for a window update
+// rather than overrunning the peer's limit (RFC 9000 §4).
+func (s *QUICStream) drainSendBuf(maxBytes int, connWindow uint64) (data []byte, offset uint64, fin, blocked bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.sendBuf) == 0 {
 		if s.sendFin && !s.sendClosed {
-			return nil, s.sendOff, true
+			return nil, s.sendOff, true, false
 		}
-		return nil, s.sendOff, false
+		return nil, s.sendOff, false, false
 	}
 
-	n := len(s.sendBuf)
-	if n > maxBytes {
-		n = maxBytes
+	allowed := uint64(maxBytes)
+	var streamWindow uint64
+	if s.maxSend > s.sendOff {
+		streamWindow = s.maxSend - s.sendOff
+	}
+	if streamWindow < allowed {
+		allowed = streamWindow
+	}
+	if connWindow < allowed {
+		allowed = connWindow
+	}
+	if allowed == 0 {
+		return nil, s.sendOff, false, true
+	}
+
+	n := uint64(len(s.sendBuf))
+	if n > allowed {
+		n = allowed
 	}
 
 	data = make([]byte, n)
 	copy(data, s.sendBuf[:n])
 	offset = s.sendOff
 	s.sendBuf = s.sendBuf[n:]
-	s.sendOff += uint64(n)
+	s.sendOff += n
 
 	fin = s.sendFin && len(s.sendBuf) == 0
-	return data, offset, fin
+	return data, offset, fin, false
 }

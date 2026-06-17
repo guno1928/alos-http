@@ -3,20 +3,25 @@ package core
 import "time"
 
 const (
-	quicInitialRTT        = 333 * time.Millisecond
-	quicMaxAckDelay       = 25 * time.Millisecond
-	quicTimerGranularity  = time.Millisecond
-	quicPktThreshold      = 3
-	quicTimeThreshold     = 9.0 / 8.0
+	quicInitialRTT       = 333 * time.Millisecond
+	quicMaxAckDelay      = 25 * time.Millisecond
+	quicTimerGranularity = time.Millisecond
+	quicPktThreshold     = 3
+	quicTimeThreshold    = 9.0 / 8.0
+
+	// Congestion control (RFC 9002 §7, NewReno).
+	quicMaxDatagramSize = 1200
+	quicInitialCwnd     = 10 * quicMaxDatagramSize
+	quicMinCwnd         = 2 * quicMaxDatagramSize
 )
 
 type quicSentPacket struct {
-	pn          uint64
-	sent        time.Time
-	size        int
-	ackElicit   bool
-	frames      []byte
-	inFlight    bool
+	pn        uint64
+	sent      time.Time
+	size      int
+	ackElicit bool
+	frames    []byte
+	inFlight  bool
 }
 
 type quicLossState struct {
@@ -31,9 +36,14 @@ type quicLossState struct {
 	sent          [3][]quicSentPacket
 	bytesInFlight int
 
-	ptoCount     int
-	ptoTimerSet  bool
-	ptoDeadline  time.Time
+	// NewReno congestion control (RFC 9002 §7).
+	cwnd               int
+	ssthresh           int
+	congestionRecovery time.Time
+
+	ptoCount    int
+	ptoTimerSet bool
+	ptoDeadline time.Time
 }
 
 func newQuicLossState() *quicLossState {
@@ -41,11 +51,45 @@ func newQuicLossState() *quicLossState {
 		smoothedRTT: quicInitialRTT,
 		rttVar:      quicInitialRTT / 2,
 		minRTT:      0,
+		cwnd:        quicInitialCwnd,
+		ssthresh:    1<<62 - 1, // effectively unbounded until the first loss
 	}
 	ls.largestAcked[0] = -1
 	ls.largestAcked[1] = -1
 	ls.largestAcked[2] = -1
 	return ls
+}
+
+// canSend reports whether the congestion window permits sending more data.
+func (ls *quicLossState) canSend() bool {
+	return ls.bytesInFlight < ls.cwnd
+}
+
+// onCongestionAck grows the congestion window for newly acknowledged bytes:
+// slow start while below ssthresh, otherwise congestion avoidance.
+func (ls *quicLossState) onCongestionAck(ackedBytes int) {
+	if ackedBytes <= 0 {
+		return
+	}
+	if ls.cwnd < ls.ssthresh {
+		ls.cwnd += ackedBytes
+		return
+	}
+	ls.cwnd += quicMaxDatagramSize * ackedBytes / ls.cwnd
+}
+
+// onCongestionLoss applies a multiplicative decrease, once per recovery period
+// (RFC 9002 §7.3.2).
+func (ls *quicLossState) onCongestionLoss(lostSentTime, now time.Time) {
+	if !lostSentTime.After(ls.congestionRecovery) {
+		return
+	}
+	ls.congestionRecovery = now
+	ls.ssthresh = ls.cwnd / 2
+	if ls.ssthresh < quicMinCwnd {
+		ls.ssthresh = quicMinCwnd
+	}
+	ls.cwnd = ls.ssthresh
 }
 
 func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit bool, frames []byte) {
@@ -88,6 +132,14 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 	if len(ackedPackets) > 0 {
 		latestRTT := time.Since(ackedPackets[len(ackedPackets)-1].sent)
 		ls.updateRTT(latestRTT, ackDelay)
+
+		ackedBytes := 0
+		for i := range ackedPackets {
+			if ackedPackets[i].inFlight {
+				ackedBytes += ackedPackets[i].size
+			}
+		}
+		ls.onCongestionAck(ackedBytes)
 	}
 
 	lostFrames = ls.detectLost(space, lostFrames)
@@ -124,12 +176,14 @@ func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
 	}
 	cutoff := time.Now().Add(-lossDelay)
 
+	now := time.Now()
 	remaining := ls.sent[space][:0]
 	for i := range ls.sent[space] {
 		sp := &ls.sent[space][i]
 		if sp.pn < threshold || sp.sent.Before(cutoff) {
 			if sp.inFlight {
 				ls.bytesInFlight -= sp.size
+				ls.onCongestionLoss(sp.sent, now)
 			}
 			if len(sp.frames) > 0 {
 				lostFrames = append(lostFrames, sp.frames)

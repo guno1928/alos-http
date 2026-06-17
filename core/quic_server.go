@@ -164,6 +164,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	connMap.Store(srcCIDKey, qc)
 
 	go qc.recvLoop()
+	go qc.sendLoop()
 	go qc.runIdleTimer()
 
 	Stats.TotalConns.Add(1)
