@@ -144,8 +144,19 @@ func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, d
 }
 
 func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, scid []byte, connMap *ShardedMap[string, *QUICConn]) *QUICConn {
+	// Bound live-connection cardinality before doing any work: a spoofed Initial
+	// must not derive keys, allocate a conn, or spawn goroutines once we are at
+	// the cap. Fail closed by dropping the Initial. See finding C3.
+	if !s.reserveQUICConn() {
+		if debugFlag.Load() {
+			log.Printf("[QUIC] conn cap (%d) reached, dropping Initial from %s", s.quicConnCap(), remoteAddr)
+		}
+		return nil
+	}
+
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
+		s.releaseQUICConn()
 		if debugFlag.Load() {
 			log.Printf("[QUIC] derive initial keys: %v", err)
 		}
@@ -175,6 +186,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 		<-qc.done
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		s.releaseQUICConn()
 	}()
 
 	return qc

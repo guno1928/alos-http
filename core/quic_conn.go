@@ -21,16 +21,28 @@ const (
 	quicInitialMaxStreamData = 1 << 20
 	quicMaxBidiStreams       = 1024
 	quicMaxUniStreams        = 128
+
+	// quicUnvalidatedIdleTimeout reaps connections whose path has not yet been
+	// validated (no decryptable Handshake packet processed) far sooner than the
+	// full idle timeout, so a flood of spoofed Initials is freed quickly instead
+	// of pinning a conn + 2 goroutines for the full idle window. See finding C3.
+	quicUnvalidatedIdleTimeout = 3 * time.Second
+
+	// quicMaxLiveConns bounds the total number of live QUIC connections the
+	// server tracks. When at the cap, a new Initial is dropped (no conn
+	// allocated, no goroutines spawned) rather than growing unbounded under a
+	// spoofed-Initial handshake flood. Generous default; see finding C3.
+	quicMaxLiveConns = 65536
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +55,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -71,6 +83,14 @@ type QUICConn struct {
 
 	idleTimeout time.Duration
 	lastActive  time.Time
+
+	// Anti-amplification accounting (RFC 9000 §8). Touched from both the
+	// recv goroutine and send paths, so accessed via atomics. pathValidated
+	// flips true once a decryptable Handshake packet is processed, which
+	// validates the peer address per RFC 9000 §8.1. See finding C3.
+	bytesReceived atomic.Uint64
+	bytesSent     atomic.Uint64
+	pathValidated atomic.Bool
 
 	pendingFrames []byte
 	h3            *H3Conn
@@ -110,6 +130,31 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	return qc
 }
 
+// quicConnCap returns the maximum number of live QUIC connections the server
+// will track concurrently.
+func (s *Server) quicConnCap() int64 {
+	return quicMaxLiveConns
+}
+
+// reserveQUICConn atomically reserves a live-connection slot, failing closed
+// when the server is already at the cardinality cap. On a denied reservation it
+// undoes its own increment so the gauge cannot drift. The caller MUST pair a
+// successful reservation (true) with exactly one releaseQUICConn once the
+// connection is torn down. See finding C3 (handshake-flood mitigation).
+func (s *Server) reserveQUICConn() bool {
+	if s.quicLiveConns.Add(1) > s.quicConnCap() {
+		s.quicLiveConns.Add(-1)
+		return false
+	}
+	return true
+}
+
+// releaseQUICConn frees a previously reserved live-connection slot. It must be
+// called exactly once per successful reserveQUICConn.
+func (s *Server) releaseQUICConn() {
+	s.quicLiveConns.Add(-1)
+}
+
 func (qc *QUICConn) srcCID() []byte {
 	return qc.srcConnID[:qc.srcCIDLen]
 }
@@ -145,6 +190,7 @@ func (qc *QUICConn) recvLoop() {
 		select {
 		case data := <-qc.inbound:
 			qc.lastActive = time.Now()
+			qc.bytesReceived.Add(uint64(len(data)))
 			qc.processPacket(data)
 		case <-qc.done:
 			return
@@ -256,7 +302,45 @@ func (qc *QUICConn) handleHandshakePacket(packet []byte, hdr *quicPacketHeader) 
 	if debugFlag.Load() {
 		log.Printf("[QUIC-DBG] handleHandshake: decrypted %d bytes, pn=%d", len(plaintext), hdr.pn)
 	}
+
+	// A decryptable Handshake packet proves the peer received our Initial
+	// keys at this address, validating the path per RFC 9000 §8.1.
+	qc.markPathValidated()
+
 	qc.processFrames(quicSpaceHandshake, hdr.pn, plaintext)
+}
+
+// markPathValidated records that the peer's address has been validated.
+// Idempotent and race-safe; the effective idle timeout (see effectiveIdleTimeout)
+// reads pathValidated directly, so no further state needs to change here.
+func (qc *QUICConn) markPathValidated() {
+	qc.pathValidated.Store(true)
+}
+
+// effectiveIdleTimeout returns the unvalidated (fast) idle timeout until the
+// peer's path is validated, then the full idle timeout. Reaping unvalidated
+// conns quickly bounds the cost of a spoofed-Initial flood. See finding C3.
+func (qc *QUICConn) effectiveIdleTimeout() time.Duration {
+	if qc.pathValidated.Load() {
+		return qc.idleTimeout
+	}
+	if qc.idleTimeout < quicUnvalidatedIdleTimeout {
+		return qc.idleTimeout
+	}
+	return quicUnvalidatedIdleTimeout
+}
+
+// amplificationBudgetExceeded reports whether sending n more bytes to an
+// unvalidated path would exceed the RFC 9000 §8 3x anti-amplification budget.
+// TODO(C3-followup): once Retry/token address validation lands, gate
+// sendFirstFlight (and other server sends before path validation) on this.
+// Currently advisory only — it is computed and tested but never used to block
+// a send, to avoid changing handshake behavior in this minimal PR.
+func (qc *QUICConn) amplificationBudgetExceeded(n int) bool {
+	if qc.pathValidated.Load() {
+		return false
+	}
+	return qc.bytesSent.Load()+uint64(n) > 3*qc.bytesReceived.Load()
 }
 
 func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
@@ -482,6 +566,7 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 			log.Printf("[QUIC-DBG] sendFrames: space=%d pn=%d pktLen=%d framesLen=%d sendErr=%v dst=%v",
 				space, pn, len(packet), len(frames), sendErr, qc.udpAddr)
 		}
+		qc.bytesSent.Add(uint64(len(packet)))
 		qc.loss.onPacketSent(space, pn, len(packet), ackEliciting, frames)
 	}
 }
@@ -542,6 +627,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		} else if qc.udpConn != nil {
 			qc.udpConn.WriteTo(data, qc.remoteAddr)
 		}
+		qc.bytesSent.Add(uint64(len(data)))
 	}
 
 	var initialFrames []byte
@@ -668,14 +754,17 @@ func (qc *QUICConn) sendConnectionClose(errorCode uint64, reason string) {
 }
 
 func (qc *QUICConn) runIdleTimer() {
-	ticker := time.NewTicker(5 * time.Second)
+	// 1s granularity so the short unvalidated timeout (quicUnvalidatedIdleTimeout)
+	// is honored promptly under a spoofed-Initial flood; the cost is one extra
+	// wakeup/second per live conn, bounded by the connection cardinality cap.
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-qc.done:
 			return
 		case <-ticker.C:
-			if time.Since(qc.lastActive) > qc.idleTimeout {
+			if time.Since(qc.lastActive) > qc.effectiveIdleTimeout() {
 				qc.close()
 				return
 			}

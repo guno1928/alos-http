@@ -76,8 +76,8 @@ func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *ShardedMap[string
 		if err != nil {
 			if s.shuttingDown.Load() || uc.closed.Load() {
 				if debugFlag.Load() {
-				log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
-			}
+					log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
+				}
 				return
 			}
 			if debugFlag.Load() {
@@ -199,8 +199,19 @@ func newQUICConnIOUring(server *Server, uc *ioUringUDPConn, remoteAddr *net.UDPA
 }
 
 func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *ShardedMap[string, *QUICConn]) *QUICConn {
+	// Bound live-connection cardinality before doing any work: a spoofed Initial
+	// must not derive keys, allocate a conn, or spawn goroutines once we are at
+	// the cap. Fail closed by dropping the Initial. See finding C3.
+	if !s.reserveQUICConn() {
+		if debugFlag.Load() {
+			log.Printf("[QUIC] conn cap (%d) reached, dropping Initial from %s", s.quicConnCap(), remoteAddr)
+		}
+		return nil
+	}
+
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
+		s.releaseQUICConn()
 		if debugFlag.Load() {
 			log.Printf("[QUIC] derive initial keys: %v", err)
 		}
@@ -231,6 +242,7 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 		<-qc.done
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		s.releaseQUICConn()
 	}()
 
 	return qc
