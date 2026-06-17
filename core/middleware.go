@@ -179,7 +179,7 @@ func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
 		return
 	}
 	if xff := req.Header("x-forwarded-for"); xff != "" {
-		ip := lastXFFEntry(xff)
+		ip := clientXFFEntry(xff, matcher)
 		if isValidIP(ip) {
 			req.RemoteAddr = ip
 			return
@@ -193,15 +193,34 @@ func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
 	}
 }
 
-func lastXFFEntry(xff string) string {
-	last := xff
-	for i := len(xff) - 1; i >= 0; i-- {
-		if xff[i] == ',' {
-			last = xff[i+1:]
-			break
+// clientXFFEntry selects the real client address from an X-Forwarded-For
+// header. Proxies append the address they received from on the right, so the
+// real client is the right-most entry that is not itself a trusted proxy:
+// walking right-to-left we skip our own proxy hops and stop at the first
+// untrusted address (the boundary between our chain and the caller). Taking
+// the right-most entry unconditionally would yield a proxy hop, and taking
+// any entry left of the boundary would trust attacker-supplied values. When
+// the matcher trusts all peers (no per-hop trust information, e.g. ProxyMode),
+// fall back to the right-most entry.
+func clientXFFEntry(xff string, matcher trustedProxyMatcher) string {
+	rest := xff
+	for {
+		comma := lastComma(rest)
+		entry := trimASCIISpace(rest[comma+1:])
+		if matcher.trustAll || comma < 0 || !matcher.allows(entry) {
+			return entry
+		}
+		rest = rest[:comma]
+	}
+}
+
+func lastComma(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == ',' {
+			return i
 		}
 	}
-	return trimASCIISpace(last)
+	return -1
 }
 
 func (ce *CORSEngine) Config() CORSConfig {
@@ -701,61 +720,22 @@ func BodyLimit(maxBytes int64) MiddlewareFunc {
 }
 
 // RealIP returns middleware that overwrites req.RemoteAddr with the
-// value from X-Forwarded-For or X-Real-IP headers. When trustedProxies
-// is non-empty, the header is only trusted if the direct client IP
-// matches one of the listed CIDRs or IPs. When trustedProxies is empty,
-// the header is always trusted — only use this behind a known proxy.
+// real client address from the X-Forwarded-For / X-Real-IP headers, but
+// only when the immediate peer is a configured trusted proxy. trustedProxies
+// is a list of CIDRs or IPs; the header is honored solely for peers that
+// match. When trustedProxies is empty the headers are ignored entirely —
+// the secure default — so an internet-facing client cannot spoof its IP and
+// poison rate-limit keys, logs, or handlers. From a trusted peer, the client
+// is taken as the right-most X-Forwarded-For entry that is not itself a
+// trusted proxy (the boundary between your proxy chain and the caller).
 //
 //	s.Router.Use(core.RealIP("10.0.0.0/8", "172.16.0.0/12"))
 func RealIP(trustedProxies ...string) MiddlewareFunc {
-	var nets []*net.IPNet
-	var ips []net.IP
-	for _, p := range trustedProxies {
-		if _, cidr, err := net.ParseCIDR(p); err == nil {
-			nets = append(nets, cidr)
-		} else if ip := net.ParseIP(p); ip != nil {
-			ips = append(ips, ip)
-		}
-	}
-	hasTrust := len(nets) > 0 || len(ips) > 0
-
-	isTrusted := func(remoteAddr string) bool {
-		if !hasTrust {
-			return true
-		}
-		host := extractIP(remoteAddr)
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return false
-		}
-		for _, n := range nets {
-			if n.Contains(ip) {
-				return true
-			}
-		}
-		for _, tip := range ips {
-			if tip.Equal(ip) {
-				return true
-			}
-		}
-		return false
-	}
+	matcher := newTrustedProxyMatcher(trustedProxies, false)
 
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
-			if isTrusted(req.RemoteAddr) {
-				if xff := req.Header("x-forwarded-for"); xff != "" {
-					ip := lastXFFEntry(xff)
-					if isValidIP(ip) {
-						req.RemoteAddr = ip
-					}
-				} else if xri := req.Header("x-real-ip"); xri != "" {
-					ip := trimASCIISpace(xri)
-					if isValidIP(ip) {
-						req.RemoteAddr = ip
-					}
-				}
-			}
+			applyTrustedRealIP(req, matcher)
 			next(req, resp)
 		}
 	}
