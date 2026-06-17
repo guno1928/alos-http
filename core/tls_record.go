@@ -155,11 +155,29 @@ func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
 	return dst
 }
 
+// maxInnerPaddingScan bounds how many trailing zero-padding bytes
+// StripInnerPlaintext will scan before giving up. RFC 8446 §5.4 permits
+// arbitrary zero padding, but scanning the whole (~16 KiB) record to find the
+// content-type byte lets a peer spend one content byte to force a full-record
+// backward scan. 256 bytes covers the ~universal zero-padding case while
+// capping the per-record CPU cost; records padded beyond this are rejected.
+const maxInnerPaddingScan = 256
+
 func StripInnerPlaintext(data []byte) (content []byte, contentType byte, err error) {
-	for i := len(data) - 1; i >= 0; i-- {
+	lo := 0
+	if len(data) > maxInnerPaddingScan+1 {
+		lo = len(data) - (maxInnerPaddingScan + 1)
+	}
+	for i := len(data) - 1; i >= lo; i-- {
 		if data[i] != 0 {
 			return data[:i], data[i], nil
 		}
+	}
+	if lo > 0 {
+		// Content byte is more than maxInnerPaddingScan bytes from the end:
+		// excessive padding, reject to bound the scan rather than walk the
+		// whole record.
+		return nil, 0, ErrInnerPaddingTooLong
 	}
 	return nil, 0, ErrAllZeroInner
 }
