@@ -751,7 +751,6 @@ func (worker *plainUringWorker) flushReqStats() {
 }
 
 func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, consumed int) func(*Request) net.Conn {
-	prefix := append([]byte(nil), conn.readBuf[consumed:conn.readN]...)
 	var once sync.Once
 	return func(req *Request) net.Conn {
 		once.Do(func() {
@@ -773,8 +772,14 @@ func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, 
 			}
 			conn.fd = -1
 			handed := net.Conn(wrapped)
-			if len(prefix) > 0 {
-				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
+			// Copy the buffered pipelined tail only here, on the rare
+			// hijack/streaming path. once.Do runs synchronously inside the
+			// handler (before the protocol-switch response and buffer
+			// compaction), so conn.readBuf is still valid — avoiding a
+			// per-request copy on the common path that never hijacks.
+			if prefix := conn.readBuf[consumed:conn.readN]; len(prefix) > 0 {
+				buf := append([]byte(nil), prefix...)
+				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(buf), wrapped)}
 			}
 			handed = worker.server.trackHandoffConn(handed)
 			if handed == nil {
