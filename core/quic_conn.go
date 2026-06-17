@@ -23,14 +23,19 @@ const (
 	quicMaxUniStreams        = 128
 )
 
+// QUIC transport error codes (RFC 9000 §20.1).
+const (
+	quicErrFlowControl uint64 = 0x03
+)
+
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +48,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -372,11 +377,60 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 	}
 	qc.streamsMu.Unlock()
 
-	s.handleStreamFrame(f)
+	newBytes, flowErr := s.handleStreamFrame(f)
+	if flowErr {
+		// Stream-level receive window exceeded (or an offset that would
+		// overflow). Fail closed with FLOW_CONTROL_ERROR rather than allocate.
+		qc.closeWithError(quicErrFlowControl, "stream flow control")
+		return
+	}
+
+	// Connection-level receive flow control: account for the bytes that newly
+	// advanced this stream's offset and reject if the conn window is exceeded.
+	// streamsMu also guards dataRecv (see h3_conn window-update path).
+	if newBytes > 0 {
+		qc.streamsMu.Lock()
+		if qc.dataRecv+newBytes > qc.maxDataLocal || qc.dataRecv+newBytes < qc.dataRecv {
+			qc.streamsMu.Unlock()
+			qc.closeWithError(quicErrFlowControl, "connection flow control")
+			return
+		}
+		qc.dataRecv += newBytes
+		qc.streamsMu.Unlock()
+
+		// EXTENSIBILITY SEAM: as the receive window is consumed we should grow
+		// it by emitting MAX_STREAM_DATA / MAX_DATA window updates so the peer
+		// can keep sending. The full window-update machinery is intentionally
+		// not implemented here; see the no-op hook below.
+		qc.maybeSendWindowUpdates(s, newBytes)
+	}
 
 	if f.fin && qc.h3 != nil && quicStreamIsBidi(f.streamID) && !quicStreamIsLocal(f.streamID, true) {
 		go qc.h3.handleRequestStream(s)
 	}
+}
+
+// maybeSendWindowUpdates is the placeholder for receive-window growth: when the
+// consumed portion of a stream/connection window crosses a threshold, issue
+// MAX_STREAM_DATA / MAX_DATA frames to advance the peer's send limits. It is a
+// deliberate no-op for now (the maintainer requested the seam without the full
+// machinery); wiring it up must not change the flow-control accounting above.
+func (qc *QUICConn) maybeSendWindowUpdates(s *QUICStream, consumed uint64) {
+	_ = s
+	_ = consumed
+	// TODO(flow-control): track consumed-vs-advertised per stream and per conn,
+	// then enqueue MAX_STREAM_DATA / MAX_DATA once a threshold (e.g. half the
+	// window) is reached. Until then the initial windows bound peer sends.
+}
+
+// closeWithError tears down the connection after signalling a transport error
+// to the peer. Safe to call from any frame handler; close() is idempotent.
+func (qc *QUICConn) closeWithError(errorCode uint64, reason string) {
+	if qc.closed.Load() {
+		return
+	}
+	qc.sendConnectionClose(errorCode, reason)
+	qc.close()
 }
 
 func (qc *QUICConn) getOrCreateStream(id uint64) *QUICStream {

@@ -34,13 +34,14 @@ type QUICStream struct {
 
 	mu sync.Mutex
 
-	recvBuf    []byte
-	recvOff    uint64
-	recvFin    bool
-	recvFinOff uint64
-	recvClosed bool
-	maxRecv    uint64
-	recvReady  chan struct{}
+	recvBuf     []byte
+	recvOff     uint64
+	recvHighOff uint64
+	recvFin     bool
+	recvFinOff  uint64
+	recvClosed  bool
+	maxRecv     uint64
+	recvReady   chan struct{}
 
 	sendBuf    []byte
 	sendOff    uint64
@@ -59,36 +60,79 @@ func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 	}
 }
 
-func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
+// handleStreamFrame ingests a received STREAM frame, enforcing stream-level
+// receive flow control. It returns the number of newly received bytes that
+// advance this stream's highest received offset (which the caller folds into
+// connection-level flow control) and whether the frame violated flow control.
+// On a flow-control violation it buffers nothing and reports flowControlError
+// so the caller can close the connection (fail closed).
+func (s *QUICStream) handleStreamFrame(f quicStreamFrame) (newBytes uint64, flowControlError bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.recvClosed {
-		return
+		return 0, false
 	}
 
-	if f.offset == s.recvOff {
+	// Treat the peer-supplied offset/length as hostile: the final absolute
+	// offset must fit within the advertised stream receive window. This also
+	// rejects any offset+len that would overflow uint64 before we allocate.
+	dataLen := uint64(len(f.data))
+	end := f.offset + dataLen
+	if end < f.offset || end > s.maxRecv {
+		return 0, true
+	}
+
+	// Connection flow control counts the largest offset ever received on the
+	// stream (RFC 9000 §4.1), tracked by recvHighOff, NOT the contiguous
+	// in-order boundary recvOff. Counting only the delta past the previous high
+	// offset means out-of-order frames are charged once and gap-filling
+	// retransmits charge nothing — no double counting, no inflation.
+	if end > s.recvHighOff {
+		newBytes = end - s.recvHighOff
+		s.recvHighOff = end
+	}
+
+	// Note: we never compute f.offset - s.recvOff when f.offset < s.recvOff;
+	// that unsigned subtraction wraps to a near-2^64 value and would drive a
+	// giant allocation. The switch below branches on ordering instead.
+
+	switch {
+	case f.offset == s.recvOff:
 		s.recvBuf = append(s.recvBuf, f.data...)
-		s.recvOff += uint64(len(f.data))
-	} else if f.offset > s.recvOff {
-		needed := f.offset - s.recvOff + uint64(len(f.data))
+		s.recvOff = end
+
+	case f.offset > s.recvOff:
+		// Out-of-order ahead: reserve space up to end (bounded by maxRecv above).
+		needed := end - s.recvOff
 		if uint64(len(s.recvBuf)) < needed {
 			grown := make([]byte, needed)
 			copy(grown, s.recvBuf)
 			s.recvBuf = grown
 		}
 		copy(s.recvBuf[f.offset-s.recvOff:], f.data)
+
+	default:
+		// f.offset < s.recvOff: already-received data, possibly with a new tail.
+		// Append only the still-missing tail (if any) without any unsigned wrap.
+		if end > s.recvOff {
+			already := s.recvOff - f.offset
+			s.recvBuf = append(s.recvBuf, f.data[already:]...)
+			s.recvOff = end
+		}
 	}
 
 	if f.fin {
 		s.recvFin = true
-		s.recvFinOff = f.offset + uint64(len(f.data))
+		s.recvFinOff = end
 	}
 
 	select {
 	case s.recvReady <- struct{}{}:
 	default:
 	}
+
+	return newBytes, false
 }
 
 func (s *QUICStream) Read(p []byte) (int, error) {
