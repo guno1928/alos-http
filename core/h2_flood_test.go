@@ -140,7 +140,7 @@ func writeFrame(t *testing.T, client net.Conn, typ, flags byte, streamID uint32,
 
 func TestH2RapidResetTripsGoAway(t *testing.T) {
 	clock := &fakeClock{nanos: 1}
-	hc, client, wait := newTestH2Conn(t, clock)
+	_, client, wait := newTestH2Conn(t, clock)
 
 	// Drain frames the server sends (initial SETTINGS, WINDOW_UPDATE, pongs,
 	// RST acks) and surface the GOAWAY when it arrives.
@@ -154,16 +154,19 @@ func TestH2RapidResetTripsGoAway(t *testing.T) {
 		}
 	}()
 
-	// HEADERS (open, no END_STREAM) + RST_STREAM in a loop. The stream
-	// opens then is immediately reset before producing a response — the
-	// canonical Rapid Reset shape. Each RST increments the rapid-reset
-	// counter; well past H2MaxRapidResets it must trip. END_STREAM is
-	// intentionally omitted so no handler goroutine is dispatched: that
-	// keeps this test orthogonal to the C5 stream-lifecycle (UAF) fix,
-	// which owns the dispatch-vs-reset reclamation path in a separate PR.
+	// HEADERS (open, no END_STREAM) + RST_STREAM in a loop. The stream opens
+	// then is immediately reset before producing a response — the Rapid Reset
+	// shape. Each RST is charged to the reset-rate bucket; with the clock frozen
+	// the bucket never refills, so past its capacity (H2MaxRstStreams) it trips.
+	// END_STREAM is intentionally omitted so no handler goroutine is dispatched,
+	// keeping this test orthogonal to the C5 stream-lifecycle (UAF) fix on a
+	// separate branch. Crucially, the defense no longer decrements on handler
+	// completion (it is a rate bucket, not a counter), so the canonical
+	// HEADERS(END_STREAM)+RST loop can no longer cancel its own pressure — that
+	// is the behavior this fix restores; see consts.go H2MaxRstStreams.
 	headerBlock := []byte{0x82, 0x84, 0x87} // :method GET, :path /, :scheme https
 	var streamID uint32 = 1
-	for i := 0; i < H2MaxRapidResets+50; i++ {
+	for i := 0; i < H2MaxRstStreams+50; i++ {
 		writeFrame(t, client, H2FrameHeaders, H2FlagEndHeaders, streamID, headerBlock)
 		writeFrame(t, client, H2FrameRSTStream, 0, streamID, []byte{0, 0, 0, byte(H2ErrCancel)})
 		streamID += 2
@@ -183,9 +186,6 @@ func TestH2RapidResetTripsGoAway(t *testing.T) {
 
 	if !wait() {
 		t.Fatal("serveLoop did not exit after rapid-reset GOAWAY")
-	}
-	if got := hc.rstStreamCount.Load(); got <= H2MaxRapidResets {
-		t.Fatalf("rstStreamCount = %d, expected > %d", got, H2MaxRapidResets)
 	}
 }
 

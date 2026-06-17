@@ -22,15 +22,18 @@ const (
 	// these bound per-connection work driven by it and fail closed
 	// (GOAWAY + close) when exceeded.
 	//
-	// H2MaxRapidResets caps the running count of streams that opened and
-	// were reset/cancelled before completing normal work (CVE-2023-44487,
-	// "Rapid Reset"). Modeled on the Go stdlib net/http2 approach, which
-	// allows roughly MaxConcurrentStreams plus a small constant of
-	// in-flight resets before treating the peer as abusive. The counter
-	// rises on each abnormal reset and falls as legitimate work completes,
-	// so a well-behaved client that occasionally cancels never trips it;
-	// a HEADERS(END_STREAM)+RST_STREAM loop does.
-	H2MaxRapidResets = H2MaxConcurrentStream + 100
+	// H2MaxRstStreams / H2RstStreamRefillPerSec bound the RST_STREAM rate via a
+	// leaky bucket to stop Rapid Reset (CVE-2023-44487). A running counter that
+	// is decremented on stream completion does NOT work here: the canonical
+	// attack is HEADERS(END_STREAM)+RST_STREAM, where the END_STREAM dispatches a
+	// handler that completes and cancels the increment in lockstep, so the
+	// counter never climbs. A rate bucket has no such decrement: the burst
+	// allowance (capacity) tolerates a well-behaved client that occasionally
+	// cancels, while a sustained reset loop outruns the refill and trips
+	// GOAWAY(ENHANCE_YOUR_CALM)+close. Every RST_STREAM is charged, including
+	// resets of already-gone streams (the loop's steady state).
+	H2MaxRstStreams         = H2MaxConcurrentStream + 100
+	H2RstStreamRefillPerSec = 20
 
 	// H2MaxSettingsFrames / H2MaxPingFrames cap SETTINGS and PING frames
 	// over the connection lifetime via a leaky bucket: the allowance

@@ -60,11 +60,11 @@ type H2Conn struct {
 	pingBucket     leakyBucket
 	emptyBucket    leakyBucket
 
-	// rstStreamCount is the running Rapid-Reset counter (CVE-2023-44487).
-	// The read loop increments it on each abnormal reset; dispatchRequest
-	// decrements it when a stream completes legitimately. dispatch runs on
-	// its own goroutine, so this is atomic.
-	rstStreamCount atomic.Int64
+	// rstBucket bounds the RST_STREAM rate (Rapid Reset, CVE-2023-44487). It is
+	// a rate limiter, not a completion-decremented counter, so the canonical
+	// HEADERS(END_STREAM)+RST loop cannot cancel its own pressure. Owned by the
+	// read-loop goroutine like the other buckets; no synchronization needed.
+	rstBucket leakyBucket
 
 	// closeRequested is set by a flood/abuse check after it has queued a
 	// GOAWAY; serveLoop observes it and returns, letting the normal defer
@@ -364,6 +364,7 @@ func (hc *H2Conn) initFloodDefenses() {
 	hc.settingsBucket = leakyBucket{capacity: H2MaxSettingsFrames, refillPerSec: H2SettingsRefillPerSec}
 	hc.pingBucket = leakyBucket{capacity: H2MaxPingFrames, refillPerSec: H2PingRefillPerSec}
 	hc.emptyBucket = leakyBucket{capacity: H2MaxEmptyFrames, refillPerSec: H2EmptyFramesRefillPerSec}
+	hc.rstBucket = leakyBucket{capacity: H2MaxRstStreams, refillPerSec: H2RstStreamRefillPerSec}
 }
 
 // connFlood queues a GOAWAY with the given error code and requests teardown
@@ -375,21 +376,6 @@ func (hc *H2Conn) connFlood(errCode uint32) {
 	}
 	Dbg("[H2] %s flood defense tripped errCode=0x%x", hc.remoteAddr, errCode)
 	hc.sendGoAway(errCode)
-}
-
-// relieveRapidReset decrements the Rapid-Reset counter on legitimate stream
-// completion, clamped at zero so a long-lived connection's idle baseline is
-// never negative. Compare-and-swap loop because dispatch goroutines race.
-func (hc *H2Conn) relieveRapidReset() {
-	for {
-		cur := hc.rstStreamCount.Load()
-		if cur <= 0 {
-			return
-		}
-		if hc.rstStreamCount.CompareAndSwap(cur, cur-1) {
-			return
-		}
-	}
 }
 
 func (hc *H2Conn) sendGoAway(errCode uint32) {
@@ -627,15 +613,14 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 			hc.sendGoAway(H2ErrFrameSize)
 			return
 		}
-		// Rapid Reset (CVE-2023-44487): a peer that opens streams and
-		// resets them before they complete forces unbounded handler
-		// churn while never binding MAX_CONCURRENT_STREAMS. Count every
-		// reset of a stream the peer already pushed past idle but that
-		// has not finished; dispatchRequest decrements on legitimate
-		// completion. A RST for an unknown/already-gone stream also
-		// counts — that is exactly the loop's steady state once the
-		// handler goroutine has drained the entry.
-		if hc.rstStreamCount.Add(1) > H2MaxRapidResets {
+		// Rapid Reset (CVE-2023-44487): a peer that opens streams and resets them
+		// before they complete forces unbounded handler churn while never binding
+		// MAX_CONCURRENT_STREAMS. Charge every RST_STREAM to the reset-rate bucket
+		// (including resets of unknown/already-gone streams — the loop's steady
+		// state). A rate bucket, unlike a completion-decremented counter, cannot be
+		// cancelled by the very HEADERS(END_STREAM)+RST handler completions the
+		// attack generates: sustained resets beyond the refill rate trip the flood.
+		if !hc.rstBucket.admit(hc.now()) {
 			hc.connFlood(H2ErrEnhanceYourCalm)
 			return
 		}
@@ -1013,12 +998,6 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 
 func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	defer hc.dispatchWg.Done()
-	// Legitimate completion relieves Rapid-Reset pressure: a stream that
-	// ran a handler to completion is not part of an abusive churn loop, so
-	// drain one unit from the reset counter (clamped at zero). This is what
-	// keeps a well-behaved client that cancels occasionally from drifting
-	// toward the threshold while still tripping on a HEADERS+RST loop.
-	defer hc.relieveRapidReset()
 	Stats.TotalReqs.Add(1)
 	if hc.server.logRequests.Load() {
 		log.Printf("[H2] stream %d: %s %s", stream.ID, stream.Method, stream.Path)
