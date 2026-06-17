@@ -99,6 +99,19 @@ type ProxyCache struct {
 	totalMisses  atomic.Uint64
 	stopCh       chan struct{}
 	gzipPool     sync.Pool
+
+	// evicting single-flights eviction: an over-limit insert only spawns an
+	// eviction goroutine if no eviction is already running. Without this, a
+	// burst of distinct over-limit inserts each spawns its own full
+	// Range+sort pass (O(N log N)), piling concurrent CPU-bound goroutines
+	// (DoS). The running pass loops until under all limits, and any inserts
+	// landing mid-pass re-trigger once it clears the flag.
+	evicting atomic.Bool
+
+	// evictionPasses counts completed eviction goroutine launches. Under
+	// single-flight this grows by at most one per drain cycle, not once per
+	// over-limit insert; it is the observable invariant the H8 test asserts.
+	evictionPasses atomic.Uint64
 }
 
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
@@ -434,7 +447,7 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 	}
 
 	if cfg.MaxEntries > 0 && pc.totalEntries.Load() >= cfg.MaxEntries {
-		go pc.evictOldest()
+		pc.triggerEviction()
 		return
 	}
 
@@ -495,7 +508,7 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 	pc.totalBytes.Add(bodyLen)
 
 	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
-		go pc.evictOldest()
+		pc.triggerEviction()
 	}
 }
 
@@ -606,37 +619,75 @@ func (pc *ProxyCache) evictExpired() {
 	})
 }
 
-func (pc *ProxyCache) evictOldest() {
-	cfg := pc.config.Load()
-	target := cfg.MaxTotalBytes * 90 / 100
-
-	type candidate struct {
-		key       alosmap.Key
-		createdAt int64
-		size      int64
+// triggerEviction starts a single background eviction pass if one is not
+// already running. The atomic CompareAndSwap guarantees at most one eviction
+// goroutine exists at a time, so a burst of concurrent over-limit inserts can
+// no longer amplify into a pile of concurrent O(N log N) passes. Inserts that
+// race in while a pass runs are absorbed by that pass's drain loop, or
+// re-trigger a fresh pass after the flag clears.
+func (pc *ProxyCache) triggerEviction() {
+	if !pc.evicting.CompareAndSwap(false, true) {
+		return
 	}
-	candidates := make([]candidate, 0, 64)
-	pc.entries.Range(func(key alosmap.Key, val any) bool {
-		entry := val.(*cacheEntry)
-		candidates = append(candidates, candidate{
-			key:       key,
-			createdAt: entry.createdAt,
-			size:      int64(entry.bodyLen) + int64(entry.gzipLen),
-		})
-		return true
-	})
+	go pc.evictOldest()
+}
 
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].createdAt < candidates[j].createdAt
-	})
+func (pc *ProxyCache) evictOldest() {
+	defer pc.evicting.Store(false)
+	pc.evictionPasses.Add(1)
 
-	for _, c := range candidates {
-		if pc.totalBytes.Load() <= target {
-			break
+	// Drain until the cache is under both limits. Looping inside the single
+	// guarded pass means we converge even if more entries are inserted while
+	// evicting, rather than relying on additional goroutines.
+	for {
+		cfg := pc.config.Load()
+
+		overEntries := cfg.MaxEntries > 0 && pc.totalEntries.Load() > cfg.MaxEntries
+		overBytes := cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes
+		if !overEntries && !overBytes {
+			return
 		}
-		pc.entries.Delete(c.key)
-		pc.totalBytes.Add(-c.size)
-		pc.totalEntries.Add(-1)
+
+		byteTarget := cfg.MaxTotalBytes * 90 / 100
+		entryTarget := cfg.MaxEntries * 90 / 100
+
+		type candidate struct {
+			key       alosmap.Key
+			createdAt int64
+			size      int64
+		}
+		candidates := make([]candidate, 0, 64)
+		pc.entries.Range(func(key alosmap.Key, val any) bool {
+			entry := val.(*cacheEntry)
+			candidates = append(candidates, candidate{
+				key:       key,
+				createdAt: entry.createdAt,
+				size:      int64(entry.bodyLen) + int64(entry.gzipLen),
+			})
+			return true
+		})
+
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].createdAt < candidates[j].createdAt
+		})
+
+		for _, c := range candidates {
+			bytesOK := cfg.MaxTotalBytes <= 0 || pc.totalBytes.Load() <= byteTarget
+			entriesOK := cfg.MaxEntries <= 0 || pc.totalEntries.Load() <= entryTarget
+			if bytesOK && entriesOK {
+				break
+			}
+			if _, ok := pc.entries.Delete(c.key); ok {
+				pc.totalBytes.Add(-c.size)
+				pc.totalEntries.Add(-1)
+			}
+		}
+
+		// Snapshot of candidates is stale once we loop; re-scan to converge
+		// against concurrent inserts. Bounded by the under-limit check above.
+		if len(candidates) == 0 {
+			return
+		}
 	}
 }
 
