@@ -1173,8 +1173,18 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 		}
 	}
 
+	maxHeaderSize := worker.server.config.MaxHeaderSize
+	if maxHeaderSize <= 0 {
+		maxHeaderSize = 8192
+	}
+
 	conn.req.resetFastH1()
-	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok := ParseH1RequestHead(conn.appBuf, &conn.req)
+	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok, reject := ParseH1RequestHead(conn.appBuf, &conn.req, maxHeaderSize)
+	if reject {
+		conn.resp.Reset()
+		conn.resp.Status(431).String("Request Header Fields Too Large")
+		return worker.queueTLSResponse(conn, false, len(conn.appBuf))
+	}
 	if !ok {
 		return tlsWorkerActionContinue, nil
 	}

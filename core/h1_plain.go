@@ -197,18 +197,26 @@ func findCRLFBytes(buf []byte, start int) int {
 	return start + idx
 }
 
-func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, ok bool) {
+// ParseH1RequestHead parses the request line and header block from data.
+//
+// maxHeaderSize bounds the header block: when the terminating CRLFCRLF has not
+// been seen yet and len(data) already exceeds it, the call returns reject=true
+// so the driver can answer 431 and close instead of growing the read buffer to
+// MaxReadSize. ok=false with reject=false means "need more data".
+func ParseH1RequestHead(data []byte, req *Request, maxHeaderSize int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, ok bool, reject bool) {
 	const maxHeaders = 128
+
+	overBudget := maxHeaderSize > 0 && len(data) > maxHeaderSize
 
 	idx := bytes.Index(data, crlfSlice)
 	if idx < 0 {
-		return 0, 0, false, false, false, false
+		return 0, 0, false, false, false, false, overBudget
 	}
 
 	rl := data[:idx]
 	sp1 := bytes.IndexByte(rl, ' ')
 	if sp1 < 0 {
-		return 0, 0, false, false, false, false
+		return 0, 0, false, false, false, false, false
 	}
 	sp2 := bytes.IndexByte(rl[sp1+1:], ' ')
 	if sp2 >= 0 {
@@ -249,11 +257,11 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		remaining := data[pos:]
 		lineEndOff := bytes.Index(remaining, crlfSlice)
 		if lineEndOff < 0 {
-			return 0, 0, false, false, false, false
+			return 0, 0, false, false, false, false, overBudget
 		}
 		nl := pos + lineEndOff
 		if nl == pos {
-			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, true
+			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, true, false
 		}
 
 		line := data[pos:nl]
@@ -267,7 +275,7 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 			valStr := UnsafeString(val)
 			req.Headers = append(req.Headers, [2]string{name, valStr})
 			if len(req.Headers) > maxHeaders {
-				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, true
+				return 0, 0, false, false, false, false, true
 			}
 
 			switch colon {
@@ -343,7 +351,7 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		pos = nl + 2
 	}
 
-	return 0, 0, false, false, false, false
+	return 0, 0, false, false, false, false, overBudget
 }
 
 func appendPlainResponse(resp *Response, dst []byte) []byte {

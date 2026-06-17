@@ -642,6 +642,10 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 	if maxRead <= 0 {
 		maxRead = 2 << 20
 	}
+	maxHeaderSize := worker.server.config.MaxHeaderSize
+	if maxHeaderSize <= 0 {
+		maxHeaderSize = 8192
+	}
 	for {
 		if fastResp, consumed, closeConn, ok := worker.server.matchPlainRootFastRequest(conn.readBuf[:conn.readN]); ok {
 			if worker.server.tryAcquireRequestSlot() {
@@ -653,7 +657,12 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		}
 
 		conn.req.resetFastH1()
-		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req)
+		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok, reject := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req, maxHeaderSize)
+		if reject {
+			conn.resp.Reset()
+			conn.resp.Status(431).String("Request Header Fields Too Large")
+			return worker.queueResponse(conn, false, conn.readN)
+		}
 		if !ok {
 			return worker.queueRead(conn)
 		}

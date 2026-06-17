@@ -491,6 +491,8 @@ func StatusText(code int) string {
 		return "Range Not Satisfiable"
 	case 429:
 		return "Too Many Requests"
+	case 431:
+		return "Request Header Fields Too Large"
 	case 500:
 		return "Internal Server Error"
 	case 502:
