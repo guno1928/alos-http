@@ -2,8 +2,10 @@ package core
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 )
 
@@ -12,6 +14,11 @@ type StaticConfig struct {
 	Index  string
 	Browse bool
 }
+
+// staticStreamThreshold is the file size above which the static handler streams
+// from the open file (sendfile / chunked) instead of buffering it whole, so a
+// request for a large file cannot pin its size in heap memory.
+const staticStreamThreshold = 1 << 20 // 1 MiB
 
 func sanitizeStaticPath(p string) (string, bool) {
 	if strings.ContainsAny(p, "\x00\\") {
@@ -33,16 +40,19 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 		cfg.Index = "index.html"
 	}
 
-	absRoot, err := filepath.Abs(cfg.Root)
-	if err != nil {
-		absRoot = cfg.Root
-	}
+	// Open the configured root once and confine every request to it at the
+	// kernel boundary. os.Root refuses path components that escape the root and
+	// refuses to traverse symlinks that point outside it, which a string-prefix
+	// jail cannot do. Fail closed: if the root cannot be opened, serve nothing.
+	root, rootErr := os.OpenRoot(cfg.Root)
 
 	return func(req *Request, resp *Response) {
-		reqPath := req.Path
-		if strings.HasPrefix(reqPath, urlPrefix) {
-			reqPath = reqPath[len(urlPrefix):]
+		if rootErr != nil {
+			resp.Status(404).String("Not Found")
+			return
 		}
+
+		reqPath := strings.TrimPrefix(req.Path, urlPrefix)
 		if reqPath == "" {
 			reqPath = "/"
 		}
@@ -57,44 +67,28 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		if strings.HasPrefix(cleanRel, "/") {
-			cleanRel = cleanRel[1:]
+		// os.Root treats its argument as relative to the root; a leading slash
+		// would be rejected as absolute.
+		cleanRel = strings.TrimPrefix(cleanRel, "/")
+		if cleanRel == "" {
+			cleanRel = "."
 		}
 
-		fullPath := filepath.Join(absRoot, filepath.FromSlash(cleanRel))
-
-		absFullPath, err := filepath.Abs(fullPath)
-		if err != nil {
-			resp.Status(404).String("Not Found")
-			return
-		}
-
-		if !strings.HasPrefix(absFullPath, absRoot) {
-			resp.Status(403).String("Forbidden")
-			return
-		}
-
-		info, err := os.Stat(absFullPath)
+		info, err := root.Stat(cleanRel)
 		if err != nil {
 			resp.Status(404).String("Not Found")
 			return
 		}
 
 		if info.IsDir() {
-			indexPath := filepath.Join(absFullPath, cfg.Index)
-			if indexInfo, err := os.Stat(indexPath); err == nil && !indexInfo.IsDir() {
-				data, err := os.ReadFile(indexPath)
-				if err != nil {
-					resp.Status(500).String("Internal Server Error")
-					return
-				}
-				mime := detectMIME(indexPath)
-				resp.Status(200).SetHeader("Content-Type", mime).SetBody(data)
+			indexRel := path.Join(cleanRel, cfg.Index)
+			if indexInfo, err := root.Stat(indexRel); err == nil && !indexInfo.IsDir() {
+				serveStaticFile(resp, root, indexRel, indexInfo.Size())
 				return
 			}
 
 			if cfg.Browse {
-				entries, err := os.ReadDir(absFullPath)
+				entries, err := fs.ReadDir(root.FS(), cleanRel)
 				if err != nil {
 					resp.Status(500).String("Internal Server Error")
 					return
@@ -125,14 +119,59 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		data, err := os.ReadFile(absFullPath)
+		serveStaticFile(resp, root, cleanRel, info.Size())
+	}
+}
+
+// serveStaticFile serves a regular file resolved within root. Small files are
+// read into memory (cheap and lets the existing buffered response path handle
+// them); files above staticStreamThreshold are streamed from the open file via
+// the sendfile fast path so their size never lands on the heap.
+func serveStaticFile(resp *Response, root *os.Root, rel string, size int64) {
+	mime := detectMIME(rel)
+
+	if size <= staticStreamThreshold {
+		data, err := readStaticFile(root, rel, size)
 		if err != nil {
 			resp.Status(500).String("Internal Server Error")
 			return
 		}
-		mime := detectMIME(absFullPath)
 		resp.Status(200).SetHeader("Content-Type", mime).SetBody(data)
+		return
 	}
+
+	f, err := root.Open(rel)
+	if err != nil {
+		resp.Status(404).String("Not Found")
+		return
+	}
+	defer f.Close()
+
+	var clBuf [20]byte
+	hdrs := [][2]string{{
+		"content-length",
+		string(appendUint(clBuf[:0], size)),
+	}}
+	if err := streamFile(resp, f, size, mime, hdrs, nil); err != nil {
+		// Headers may already be on the wire; nothing safe to send now.
+		return
+	}
+}
+
+// readStaticFile reads exactly size bytes from the root-confined file. A short
+// read is treated as an error so a truncated file is never served as complete.
+func readStaticFile(root *os.Root, rel string, size int64) ([]byte, error) {
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	data := make([]byte, size)
+	if _, err := io.ReadFull(f, data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func StaticDir(urlPrefix, root string) HandlerFunc {

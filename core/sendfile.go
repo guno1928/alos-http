@@ -190,6 +190,23 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 		string(appendUint(clBuf[:0], fi.Size())),
 	})
 
+	var limiter *TokenBucket
+	if cfg.rateLimit > 0 {
+		burst := cfg.burstSize
+		if burst <= 0 {
+			burst = cfg.rateLimit
+		}
+		limiter = NewTokenBucket(cfg.rateLimit, burst)
+	}
+
+	return streamFile(r, f, fi.Size(), ct, hdrs, limiter)
+}
+
+// streamFile writes status 200, the given headers, and the contents of an
+// already-open file to the client, preferring the native sendfile fast path and
+// falling back to chunked reads. The caller owns f and must close it; this keeps
+// large files off the heap instead of buffering them whole.
+func streamFile(r *Response, f *os.File, size int64, ct string, hdrs [][2]string, limiter *TokenBucket) error {
 	sw := r.ensureSW()
 	if sw == nil {
 		r.Status(500).String("no stream writer available")
@@ -200,16 +217,7 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 	}
 	r.SetStreamer(sw)
 
-	var limiter *TokenBucket
-	if cfg.rateLimit > 0 {
-		burst := cfg.burstSize
-		if burst <= 0 {
-			burst = cfg.rateLimit
-		}
-		limiter = NewTokenBucket(cfg.rateLimit, burst)
-	}
-
-	if sent, err := trySendFileFastPath(sw, f, fi.Size(), limiter); sent {
+	if sent, err := trySendFileFastPath(sw, f, size, limiter); sent {
 		if err != nil {
 			return err
 		}
