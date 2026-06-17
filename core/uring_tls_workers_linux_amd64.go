@@ -732,6 +732,16 @@ func (worker *tlsUringWorker) handleWrite(conn *tlsWorkerConn, result int32, fla
 	}
 	conn.writeSent = 0
 	conn.writeN = 0
+	// SEND_ZC keeps a kernel reference to writeBuf until the F_NOTIF
+	// notification CQE, which lands after this data-completion CQE. Re-entering
+	// processTLSConn here would rebuild a pipelined response into the same
+	// backing array while the kernel still owns it (use-after-submit). ZC is
+	// only ever used on closeAfter responses, so closing is always the intended
+	// outcome; closeConnection -> finishClose defers slot reuse while
+	// zcPending > 0, so the buffer is held until the notification arrives.
+	if conn.writeZeroCopy && conn.zcPending > 0 {
+		return worker.closeConnection(conn)
+	}
 	conn.writeBuf = conn.writeBuf[:0]
 	if conn.closeAfter && len(conn.plainBuf) == 0 {
 		return worker.closeConnection(conn)
