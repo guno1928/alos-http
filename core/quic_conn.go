@@ -21,16 +21,30 @@ const (
 	quicInitialMaxStreamData = 1 << 20
 	quicMaxBidiStreams       = 1024
 	quicMaxUniStreams        = 128
+
+	// quicMaxConcurrentRequests bounds in-flight HTTP/3 request handler
+	// goroutines per connection. It matches the advertised concurrent bidi
+	// stream limit so dispatch can never outrun what we promised the peer.
+	quicMaxConcurrentRequests = quicMaxBidiStreams
+
+	// quicMaxResetsPerConn caps RESET_STREAM frames a peer may send over the
+	// life of a connection before we treat it as a rapid-reset flood
+	// (CVE-2023-44487 / QUIC analog) and close with H3_EXCESSIVE_LOAD. This
+	// mirrors the spirit of Go net/http2's rapid-reset defense, which tolerates
+	// only a small burst of resets per accepted stream. We allow headroom over
+	// the advertised stream limit (legitimate clients reset rarely) but bound it
+	// so open->dispatch->reset loops cannot run unbounded.
+	quicMaxResetsPerConn = quicMaxBidiStreams + 100
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +57,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -75,6 +89,20 @@ type QUICConn struct {
 	pendingFrames []byte
 	h3            *H3Conn
 	inbound       chan []byte
+
+	// Stream-flood / rapid-reset defenses (C4). All counters below are owned by
+	// the recvLoop goroutine path but mutated under streamsMu because the
+	// dispatch goroutines (handleRequestStream) also touch qc.streams and the
+	// semaphore. peerBidiStreams/peerUniStreams count distinct peer-initiated
+	// streams ever opened; resetCount counts RESET_STREAM frames received.
+	peerBidiStreams uint64
+	peerUniStreams  uint64
+	resetCount      uint64
+
+	// dispatchSem bounds concurrent handleRequestStream goroutines. A slot is
+	// acquired before spawning the handler and released when it returns. The
+	// spawned goroutine is the sole owner of its slot.
+	dispatchSem chan struct{}
 }
 
 func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dcid, scid []byte) *QUICConn {
@@ -94,6 +122,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		nextUniRemote:  2,
 		nextBidiLocal:  1,
 		nextUniLocal:   3,
+		dispatchSem:    make(chan struct{}, quicMaxConcurrentRequests),
 	}
 
 	qc.inbound = make(chan []byte, 256)
@@ -280,6 +309,10 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 			needsAck = true
 			qc.handleStreamFrameIncoming(f)
 		},
+		onResetStream: func(f quicResetStreamFrame) {
+			needsAck = true
+			qc.handleResetStream(f)
+		},
 		onMaxData: func(f quicMaxDataFrame) {
 			needsAck = true
 			if f.maxData > qc.maxDataRemote {
@@ -363,10 +396,45 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 	qc.tlsState.handleCryptoData(qc, space, qc.cryptoBuf[space][:needed])
 }
 
+// handleStreamFrameIncoming processes a STREAM frame from the peer. It validates
+// the stream-ID type/initiator, enforces the advertised peer-stream limit, and
+// bounds concurrent request dispatch. Called from the recvLoop goroutine via the
+// frame visitor; mutates shared counters and qc.streams under streamsMu.
 func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
+	// A server must never receive a STREAM frame on a stream it initiated
+	// itself (low bit 0 => client-initiated, which is what a peer may open).
+	// Reject server-initiated IDs as a protocol violation; fail closed.
+	if quicStreamIsLocal(f.streamID, true) {
+		qc.closeWithError(quicErrProtocolViolation, "stream frame on server-initiated stream")
+		return
+	}
+
 	qc.streamsMu.Lock()
+	if qc.closed.Load() {
+		qc.streamsMu.Unlock()
+		return
+	}
+
 	s, ok := qc.streams[f.streamID]
 	if !ok {
+		// New peer-initiated stream: enforce the advertised limit before
+		// allocating any state, so a flood of fresh IDs cannot grow qc.streams
+		// without bound.
+		if quicStreamIsBidi(f.streamID) {
+			if qc.peerBidiStreams >= quicMaxBidiStreams {
+				qc.streamsMu.Unlock()
+				qc.closeWithError(quicErrStreamLimitError, "peer exceeded MAX_STREAMS (bidi)")
+				return
+			}
+			qc.peerBidiStreams++
+		} else {
+			if qc.peerUniStreams >= quicMaxUniStreams {
+				qc.streamsMu.Unlock()
+				qc.closeWithError(quicErrStreamLimitError, "peer exceeded MAX_STREAMS (uni)")
+				return
+			}
+			qc.peerUniStreams++
+		}
 		s = newQUICStream(f.streamID, qc)
 		qc.streams[f.streamID] = s
 	}
@@ -374,9 +442,78 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 
 	s.handleStreamFrame(f)
 
-	if f.fin && qc.h3 != nil && quicStreamIsBidi(f.streamID) && !quicStreamIsLocal(f.streamID, true) {
-		go qc.h3.handleRequestStream(s)
+	if f.fin && qc.h3 != nil && quicStreamIsBidi(f.streamID) {
+		qc.dispatchRequest(s)
 	}
+}
+
+// dispatchRequest spawns the HTTP/3 request handler under the per-connection
+// dispatch semaphore so handler goroutines cannot grow unbounded. The slot is
+// released exactly once when the handler returns. If no slot is available the
+// peer is exceeding the concurrency we advertised, so we fail closed.
+func (qc *QUICConn) dispatchRequest(s *QUICStream) {
+	select {
+	case qc.dispatchSem <- struct{}{}:
+	default:
+		qc.closeWithError(h3ErrExcessiveLoad, "concurrent request limit exceeded")
+		return
+	}
+
+	if !s.markDispatched() {
+		// Already dispatched (duplicate FIN) or torn down: release the slot.
+		<-qc.dispatchSem
+		return
+	}
+
+	go func() {
+		defer func() { <-qc.dispatchSem }()
+		qc.h3.handleRequestStream(s)
+	}()
+}
+
+// handleResetStream tears down the stream identified by a RESET_STREAM frame and
+// enforces the per-connection reset-rate cap. Runs on the recvLoop goroutine.
+func (qc *QUICConn) handleResetStream(f quicResetStreamFrame) {
+	// A RESET_STREAM for a server-initiated stream is a protocol violation.
+	if quicStreamIsLocal(f.streamID, true) {
+		qc.closeWithError(quicErrProtocolViolation, "reset_stream on server-initiated stream")
+		return
+	}
+
+	qc.streamsMu.Lock()
+	qc.resetCount++
+	flood := qc.resetCount > quicMaxResetsPerConn
+
+	s, ok := qc.streams[f.streamID]
+	if ok {
+		// Identity-checked removal: only evict the exact stream we found, never
+		// a racing sibling sharing the key.
+		delete(qc.streams, f.streamID)
+	}
+	qc.streamsMu.Unlock()
+
+	// Tear down the stream's buffers and unblock any reader. The dispatch
+	// goroutine (if one was spawned) is the sole owner of its semaphore slot and
+	// releases it on return, so RESET_STREAM must not touch dispatchSem here:
+	// doing so would double-release. Closing the stream makes the in-flight
+	// handler's ReadAll return promptly, so the slot is freed quickly.
+	if ok {
+		s.Close()
+	}
+
+	if flood {
+		qc.closeWithError(h3ErrExcessiveLoad, "excessive RESET_STREAM (rapid reset)")
+	}
+}
+
+// closeWithError sends a CONNECTION_CLOSE with the given transport/application
+// error code (best effort) and tears the connection down. Idempotent.
+func (qc *QUICConn) closeWithError(errorCode uint64, reason string) {
+	if qc.closed.Load() {
+		return
+	}
+	qc.sendConnectionClose(errorCode, reason)
+	qc.close()
 }
 
 func (qc *QUICConn) getOrCreateStream(id uint64) *QUICStream {

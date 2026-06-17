@@ -34,6 +34,22 @@ const (
 	quicStreamFlagFin byte = 0x01
 )
 
+// QUIC transport error codes (RFC 9000 §20.1) and HTTP/3 application error
+// codes (RFC 9114 §8.1) used when closing a connection in response to abusive
+// peer behavior.
+const (
+	quicErrNoError           uint64 = 0x00
+	quicErrProtocolViolation uint64 = 0x0a
+	quicErrStreamLimitError  uint64 = 0x04
+	h3ErrExcessiveLoad       uint64 = 0x0107
+)
+
+type quicResetStreamFrame struct {
+	streamID  uint64
+	errorCode uint64
+	finalSize uint64
+}
+
 type quicCryptoFrame struct {
 	offset uint64
 	data   []byte
@@ -76,7 +92,7 @@ type quicMaxStreamDataFrame struct {
 
 type quicMaxStreamsFrame struct {
 	maxStreams uint64
-	bidi      bool
+	bidi       bool
 }
 
 type quicNewConnIDFrame struct {
@@ -222,11 +238,12 @@ type quicFrameVisitor struct {
 	onStream        func(f quicStreamFrame)
 	onMaxData       func(f quicMaxDataFrame)
 	onMaxStreamData func(f quicMaxStreamDataFrame)
-	onMaxStreams     func(f quicMaxStreamsFrame)
+	onMaxStreams    func(f quicMaxStreamsFrame)
 	onConnClose     func(f quicConnCloseFrame)
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)
 	onNewToken      func(token []byte)
+	onResetStream   func(f quicResetStreamFrame)
 }
 
 func quicParseFrames(data []byte, v *quicFrameVisitor) error {
@@ -355,14 +372,20 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 			}
 
 		case frameType == quicFrameResetStream:
-			if _, ok := p.readVarint(); !ok {
+			sid, ok := p.readVarint()
+			if !ok {
 				return ErrTruncated
 			}
-			if _, ok := p.readVarint(); !ok {
+			appErr, ok := p.readVarint()
+			if !ok {
 				return ErrTruncated
 			}
-			if _, ok := p.readVarint(); !ok {
+			finalSize, ok := p.readVarint()
+			if !ok {
 				return ErrTruncated
+			}
+			if v.onResetStream != nil {
+				v.onResetStream(quicResetStreamFrame{streamID: sid, errorCode: appErr, finalSize: finalSize})
 			}
 
 		case frameType == quicFrameStopSending:

@@ -47,6 +47,22 @@ type QUICStream struct {
 	sendFin    bool
 	sendClosed bool
 	maxSend    uint64
+
+	// dispatched guards against spawning the request handler more than once for
+	// the same stream (e.g. a peer that retransmits FIN). Set under mu.
+	dispatched bool
+}
+
+// markDispatched returns true exactly once for a stream, when this caller wins
+// the right to spawn the request handler. Subsequent calls return false.
+func (s *QUICStream) markDispatched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dispatched {
+		return false
+	}
+	s.dispatched = true
+	return true
 }
 
 func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
