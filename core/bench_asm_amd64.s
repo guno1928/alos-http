@@ -1,3 +1,5 @@
+//go:build alos_asm
+
 #include "textflag.h"
 
 // func benchAsmStringHash(s string) uint64

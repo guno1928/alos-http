@@ -1,3 +1,5 @@
+//go:build alos_asm
+
 #include "textflag.h"
 
 // func plainEncodeUserDataASM(op uint8, connIndex int, generation uint16) uint64

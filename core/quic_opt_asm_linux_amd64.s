@@ -1,3 +1,5 @@
+//go:build alos_asm
+
 #include "textflag.h"
 
 TEXT ·quicParseVarintASM(SB), NOSPLIT, $0-40

@@ -1,3 +1,5 @@
+//go:build alos_asm
+
 package core
 
 func benchAsmStringHash(s string) uint64
