@@ -1301,8 +1301,6 @@ func (worker *tlsUringWorker) flushReqStats() {
 }
 
 func (worker *tlsUringWorker) newH1RequestConnAttacher(conn *tlsWorkerConn, consumed int) func(*Request) net.Conn {
-	rawPrefix := append([]byte(nil), conn.readBuf[:conn.readN]...)
-	decryptedPrefix := append([]byte(nil), conn.appBuf[consumed:]...)
 	reader := conn.appReader
 	writer := conn.appWriter
 	var once sync.Once
@@ -1319,10 +1317,15 @@ func (worker *tlsUringWorker) newH1RequestConnAttacher(conn *tlsWorkerConn, cons
 			req.tlsReader = reader
 			req.tlsWriter = writer
 			req.hdrBuf = make([]byte, 5)
-			req.hijackReadBuf = append([]byte(nil), decryptedPrefix...)
+			// Copy the buffered ciphertext/plaintext tails only here, on the
+			// rare hijack/streaming path. once.Do runs synchronously inside the
+			// handler (before buffer compaction), so conn.readBuf/appBuf are
+			// still valid — avoiding two per-request copies on the common path
+			// where the connection is never hijacked.
+			req.hijackReadBuf = append([]byte(nil), conn.appBuf[consumed:]...)
 			handed := net.Conn(wrapped)
-			if len(rawPrefix) > 0 {
-				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(rawPrefix), wrapped)}
+			if rawPrefix := conn.readBuf[:conn.readN]; len(rawPrefix) > 0 {
+				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(append([]byte(nil), rawPrefix...)), wrapped)}
 			}
 			handed = worker.server.trackHandoffConn(handed)
 			if handed == nil {
