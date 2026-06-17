@@ -309,11 +309,11 @@ func wsHandshake(url string) (net.Conn, error) {
 
 	// Verify accept
 	h := sha1.New()
-	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-5AB5DC11650B"))
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	expectedAccept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 	if headers["sec-websocket-accept"] != expectedAccept {
-		// Don't fail here - the ALOS framework has a known bug with the accept hash
-		// We'll test this specifically in a test case
+		conn.Close()
+		return nil, fmt.Errorf("accept hash mismatch: got %q, want %q", headers["sec-websocket-accept"], expectedAccept)
 	}
 
 	conn.SetDeadline(time.Time{})
@@ -471,7 +471,7 @@ func wsHandshakeVerifyAccept(url string) (net.Conn, error) {
 	}
 
 	h := sha1.New()
-	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-5AB5DC11650B"))
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 	expectedAccept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 	if headers["sec-websocket-accept"] != expectedAccept {
 		conn.Close()
