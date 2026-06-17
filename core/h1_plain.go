@@ -307,12 +307,19 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 				if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Content-Length") {
 					req.cachedCL = valStr
 					req.headerCacheMask |= headerCacheContentLength
-					hasContentLength = true
-					parsedCL, parsedOK := parseUint(valStr)
-					if parsedOK {
-						contentLength = parsedCL
-					} else {
+					if hasContentLength {
+						// RFC 9112 §6.3.3: a repeated Content-Length is a framing
+						// error (request-smuggling vector). Force the invalid-length
+						// reject path the callers already take on contentLength < 0.
 						contentLength = -1
+					} else {
+						hasContentLength = true
+						parsedCL, parsedOK := parseUint(valStr)
+						if parsedOK {
+							contentLength = parsedCL
+						} else {
+							contentLength = -1
+						}
 					}
 				}
 			case 15:
