@@ -1,7 +1,8 @@
 package core
 
 import (
-	"fmt"
+	"html"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,18 +104,30 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 				if !strings.HasSuffix(dirURL, "/") {
 					dirURL += "/"
 				}
+				// dirURL is request-derived and entry names come from the
+				// filesystem; both are untrusted in the HTML output context.
+				// Escape names for the text node and percent-encode + attribute-
+				// escape them for the href to prevent stored/reflected XSS.
+				safeDirURL := html.EscapeString(dirURL)
 				var b strings.Builder
 				b.WriteString("<html><head><title>Index of ")
-				b.WriteString(dirURL)
+				b.WriteString(safeDirURL)
 				b.WriteString("</title></head><body><h1>Index of ")
-				b.WriteString(dirURL)
+				b.WriteString(safeDirURL)
 				b.WriteString("</h1><ul>")
 				for _, entry := range entries {
 					name := entry.Name()
+					href := dirURL + url.PathEscape(name)
+					display := name
 					if entry.IsDir() {
-						name += "/"
+						href += "/"
+						display += "/"
 					}
-					b.WriteString(fmt.Sprintf("<li><a href=\"%s%s\">%s</a></li>", dirURL, name, name))
+					b.WriteString("<li><a href=\"")
+					b.WriteString(html.EscapeString(href))
+					b.WriteString("\">")
+					b.WriteString(html.EscapeString(display))
+					b.WriteString("</a></li>")
 				}
 				b.WriteString("</ul></body></html>")
 				resp.Status(200).SetHeader("Content-Type", "text/html; charset=utf-8").SetBody([]byte(b.String()))
