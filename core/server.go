@@ -95,7 +95,41 @@ type Config struct {
 	PlainHTTP       bool
 	DisableHTTP2    bool
 	ProxyMode       bool
+
+	// WebSocketOriginMode controls cross-origin validation on the WebSocket
+	// upgrade. The zero value (WSOriginModeOff) preserves the historical
+	// behavior of accepting any Origin, so existing deployments are unaffected.
+	// See WSOriginMode for the available modes and their security tradeoffs.
+	WebSocketOriginMode WSOriginMode
+	// AllowedWebSocketOrigins is the exact-match origin allowlist consulted in
+	// WSOriginModeAllowlist (e.g. "https://app.example.com"). Each entry is a
+	// full origin string; comparison is scheme/host case-insensitive with
+	// default ports normalized. Ignored in other modes.
+	AllowedWebSocketOrigins []string
 }
+
+// WSOriginMode selects how UpgradeWebSocket validates the request Origin header
+// against Cross-Site WebSocket Hijacking (CSWSH). Cross-origin handshakes are
+// otherwise accepted unconditionally, so any attacker page could open an
+// authenticated socket from a victim's browser when handlers trust ambient
+// cookies or session state.
+//
+//   - WSOriginModeOff: accept any Origin (default; back-compatible). A one-time
+//     warning is logged on first upgrade to flag that the check is disabled.
+//   - WSOriginModeSameOrigin: require the Origin host to equal the request Host
+//     (scheme-agnostic host:port compare). Missing/garbage Origin is rejected.
+//   - WSOriginModeAllowlist: require Origin to match an entry in
+//     AllowedWebSocketOrigins. Anything else is rejected.
+//
+// SameOrigin and Allowlist fail closed: on any ambiguity the upgrade is
+// rejected with HTTP 403 and the connection is not hijacked.
+type WSOriginMode uint8
+
+const (
+	WSOriginModeOff WSOriginMode = iota
+	WSOriginModeSameOrigin
+	WSOriginModeAllowlist
+)
 
 // DefaultConfig returns a Config with sensible defaults. It listens on
 // :8443 with a 120s idle timeout, 30s handshake timeout, 8 KiB header
@@ -174,34 +208,34 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config         Config
-	caps           Capabilities
-	capsLogOnce    sync.Once
-	Router         *Router
-	CORS           *CORSEngine
-	RateLimit      *RateLimitEngine
-	certStore      *CertStore
-	fallbackTLS    atomic.Pointer[tls.Config]
-	proxy          atomic.Pointer[ProxyEngine]
-	httpRouter     *HTTPRouter
-	acme           *acmeIntegration
-	listeners      []net.Listener
-	done           chan struct{}
-	tlsRuntimeOnce sync.Once
-	x25519Pool     *x25519KeyPool
-	activeConns    atomic.Int64
-	shuttingDown   atomic.Bool
-	drainDone      chan struct{}
-	drainOnce      sync.Once
-	shutdownOnce   sync.Once
-	connLimiter    *ConnectionLimiter
-	globalLimiter  *GlobalLimiter
-	activeReqs     atomic.Int64
-	fastDispatch   atomic.Bool
-	plainRootFast  plainRootFastResponse
-	h2RootFast     h2RootFastResponse
-	trustedProxies trustedProxyMatcher
-	perIPLimiter   *perIPRequestLimiter
+	config          Config
+	caps            Capabilities
+	capsLogOnce     sync.Once
+	Router          *Router
+	CORS            *CORSEngine
+	RateLimit       *RateLimitEngine
+	certStore       *CertStore
+	fallbackTLS     atomic.Pointer[tls.Config]
+	proxy           atomic.Pointer[ProxyEngine]
+	httpRouter      *HTTPRouter
+	acme            *acmeIntegration
+	listeners       []net.Listener
+	done            chan struct{}
+	tlsRuntimeOnce  sync.Once
+	x25519Pool      *x25519KeyPool
+	activeConns     atomic.Int64
+	shuttingDown    atomic.Bool
+	drainDone       chan struct{}
+	drainOnce       sync.Once
+	shutdownOnce    sync.Once
+	connLimiter     *ConnectionLimiter
+	globalLimiter   *GlobalLimiter
+	activeReqs      atomic.Int64
+	fastDispatch    atomic.Bool
+	plainRootFast   plainRootFastResponse
+	h2RootFast      h2RootFastResponse
+	trustedProxies  trustedProxyMatcher
+	perIPLimiter    *perIPRequestLimiter
 	trackedConnMu   sync.Mutex
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool

@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -109,6 +111,11 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		return nil
 	}
 
+	if !checkWebSocketOrigin(req) {
+		resp.Status(403).String("forbidden websocket origin")
+		return nil
+	}
+
 	conn := req.HijackConn()
 	if conn == nil {
 		resp.Status(500).String("connection hijack failed")
@@ -172,6 +179,118 @@ func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 		fn(ws)
 	}()
 	return true
+}
+
+var wsOriginOffWarnOnce sync.Once
+
+// checkWebSocketOrigin enforces the configured WSOriginMode against the request
+// Origin header before the handshake completes. It returns true if the upgrade
+// may proceed and false if it must be rejected with 403. Treats all peer input
+// as hostile and fails closed: a missing or malformed Origin is rejected in any
+// checking mode.
+func checkWebSocketOrigin(req *Request) bool {
+	var mode WSOriginMode
+	if req.server != nil {
+		mode = req.server.config.WebSocketOriginMode
+	}
+
+	switch mode {
+	case WSOriginModeSameOrigin:
+		originHost, ok := wsOriginHost(req.Header("Origin"))
+		if !ok {
+			return false
+		}
+		return EqualFoldASCII(originHost, wsStripDefaultPort(req.Host))
+
+	case WSOriginModeAllowlist:
+		gotScheme, gotHost, ok := wsParseOrigin(req.Header("Origin"))
+		if !ok {
+			return false
+		}
+		for _, allowed := range req.server.config.AllowedWebSocketOrigins {
+			wantScheme, wantHost, ok := wsParseOrigin(allowed)
+			if !ok {
+				continue
+			}
+			if EqualFoldASCII(gotScheme, wantScheme) && EqualFoldASCII(gotHost, wantHost) {
+				return true
+			}
+		}
+		return false
+
+	default: // WSOriginModeOff
+		wsOriginOffWarnOnce.Do(func() {
+			log.Printf("[WARN] WebSocket Origin checking is disabled (WebSocketOriginMode=Off); cross-origin handshakes are accepted, exposing handlers that rely on ambient cookies/session to Cross-Site WebSocket Hijacking")
+		})
+		return true
+	}
+}
+
+// wsOriginHost parses an Origin header and returns its host with the default
+// port stripped. It returns ok=false for a missing, opaque, or malformed Origin
+// (e.g. "null"), so callers in checking modes fail closed.
+func wsOriginHost(origin string) (string, bool) {
+	_, host, ok := wsParseOrigin(origin)
+	if !ok {
+		return "", false
+	}
+	return host, true
+}
+
+// wsParseOrigin splits an origin of the form "scheme://host[:port]" into its
+// scheme (lowercased) and host with the scheme's default port removed. ok is
+// false if the input is not a well-formed scheme://authority origin (this
+// rejects "null", empty, and anything carrying a path/query/fragment).
+func wsParseOrigin(origin string) (scheme, host string, ok bool) {
+	sep := strings.Index(origin, "://")
+	if sep <= 0 {
+		return "", "", false
+	}
+	scheme = strings.ToLower(origin[:sep])
+	rest := origin[sep+3:]
+	if rest == "" {
+		return "", "", false
+	}
+
+	// An origin authority carries no path/query/fragment; anything past the
+	// host is malformed input, reject it rather than parse leniently.
+	if strings.ContainsAny(rest, "/?#") {
+		return "", "", false
+	}
+
+	host = wsStripSchemeDefaultPort(scheme, rest)
+	if host == "" {
+		return "", "", false
+	}
+	return scheme, host, true
+}
+
+// wsStripDefaultPort removes a trailing :443 or :80 from a request Host so the
+// SameOrigin compare treats an explicit default port as equal to none.
+func wsStripDefaultPort(host string) string {
+	if h, ok := strings.CutSuffix(host, ":443"); ok {
+		return h
+	}
+	if h, ok := strings.CutSuffix(host, ":80"); ok {
+		return h
+	}
+	return host
+}
+
+// wsStripSchemeDefaultPort removes the default port for the given scheme from a
+// host:port so "https://app:443" and "https://app" compare equal.
+func wsStripSchemeDefaultPort(scheme, host string) string {
+	switch scheme {
+	case "https", "wss":
+		if h, ok := strings.CutSuffix(host, ":443"); ok {
+			return h
+		}
+	case "http", "ws":
+		if h, ok := strings.CutSuffix(host, ":80"); ok {
+			return h
+		}
+	}
+	return host
 }
 
 // NetConn exposes the underlying hijacked connection, e.g. to set per-write
