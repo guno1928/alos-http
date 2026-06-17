@@ -1,8 +1,36 @@
 package core
 
-import "sync"
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"sync"
+)
 
 const shardCount = 64
+
+// shardSeed is a per-process random value mixed into shard selection so an
+// attacker cannot craft keys (QUIC DCIDs, client IPs, session IDs) that all
+// funnel into one shard's lock and serialize the map (DoS). It is stable for
+// the process lifetime so Store/Load agree. Falls back to a fixed odd constant
+// if the OS RNG is unavailable.
+var shardSeed = func() uint64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0x9E3779B97F4A7C15
+	}
+	return binary.LittleEndian.Uint64(b[:]) | 1
+}()
+
+// seededShardIndex maps a key hash to a shard index using shardSeed and a
+// splitmix64 finalizer, so every input bit affects the low bits that select the
+// shard. Load-balancing hashes use StringHash directly and are unaffected.
+func seededShardIndex(h uint64) uint64 {
+	h ^= shardSeed
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	return h % shardCount
+}
 
 type mapShard[K comparable, V any] struct {
 	mu sync.RWMutex
@@ -24,7 +52,7 @@ func NewShardedMap[K comparable, V any](hasher func(K) uint64) *ShardedMap[K, V]
 }
 
 func (s *ShardedMap[K, V]) shard(key K) *mapShard[K, V] {
-	return &s.shards[s.hasher(key)%shardCount]
+	return &s.shards[seededShardIndex(s.hasher(key))]
 }
 
 func (s *ShardedMap[K, V]) Store(key K, val V) {
