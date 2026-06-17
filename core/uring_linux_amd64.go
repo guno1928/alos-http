@@ -1497,6 +1497,51 @@ func (ring *ioUring) submitAndAwait(deadline time.Time) (ioUringCqe, error) {
 	}
 }
 
+// proxyRingReclaimTimeout bounds how long reclaimAfterTimeout waits for a
+// cancelled operation's completion to post before signalling the caller to
+// replace the ring. Only the (rare) deadline-exceeded path hits this.
+const proxyRingReclaimTimeout = 250 * time.Millisecond
+
+// reclaimAfterTimeout makes a pooled ring safe to reuse after one of its
+// operations exceeded its deadline. The timed-out submitAndAwait left an op in
+// flight without consuming its completion; because pooled rings do not match
+// completions by user_data, the next connection to borrow the ring would reap
+// that stale completion as its own (wrong byte count / queue desync).
+//
+// It synchronously cancels any op still attached to fd (on kernels with
+// IORING_REGISTER_SYNC_CANCEL the cancelled op's CQE is posted before the
+// register call returns) and drains the resulting completion(s). It returns
+// true when the completion queue was drained (ring is clean), and false when it
+// could not confirm cleanliness within proxyRingReclaimTimeout — in which case
+// the caller must replace the ring. The wait is bounded so a stuck ring cannot
+// block the proxy.
+func (ring *ioUring) reclaimAfterTimeout(fd int) bool {
+	if ring == nil || ring.fd < 0 {
+		return false
+	}
+	_ = ring.cancelFD(fd, 0)
+	deadline := time.Now().Add(proxyRingReclaimTimeout)
+	for {
+		drained := false
+		for {
+			if _, ok := ring.tryCqe(); !ok {
+				break
+			}
+			drained = true
+		}
+		if drained {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		fds := []unix.PollFd{{Fd: int32(ring.fd), Events: unix.POLLIN}}
+		if _, err := unix.Poll(fds, 10); err != nil && !errors.Is(err, unix.EINTR) {
+			return false
+		}
+	}
+}
+
 func byteOffsetPtr[T any](base []byte, offset uint32) *T {
 	return (*T)(unsafe.Pointer(unsafe.SliceData(base[offset:])))
 }

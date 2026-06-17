@@ -130,11 +130,67 @@ func (p *proxyRingPool) releaseWriteRing(idx int) {
 	p.writeMu[idx].Unlock()
 }
 
+// replaceReadRing closes the ring at idx and installs a fresh one — the
+// guaranteed-clean fallback when reclaimAfterTimeout could not drain a timed-out
+// op's stale completion (e.g. kernels without IORING_REGISTER_SYNC_CANCEL):
+// closing the old ring's fd makes the kernel drop its in-flight request, so no
+// stale completion can be reaped by the next borrower. Caller holds readMu[idx].
+// On allocation failure the old ring is kept (best effort) rather than nil.
+func (p *proxyRingPool) replaceReadRing(idx int) {
+	if p.closed.Load() {
+		return
+	}
+	nr, err := newIOUring(proxyRingEntries)
+	if err != nil {
+		return
+	}
+	old := p.readRings[idx]
+	p.readRings[idx] = nr
+	if old != nil {
+		old.close()
+	}
+}
+
+// replaceWriteRing mirrors replaceReadRing for the write rings. Caller holds writeMu[idx].
+func (p *proxyRingPool) replaceWriteRing(idx int) {
+	if p.closed.Load() {
+		return
+	}
+	nr, err := newIOUring(proxyRingEntries)
+	if err != nil {
+		return
+	}
+	old := p.writeRings[idx]
+	p.writeRings[idx] = nr
+	if old != nil {
+		old.close()
+	}
+}
+
+// replaceConnectRing mirrors replaceReadRing for the connect rings. Caller holds connectMu[idx].
+func (p *proxyRingPool) replaceConnectRing(idx int) {
+	if p.closed.Load() {
+		return
+	}
+	nr, err := newIOUring(proxyConnEntries)
+	if err != nil {
+		return
+	}
+	old := p.connectRings[idx]
+	p.connectRings[idx] = nr
+	if old != nil {
+		old.close()
+	}
+}
+
 func (p *proxyRingPool) doConnect(fd int, sa *unix.RawSockaddrInet4, deadline time.Time) error {
 	idx := int(p.nextConnect.Add(1) % uint64(p.count))
 	p.connectMu[idx].Lock()
 	ring := p.connectRings[idx]
 	err := ring.connect(fd, unsafe.Pointer(sa), uint64(unsafe.Sizeof(*sa)), deadline)
+	if err == errIOUringDeadlineExceeded && !ring.reclaimAfterTimeout(fd) {
+		p.replaceConnectRing(idx)
+	}
 	p.connectMu[idx].Unlock()
 	runtime.KeepAlive(sa)
 	return err
@@ -180,6 +236,9 @@ func (c *proxyUringConn) Read(p []byte) (int, error) {
 
 	ring, idx := c.pool.acquireReadRing()
 	n, err := ring.recv(c.fd, p, c.readDeadline())
+	if err == errIOUringDeadlineExceeded && !ring.reclaimAfterTimeout(c.fd) {
+		c.pool.replaceReadRing(idx)
+	}
 	c.pool.releaseReadRing(idx)
 
 	err = c.normalizeError(err)
@@ -205,6 +264,9 @@ func (c *proxyUringConn) Write(p []byte) (int, error) {
 
 	ring, idx := c.pool.acquireWriteRing()
 	n, err := ring.sendAll(c.fd, p, c.writeDeadline())
+	if err == errIOUringDeadlineExceeded && !ring.reclaimAfterTimeout(c.fd) {
+		c.pool.replaceWriteRing(idx)
+	}
 	c.pool.releaseWriteRing(idx)
 
 	err = c.normalizeError(err)
