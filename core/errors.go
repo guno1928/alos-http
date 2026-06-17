@@ -11,6 +11,7 @@ var (
 	ErrBodyTooShort       = &staticError{"body too short"}
 	ErrNoSessionID        = &staticError{"no session_id"}
 	ErrSessionIDTruncated = &staticError{"session_id truncated"}
+	ErrSessionIDTooLong   = &staticError{"session_id too long"}
 	ErrNoCipherSuites     = &staticError{"no cipher_suites"}
 	ErrBadCSLen           = &staticError{"cipher_suites bad length"}
 	ErrNoCompression      = &staticError{"no compression"}
