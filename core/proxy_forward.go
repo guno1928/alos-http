@@ -131,6 +131,19 @@ func pickRetryBackend(ds *domainState, clientIP string, tried []bool) int {
 	return -1
 }
 
+// proxyResponseHasNoBody reports whether an HTTP response must be treated as
+// having no message body per RFC 9112 §6.3: any response to a HEAD request, all
+// 1xx informational responses, and 204 No Content / 304 Not Modified.
+func proxyResponseHasNoBody(method string, statusCode int) bool {
+	if method == "HEAD" {
+		return true
+	}
+	if statusCode >= 100 && statusCode < 200 {
+		return true
+	}
+	return statusCode == 204 || statusCode == 304
+}
+
 func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
 	if isWebSocket(req) {
 		return pe.forwardWebSocket(req, resp, b, cfg)
@@ -200,6 +213,28 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 				manualCompressMin = pr.cacheCompressMin
 			}
 		}
+	}
+
+	// RFC 9112 §6.3: a response to a HEAD request and any 1xx, 204, or 304
+	// response carries no message body even when Content-Length or
+	// Transfer-Encoding is present. Reading a body here blocks until ReadTimeout
+	// and then discards an otherwise-reusable upstream connection. Emit headers
+	// and return without touching the body; such responses have no representation
+	// body to cache, so the cache is intentionally skipped.
+	if proxyResponseHasNoBody(req.Method, statusCode) {
+		resp.Status(statusCode)
+		if contentType != "" {
+			resp.ContentType = contentType
+		}
+		for i := range headers {
+			resp.SetHeader(headers[i][0], headers[i][1])
+		}
+		if keepAlive {
+			b.pool.put(pc)
+		} else {
+			b.pool.discard(pc)
+		}
+		return nil
 	}
 
 	if manualCache && (isChunked || contentLength > 65536) {
