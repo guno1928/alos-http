@@ -1,8 +1,29 @@
 package core
 
-import "sync"
+import (
+	crand "crypto/rand"
+	"encoding/binary"
+	"sync"
+)
 
 const shardCount = 64
+
+// hashSeed randomizes shard/slot selection per process. The shards are native
+// (runtime-seeded) Go maps, so there is no intra-map bucket blowup; the risk is
+// an attacker precomputing keys that all collide mod shardCount, funneling every
+// entry into one shard's lock and collapsing the 64-way sharding to a single
+// mutex (contention DoS). Mixing an unpredictable per-process seed into the
+// FNV-1a accumulator makes the shard index unguessable. This is in-memory shard
+// selection only; the seed must NOT leak into anything persisted or on the wire.
+var hashSeed = func() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// Fail closed: a predictable seed reintroduces the funneling vector, so
+		// refuse to start rather than serve with a guessable shard mapping.
+		panic("core: failed to read crypto/rand for hash seed: " + err.Error())
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}()
 
 type mapShard[K comparable, V any] struct {
 	mu sync.RWMutex
@@ -76,11 +97,22 @@ func (s *ShardedMap[K, V]) Range(fn func(K, V) bool) {
 }
 
 func StringHash(s string) uint64 {
-	var h uint64 = 14695981039346656037
+	h := 14695981039346656037 ^ hashSeed
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])
 		h *= 1099511628211
 	}
+	// FNV-1a alone has weak low bits: keys forged to collide mod shardCount stay
+	// collided even after XORing a seed into the accumulator, because the prime
+	// multiply only propagates low bits upward. Fold the seed back in and run a
+	// splitmix64 finalizer so every output bit (including the low 6 used for the
+	// shard index) avalanches over all input bits and the seed.
+	h ^= hashSeed
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	h *= 0x94d049bb133111eb
+	h ^= h >> 31
 	return h
 }
 
