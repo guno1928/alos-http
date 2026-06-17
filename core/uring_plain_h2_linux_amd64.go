@@ -53,7 +53,9 @@ func (worker *plainUringWorker) processHTTP2Frames(conn *plainWorkerConn) (int, 
 		frameType := conn.readBuf[base+3]
 		frameFlags := conn.readBuf[base+4]
 		streamID := (uint32(conn.readBuf[base+5])<<24 | uint32(conn.readBuf[base+6])<<16 | uint32(conn.readBuf[base+7])<<8 | uint32(conn.readBuf[base+8])) & 0x7fffffff
-		if frameLen > int(H2MaxFrameSize) {
+		// RFC 9113 §4.2: enforce the SETTINGS_MAX_FRAME_SIZE we advertise
+		// (H2DefaultMaxFrameSize), not the 24-bit protocol ceiling.
+		if frameLen > int(H2DefaultMaxFrameSize) {
 			conn.writeBuf = appendH2GoAwayFrame(conn.writeBuf[:0], st.lastStreamID, H2ErrFrameSize)
 			return worker.flushHTTP2Frames(conn, true)
 		}

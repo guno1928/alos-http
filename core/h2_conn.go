@@ -374,15 +374,19 @@ func (hc *H2Conn) consumeFrame() (*H2Frame, error) {
 		if avail >= 9 {
 			off := hc.appBufOff
 			fLen := int(hc.appBuf[off])<<16 | int(hc.appBuf[off+1])<<8 | int(hc.appBuf[off+2])
+			// RFC 9113 §4.2: reject frames exceeding the SETTINGS_MAX_FRAME_SIZE
+			// we advertised (H2DefaultMaxFrameSize). H2MaxFrameSize is only the
+			// 24-bit protocol ceiling; using it let a peer send up to 16 MiB
+			// frames. Check as soon as the 9-byte header is available so the
+			// oversized payload is never buffered.
+			if fLen > int(H2DefaultMaxFrameSize) {
+				hc.sendGoAway(H2ErrFrameSize)
+				return nil, ErrH2FrameTooLarge
+			}
 			totalNeeded := 9 + fLen
 			if avail >= totalNeeded {
 				f := H2FramePool.Get().(*H2Frame)
 				f.Length = uint32(fLen)
-				if fLen > int(H2MaxFrameSize) {
-					H2FramePool.Put(f)
-					hc.sendGoAway(H2ErrFrameSize)
-					return nil, ErrH2FrameTooLarge
-				}
 				f.Type = hc.appBuf[off+3]
 				f.Flags = hc.appBuf[off+4]
 				f.StreamID = (uint32(hc.appBuf[off+5])<<24 | uint32(hc.appBuf[off+6])<<16 | uint32(hc.appBuf[off+7])<<8 | uint32(hc.appBuf[off+8])) & 0x7fffffff
