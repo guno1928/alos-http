@@ -1988,6 +1988,11 @@ func (worker *tlsUringWorker) startTLS12(conn *tlsWorkerConn, certEntry *CertEnt
 	if _, err := rand.Read(conn.serverRandom[:]); err != nil {
 		return tlsWorkerActionClose, err
 	}
+	// This server is TLS 1.3-capable but is negotiating 1.2 here; stamp the
+	// RFC 8446 §4.1.3 downgrade sentinel into server_random before it feeds the
+	// ServerHello, the SKE signature, and key derivation. Genuine 1.2-only
+	// servers would never reach this 1.3-capable build, so they stay unaffected.
+	setTLS12DowngradeSentinel(conn.serverRandom[:])
 	copy(conn.clientRandom[:], conn.clientHello.Random[:])
 
 	transcript := suite.newHash()

@@ -271,6 +271,20 @@ func tls12Handshake(typ byte, body []byte) []byte {
 	return append(out, body...)
 }
 
+// tls12DowngradeSentinel is the RFC 8446 §4.1.3 downgrade-protection canary.
+// A TLS 1.3-capable server that negotiates TLS 1.2 MUST set the last 8 bytes of
+// ServerHello.random to this value, so a 1.3-capable client whose
+// supported_versions was stripped by a MITM can detect the forced downgrade.
+var tls12DowngradeSentinel = [8]byte{0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01}
+
+// setTLS12DowngradeSentinel overwrites the trailing 8 bytes of a freshly
+// generated TLS 1.2 server_random with the RFC 8446 §4.1.3 downgrade canary.
+// It must run before the value is consumed by the ServerHello, the
+// ServerKeyExchange signature, and key derivation so all three agree.
+func setTLS12DowngradeSentinel(serverRandom []byte) {
+	copy(serverRandom[24:32], tls12DowngradeSentinel[:])
+}
+
 func buildTLS12ServerHello(serverRandom []byte, suite uint16, alpn string) []byte {
 	body := make([]byte, 0, 80)
 	body = append(body, 0x03, 0x03)
