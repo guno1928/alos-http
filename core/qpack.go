@@ -261,11 +261,17 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 		return nil, ErrTruncated
 	}
 	pos := 0
-	_, n := qpackDecodeInt(data[pos:], 8)
+	ric, n := qpackDecodeInt(data[pos:], 8)
 	if n == 0 {
 		return nil, ErrTruncated
 	}
 	pos += n
+	// We advertise zero dynamic-table capacity, so a nonzero Required Insert
+	// Count refers to dynamic entries that cannot exist: reject as a
+	// decompression failure rather than silently decoding against a phantom table.
+	if ric != 0 {
+		return nil, ErrQPACKDecompressionFailed
+	}
 	_, sn := qpackDecodeInt(data[pos:], 7)
 	if sn == 0 {
 		return nil, ErrTruncated
@@ -282,9 +288,12 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 				return nil, ErrTruncated
 			}
 			pos += n
-			if static && int(idx) < len(qpackStaticTable) {
-				headers = append(headers, qpackStaticTable[idx])
+			// Only static-table references are valid: dynamic capacity is zero,
+			// and an out-of-range static index has no entry to resolve.
+			if !static || int(idx) >= len(qpackStaticTable) {
+				return nil, ErrQPACKDecompressionFailed
 			}
+			headers = append(headers, qpackStaticTable[idx])
 		} else if b&0x40 != 0 {
 			nameIsStatic := b&0x10 != 0
 			nameIdx, n := qpackDecodeInt(data[pos:], 4)
@@ -297,10 +306,12 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 				return nil, ErrTruncated
 			}
 			pos += vn
-			var name string
-			if nameIsStatic && int(nameIdx) < len(qpackStaticTable) {
-				name = qpackStaticTable[nameIdx][0]
+			// The name must resolve to a static-table entry; a dynamic name
+			// reference or out-of-range static index cannot yield a header name.
+			if !nameIsStatic || int(nameIdx) >= len(qpackStaticTable) {
+				return nil, ErrQPACKDecompressionFailed
 			}
+			name := qpackStaticTable[nameIdx][0]
 			headers = append(headers, [2]string{name, value})
 		} else if b&0x20 != 0 {
 			huffName := b&0x08 != 0

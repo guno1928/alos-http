@@ -73,6 +73,12 @@ var (
 	ErrTooManyHeaders         = &staticError{"too many headers"}
 	ErrHpackTableSizeExceeded = &staticError{"hpack: dynamic table size exceeds protocol limit"}
 
+	// ErrQPACKDecompressionFailed maps to the QPACK_DECOMPRESSION_FAILED
+	// connection error. We advertise zero dynamic-table capacity, so any
+	// reference to a dynamic entry (nonzero Required Insert Count) or any
+	// out-of-range static-table index is an unrecoverable protocol violation.
+	ErrQPACKDecompressionFailed = &staticError{"qpack: decompression failed"}
+
 	// ErrWebSocketProtocol is returned when a WebSocket frame violates
 	// RFC 6455 (bad opcode, missing mask, unexpected continuation, etc.).
 	ErrWebSocketProtocol = &staticError{"websocket protocol error"}
