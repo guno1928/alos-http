@@ -76,7 +76,7 @@ type quicMaxStreamDataFrame struct {
 
 type quicMaxStreamsFrame struct {
 	maxStreams uint64
-	bidi      bool
+	bidi       bool
 }
 
 type quicNewConnIDFrame struct {
@@ -222,7 +222,7 @@ type quicFrameVisitor struct {
 	onStream        func(f quicStreamFrame)
 	onMaxData       func(f quicMaxDataFrame)
 	onMaxStreamData func(f quicMaxStreamDataFrame)
-	onMaxStreams     func(f quicMaxStreamsFrame)
+	onMaxStreams    func(f quicMaxStreamsFrame)
 	onConnClose     func(f quicConnCloseFrame)
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)
@@ -433,6 +433,13 @@ func (p *quicFrameParser) parseACK(ecn bool) (quicAckFrame, error) {
 		return f, ErrTruncated
 	}
 	if rangeCount > 0 {
+		// Each ACK range consumes at least two varints (>= 2 bytes), so a
+		// rangeCount larger than the remaining input cannot be satisfied and
+		// would otherwise drive an unbounded make() from a single untrusted
+		// varint.
+		if rangeCount > uint64(p.remaining()) {
+			return f, ErrTruncated
+		}
 		f.ranges = make([]quicAckRange, rangeCount)
 		for i := uint64(0); i < rangeCount; i++ {
 			gap, ok := p.readVarint()

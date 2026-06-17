@@ -282,7 +282,7 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 				return nil, ErrTruncated
 			}
 			pos += n
-			if static && int(idx) < len(qpackStaticTable) {
+			if static && idx < uint64(len(qpackStaticTable)) {
 				headers = append(headers, qpackStaticTable[idx])
 			}
 		} else if b&0x40 != 0 {
@@ -298,7 +298,7 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			}
 			pos += vn
 			var name string
-			if nameIsStatic && int(nameIdx) < len(qpackStaticTable) {
+			if nameIsStatic && nameIdx < uint64(len(qpackStaticTable)) {
 				name = qpackStaticTable[nameIdx][0]
 			}
 			headers = append(headers, [2]string{name, value})
@@ -309,7 +309,7 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 				return nil, ErrTruncated
 			}
 			pos += n
-			if pos+int(nameLen) > len(data) {
+			if nameLen > uint64(len(data)) || pos+int(nameLen) > len(data) {
 				return nil, ErrTruncated
 			}
 			nameRaw := data[pos : pos+int(nameLen)]
@@ -346,7 +346,7 @@ func qpackDecodeString(data []byte) (string, int) {
 	}
 	huffman := data[0]&0x80 != 0
 	sLen, n := qpackDecodeInt(data, 7)
-	if n == 0 || n+int(sLen) > len(data) {
+	if n == 0 || sLen > uint64(len(data)) || n+int(sLen) > len(data) {
 		return "", 0
 	}
 	raw := data[n : n+int(sLen)]
