@@ -21,16 +21,26 @@ const (
 	quicInitialMaxStreamData = 1 << 20
 	quicMaxBidiStreams       = 1024
 	quicMaxUniStreams        = 128
+
+	// quicMaxCryptoBuffer bounds the per-space CRYPTO reassembly buffer.
+	// Handshake CRYPTO messages are tiny; this caps memory committed by a
+	// peer's CRYPTO frame offsets, which are otherwise attacker-controlled
+	// varints up to 2^62-1 (RFC 9000 §4.6, §19.6).
+	quicMaxCryptoBuffer = 64 << 10
+
+	// quicErrCryptoBufferExceeded is the QUIC CRYPTO_BUFFER_EXCEEDED
+	// transport error code (RFC 9000 §20.1).
+	quicErrCryptoBufferExceeded = 0x0d
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -43,22 +53,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -324,6 +334,16 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 
 func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 	if qc.tlsState == nil {
+		return
+	}
+
+	// Reject before allocating: f.offset is an attacker-controlled varint and
+	// f.offset+len(f.data) can both blow past any sane handshake size and wrap
+	// uint64. Establishing f.offset <= quicMaxCryptoBuffer first makes the
+	// subtraction in the second clause safe and also guards the overflow.
+	if f.offset > quicMaxCryptoBuffer || uint64(len(f.data)) > quicMaxCryptoBuffer-f.offset {
+		qc.sendConnectionClose(quicErrCryptoBufferExceeded, "CRYPTO buffer exceeded")
+		qc.close()
 		return
 	}
 
