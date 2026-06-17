@@ -519,11 +519,13 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 		}
 		if v, ok := hc.streams.Load(alosmap.I(int64(f.StreamID))); ok {
 			stream := v.(*H2Stream)
-			stream.State.Store(StreamClosed)
-			hc.streams.Delete(alosmap.I(int64(f.StreamID)))
-			hc.activeStreams.Add(-1)
-			stream.Reset()
-			StreamPool.Put(stream)
+			// Mark closed and release the read-loop's reference. If a dispatch
+			// goroutine is still in flight it holds its own reference, so the
+			// stream is recycled only when that goroutine exits — never here,
+			// avoiding a use-after-free. A racing double-RST loses the
+			// identity-matched CompareAndDelete and is a no-op (no double Put,
+			// no gauge drift).
+			hc.closeStreamFromReadLoop(f.StreamID, stream)
 		}
 
 	case H2FrameGoAway:
@@ -749,11 +751,13 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		}
 	}
 
+	stream.refs.Store(1)
 	hc.streams.Store(alosmap.I(int64(streamID)), stream)
 	hc.activeStreams.Add(1)
 
 	if endStream {
 		stream.State.Store(StreamHalfClosed)
+		stream.refs.Add(1)
 		hc.dispatchWg.Add(1)
 		if hc.server.fastDispatch.Load() && hc.activeStreams.Load() == 1 {
 			hc.dispatchRequest(stream)
@@ -828,10 +832,7 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 	maxBody := hc.server.config.MaxBodySize
 	if maxBody > 0 && int64(len(stream.Body)) > maxBody {
 		hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrCancel))
-		hc.streams.Delete(alosmap.I(int64(f.StreamID)))
-		hc.activeStreams.Add(-1)
-		stream.Reset()
-		StreamPool.Put(stream)
+		hc.closeStreamFromReadLoop(f.StreamID, stream)
 		return
 	}
 
@@ -849,6 +850,7 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 
 	if f.Flags&H2FlagEndStream != 0 {
 		stream.State.Store(StreamHalfClosed)
+		stream.refs.Add(1)
 		hc.dispatchWg.Add(1)
 		if hc.server.fastDispatch.Load() && hc.activeStreams.Load() == 1 {
 			hc.dispatchRequest(stream)
@@ -857,6 +859,43 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 		go hc.dispatchRequest(stream)
 	}
 }
+
+// closeStreamFromReadLoop removes the stream from hc.streams identity-matched
+// (so a racing new stream that reused the ID is never evicted) and, only on a
+// confirmed removal, decrements the activeStreams gauge and releases the
+// read-loop's reference. It is the single point through which the read-loop
+// goroutine (RST_STREAM, body-limit, flow-control violations) relinquishes a
+// stream. The actual StreamPool.Put happens in releaseStream when the last
+// reference drops, never here, so an in-flight dispatch goroutine cannot
+// observe a recycled stream. Returns true if this call performed the removal.
+func (hc *H2Conn) closeStreamFromReadLoop(streamID uint32, stream *H2Stream) bool {
+	if !hc.streams.CompareAndDelete(alosmap.I(int64(streamID)), stream) {
+		return false
+	}
+	stream.State.Store(StreamClosed)
+	hc.activeStreams.Add(-1)
+	hc.releaseStream(stream)
+	return true
+}
+
+// releaseStream drops one reference to the stream and, when the final owner
+// releases, resets and returns it to StreamPool exactly once. The atomic
+// decrement-to-zero is the single-winner event, so concurrent releases by the
+// read-loop and the dispatch goroutine can never double-Put.
+func (hc *H2Conn) releaseStream(stream *H2Stream) {
+	if stream.refs.Add(-1) != 0 {
+		return
+	}
+	if streamRecycleHook != nil {
+		streamRecycleHook(stream)
+	}
+	stream.Reset()
+	StreamPool.Put(stream)
+}
+
+// streamRecycleHook is a test-only seam invoked exactly once per stream, by the
+// single owner that recycles it. Production keeps it nil.
+var streamRecycleHook func(*H2Stream)
 
 func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	defer hc.dispatchWg.Done()
@@ -901,11 +940,12 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	}
 
 	if resp.IsStreamed() {
-		stream.State.Store(StreamClosed)
-		hc.streams.Delete(alosmap.I(int64(stream.ID)))
-		hc.activeStreams.Add(-1)
-		stream.Reset()
-		StreamPool.Put(stream)
+		// closeStreamFromReadLoop performs the identity-matched map removal +
+		// gauge decrement once (if a RST_STREAM already did so it is a no-op);
+		// releaseStream then drops this dispatch goroutine's reference. The
+		// stream returns to StreamPool only when the last reference is gone.
+		hc.closeStreamFromReadLoop(stream.ID, stream)
+		hc.releaseStream(stream)
 		if sw, ok := req.StreamWriter.(*H2StreamWriter); ok {
 			H2StreamWriterPool.Put(sw)
 		}
@@ -916,11 +956,8 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 
 	hc.writeH2Response(stream.ID, resp)
 
-	stream.State.Store(StreamClosed)
-	hc.streams.Delete(alosmap.I(int64(stream.ID)))
-	hc.activeStreams.Add(-1)
-	stream.Reset()
-	StreamPool.Put(stream)
+	hc.closeStreamFromReadLoop(stream.ID, stream)
+	hc.releaseStream(stream)
 
 	if sw, ok := req.StreamWriter.(*H2StreamWriter); ok {
 		H2StreamWriterPool.Put(sw)
