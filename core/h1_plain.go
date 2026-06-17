@@ -307,12 +307,21 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 				if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Content-Length") {
 					req.cachedCL = valStr
 					req.headerCacheMask |= headerCacheContentLength
-					hasContentLength = true
-					parsedCL, parsedOK := parseUint(valStr)
-					if parsedOK {
-						contentLength = parsedCL
-					} else {
+					if hasContentLength {
+						// RFC 7230 §3.3.3: a duplicate Content-Length is a
+						// request-smuggling vector (CL.CL desync). Fail closed by
+						// flagging an invalid length; the drivers reject with 400.
 						contentLength = -1
+					} else {
+						hasContentLength = true
+						parsedCL, parsedOK := parseUint(valStr)
+						if parsedOK {
+							contentLength = parsedCL
+						} else {
+							// Non-numeric or comma/whitespace list (e.g. "6, 0"):
+							// only a single well-formed decimal is acceptable.
+							contentLength = -1
+						}
 					}
 				}
 			case 15:
