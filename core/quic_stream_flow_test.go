@@ -18,7 +18,7 @@ func TestHandleStreamFrame_HugeOffsetRejected(t *testing.T) {
 
 	f := quicStreamFrame{
 		streamID: 0,
-		offset:   1 << 40, // ~1 TiB, far beyond maxRecv (1 MiB)
+		offset:   1 << 40, // ~1 TiB, far beyond maxRecv (4 MiB)
 		data:     []byte("boom"),
 	}
 
@@ -172,5 +172,32 @@ func TestHandleStreamFrameIncoming_ConnFlowControl(t *testing.T) {
 	}
 	if qc.dataRecv > qc.maxDataLocal {
 		t.Fatalf("dataRecv %d exceeded maxDataLocal %d (limit not enforced)", qc.dataRecv, qc.maxDataLocal)
+	}
+}
+
+// The initial stream receive window must equal the advertised
+// quicInitialMaxStreamData, and advancing maxRecv — what the H3 window-update
+// path does as data is granted — must let a previously-rejected offset through.
+// Guards against the C2 regression where the enforced ceiling was static while
+// the advertised window grew, FLOW_CONTROL-killing legitimate large transfers.
+func TestHandleStreamFrame_WindowAdvances(t *testing.T) {
+	s := newTestStream()
+	if s.maxRecv != quicInitialMaxStreamData {
+		t.Fatalf("initial maxRecv = %d, want quicInitialMaxStreamData (%d)", s.maxRecv, quicInitialMaxStreamData)
+	}
+
+	// One byte past the initial window: rejected, nothing buffered.
+	beyond := quicStreamFrame{offset: quicInitialMaxStreamData, data: []byte("x")}
+	if _, flowErr := s.handleStreamFrame(beyond); !flowErr {
+		t.Fatal("frame past the initial window must be a flow-control violation")
+	}
+	if len(s.recvBuf) != 0 {
+		t.Fatalf("rejected frame must not buffer anything, got %d bytes", len(s.recvBuf))
+	}
+
+	// Slide the window forward (as handleRequestStream does) and retry: accepted.
+	s.maxRecv = quicInitialMaxStreamData + (1 << 20)
+	if _, flowErr := s.handleStreamFrame(beyond); flowErr {
+		t.Fatal("frame within the advanced window must be accepted")
 	}
 }

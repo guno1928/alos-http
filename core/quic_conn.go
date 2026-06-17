@@ -14,11 +14,19 @@ const (
 	quicSpaceHandshake = 1
 	quicSpaceAppData   = 2
 
-	quicDefaultIdleTimeout   = 30 * time.Second
-	quicMaxPacketSize        = 1200
-	quicConnIDLen            = 8
-	quicInitialMaxData       = 10 << 20
-	quicInitialMaxStreamData = 1 << 20
+	quicDefaultIdleTimeout = 30 * time.Second
+	quicMaxPacketSize      = 1200
+	quicConnIDLen          = 8
+	quicInitialMaxData     = 10 << 20
+	// quicInitialMaxStreamData is the initial per-stream receive window. It is
+	// advertised in three places that must agree — the transport parameters, the
+	// MAX_STREAM_DATA frames, and the enforced maxRecv ceiling — and is sized
+	// generously enough that a typical HTTP/3 request body fits without a
+	// mid-stream window update (requests dispatch on FIN, so the whole body is
+	// buffered before the handler reads it). Aligned with the HTTP/2 stream
+	// window (4 MiB); larger bodies get a clean FLOW_CONTROL close until
+	// consumption-driven window updates land (see maybeSendWindowUpdates).
+	quicInitialMaxStreamData = 4 << 20
 	quicMaxBidiStreams       = 1024
 	quicMaxUniStreams        = 128
 )

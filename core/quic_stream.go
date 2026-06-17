@@ -54,8 +54,8 @@ func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 	return &QUICStream{
 		id:        id,
 		conn:      conn,
-		maxRecv:   1 << 20,
-		maxSend:   1 << 20,
+		maxRecv:   quicInitialMaxStreamData,
+		maxSend:   quicInitialMaxStreamData,
 		recvReady: make(chan struct{}, 1),
 	}
 }

@@ -57,17 +57,29 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 
 	consumed := uint64(len(data))
 	if consumed > 0 {
-		// dataRecv is now maintained authoritatively on the receive path
-		// (handleStreamFrameIncoming enforces connection flow control there);
-		// do NOT add consumed here or it double-counts. Read it under the lock
-		// to advertise an enlarged MAX_DATA window to the peer.
+		// Advance BOTH the advertised window AND the enforced ceiling together,
+		// under the locks that guard them, so the receive-path flow-control checks
+		// (handleStreamFrame / handleStreamFrameIncoming) never reject data we have
+		// already granted the peer credit for (finding C2). dataRecv is maintained
+		// authoritatively on the receive path; we read it (and recvOff) only to
+		// size the new windows — do NOT add consumed here or it double-counts.
+		s.mu.Lock()
+		streamMax := s.recvOff + uint64(quicInitialMaxStreamData)
+		if streamMax > s.maxRecv {
+			s.maxRecv = streamMax
+		}
+		s.mu.Unlock()
+
 		h3.qconn.streamsMu.Lock()
-		dataRecv := h3.qconn.dataRecv
+		connMax := h3.qconn.dataRecv + uint64(quicInitialMaxData)
+		if connMax > h3.qconn.maxDataLocal {
+			h3.qconn.maxDataLocal = connMax
+		}
 		h3.qconn.streamsMu.Unlock()
 
 		var fc []byte
-		fc = quicAppendMaxStreamDataFrame(fc, s.id, s.recvOff+uint64(quicInitialMaxStreamData))
-		fc = quicAppendMaxDataFrame(fc, dataRecv+uint64(quicInitialMaxData))
+		fc = quicAppendMaxStreamDataFrame(fc, s.id, streamMax)
+		fc = quicAppendMaxDataFrame(fc, connMax)
 		h3.qconn.sendFrames(quicSpaceAppData, fc, false)
 	}
 

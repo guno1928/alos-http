@@ -7,13 +7,13 @@ import (
 )
 
 type quicTLSState struct {
-	hashFn          func() hash.Hash
-	hashLen         int
-	suite           *CipherSuiteConfig
-	transcript      hash.Hash
-	ch              ParsedClientHello
-	clientHSSecret  []byte
-	stage           int
+	hashFn         func() hash.Hash
+	hashLen        int
+	suite          *CipherSuiteConfig
+	transcript     hash.Hash
+	ch             ParsedClientHello
+	clientHSSecret []byte
+	stage          int
 }
 
 const (
@@ -37,7 +37,9 @@ func (ts *quicTLSState) handleCryptoData(qc *QUICConn, space int, data []byte) {
 		ts.handleClientHello(qc, data)
 	case quicTLSStageWaitFinished:
 		if space == quicSpaceInitial && qc.firstFlight.sent {
-			if debugFlag.Load() { log.Printf("[QUIC-DBG] retransmitting handshake flight (browser retried Initial)") }
+			if debugFlag.Load() {
+				log.Printf("[QUIC-DBG] retransmitting handshake flight (browser retried Initial)")
+			}
 			qc.sendFirstFlight(qc.firstFlight.serverHello, qc.firstFlight.ee, qc.firstFlight.cert, qc.firstFlight.cv, qc.firstFlight.fin)
 			return
 		}
@@ -49,138 +51,206 @@ func (ts *quicTLSState) handleCryptoData(qc *QUICConn, space int, data []byte) {
 }
 
 func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] handleClientHello: dataLen=%d", len(data)) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handleClientHello: dataLen=%d", len(data))
+	}
 	if len(data) < 4 {
-		if debugFlag.Load() { log.Printf("[QUIC-DBG] handleClientHello: too short (%d < 4)", len(data)) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleClientHello: too short (%d < 4)", len(data))
+		}
 		return
 	}
 	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] handleClientHello: msgType=0x%02x msgLen=%d totalAvail=%d", data[0], msgLen, len(data)) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handleClientHello: msgType=0x%02x msgLen=%d totalAvail=%d", data[0], msgLen, len(data))
+	}
 	if len(data) < 4+msgLen {
-		if debugFlag.Load() { log.Printf("[QUIC-DBG] handleClientHello: truncated (%d < %d)", len(data), 4+msgLen) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-DBG] handleClientHello: truncated (%d < %d)", len(data), 4+msgLen)
+		}
 		return
 	}
 
 	ch := &ts.ch
 	ch.Reset()
 	if err := ParseClientHello(data, ch); err != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] bad ClientHello: %v", err) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] bad ClientHello: %v", err)
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] ClientHello: SNI=%q TLS13=%v suites=%v x25519=%v sessionID_len=%d",
-		ch.ServerName, ch.SupportsTLS13(), ch.CipherSuites, ch.X25519PubKey != nil, len(ch.SessionID)) }
-	if debugFlag.Load() { log.Printf("[H3-TLS] ClientHello first 20 bytes: %x", data[:min(20, len(data))]) }
-	if debugFlag.Load() { log.Printf("[H3-TLS] ClientHello raw bytes 4-10: %x", data[4:min(10, len(data))]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] ClientHello: SNI=%q TLS13=%v suites=%v x25519=%v sessionID_len=%d",
+			ch.ServerName, ch.SupportsTLS13(), ch.CipherSuites, ch.X25519PubKey != nil, len(ch.SessionID))
+	}
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] ClientHello first 20 bytes: %x", data[:min(20, len(data))])
+	}
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] ClientHello raw bytes 4-10: %x", data[4:min(10, len(data))])
+	}
 
 	if !ch.SupportsTLS13() {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] client doesn't support TLS 1.3") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] client doesn't support TLS 1.3")
+		}
 		return
 	}
 
 	suite := NegotiateSuite(ch.CipherSuites)
 	if suite == nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] no shared cipher suite") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] no shared cipher suite")
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] negotiated suite: 0x%04x (hash=%d)", suite.ID, suite.HashLen) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] negotiated suite: 0x%04x (hash=%d)", suite.ID, suite.HashLen)
+	}
 	ts.suite = suite
 	ts.hashFn = suite.HashFn
 	ts.hashLen = suite.HashLen
 	ts.transcript = ts.hashFn()
 
 	if ch.X25519PubKey == nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] no x25519 key share") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] no x25519 key share")
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] client x25519 pub: %x", ch.X25519PubKey) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] client x25519 pub: %x", ch.X25519PubKey)
+	}
 
 	entry := qc.server.certStore.Lookup(ch.ServerName)
 	if entry == nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] no cert for SNI %q", ch.ServerName) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] no cert for SNI %q", ch.ServerName)
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] cert found for %q, privKey type=%T, chainDER=%d certs", ch.ServerName, entry.PrivKey, len(entry.ChainDER)) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] cert found for %q, privKey type=%T, chainDER=%d certs", ch.ServerName, entry.PrivKey, len(entry.ChainDER))
+	}
 	if entry.PrivKey == nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] cert for %q has no private key", ch.ServerName) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] cert for %q has no private key", ch.ServerName)
+		}
 		return
 	}
 
 	kp, kpErr := qc.server.x25519Pool.Get()
 	if kpErr != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] x25519 key generation failed: %v", kpErr) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] x25519 key generation failed: %v", kpErr)
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] server x25519 pub: %x", kp.pub[:]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] server x25519 pub: %x", kp.pub[:])
+	}
 
 	var peerPub [32]byte
 	copy(peerPub[:], ch.X25519PubKey)
 	sharedSecret, ok := deriveX25519SharedSecret(&kp.priv, &peerPub)
 	if !ok {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] x25519 key exchange failed") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] x25519 key exchange failed")
+		}
 		return
 	}
-	if debugFlag.Load() { log.Printf("[H3-TLS] sharedSecret: %x", sharedSecret[:]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] sharedSecret: %x", sharedSecret[:])
+	}
 
 	ts.transcript.Write(data[:4+msgLen])
 	chHash := make([]byte, 0, ts.hashLen)
 	chHash = ts.transcript.Sum(chHash)
-	if debugFlag.Load() { log.Printf("[H3-TLS] transcript after CH: %x", chHash) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] transcript after CH: %x", chHash)
+	}
 
 	var serverRandom [32]byte
 	rand.Read(serverRandom[:])
 	serverHello := BuildServerHello(serverRandom[:], ch.SessionID, suite.ID, kp.pub[:])
-	if debugFlag.Load() { log.Printf("[H3-TLS] ServerHello: %d bytes, full hex: %x", len(serverHello), serverHello) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] ServerHello: %d bytes, full hex: %x", len(serverHello), serverHello)
+	}
 	ts.transcript.Write(serverHello)
 
 	chHash = chHash[:0]
 	chHash = ts.transcript.Sum(chHash)
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] CH+SH transcript hash: %x", chHash) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] CH+SH transcript hash: %x", chHash)
+	}
 
 	h := ts.hashFn
 	derivedFromEarly := suite.derivedFromEarly
 	handshakeSecret := TLSExtract(h, derivedFromEarly, sharedSecret[:])
 
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] handshakeSecret: %x", handshakeSecret[:min(16, len(handshakeSecret))]) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] handshakeSecret: %x", handshakeSecret[:min(16, len(handshakeSecret))])
+	}
 	var clientHSBuf, serverHSBuf [64]byte
 	clientHSSecret := suite.DeriveSecretTo(&suite.labelClientHSTraffic, handshakeSecret, chHash, clientHSBuf[:0])
 	serverHSSecret := suite.DeriveSecretTo(&suite.labelServerHSTraffic, handshakeSecret, chHash, serverHSBuf[:0])
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] serverHSSecret: %x", serverHSSecret[:min(16, len(serverHSSecret))]) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] serverHSSecret: %x", serverHSSecret[:min(16, len(serverHSSecret))])
+	}
 
 	clientHSKeys, err := quicDeriveKeys(h, clientHSSecret, suite)
 	if err != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] derive client HS keys: %v", err) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] derive client HS keys: %v", err)
+		}
 		return
 	}
 	serverHSKeys, err := quicDeriveKeys(h, serverHSSecret, suite)
 	if err != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] derive server HS keys: %v", err) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] derive server HS keys: %v", err)
+		}
 		return
 	}
 
 	qc.keys[quicSpaceHandshake] = clientHSKeys
 	qc.sendKeys[quicSpaceHandshake] = serverHSKeys
-	if debugFlag.Load() { log.Printf("[H3-TLS] HS keys derived, serverHSKeys IV=%x", serverHSKeys.iv[:]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] HS keys derived, serverHSKeys IV=%x", serverHSKeys.iv[:])
+	}
 
 	tp := quicBuildTransportParams(qc)
-	if debugFlag.Load() { log.Printf("[H3-TLS] transport params: %d bytes, hex=%x", len(tp), tp[:min(40, len(tp))]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] transport params: %d bytes, hex=%x", len(tp), tp[:min(40, len(tp))])
+	}
 	ee := quicBuildEncryptedExtensions("h3", tp)
-	if debugFlag.Load() { log.Printf("[H3-TLS] EncryptedExtensions: %d bytes, first20=%x", len(ee), ee[:min(20, len(ee))]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] EncryptedExtensions: %d bytes, first20=%x", len(ee), ee[:min(20, len(ee))])
+	}
 	cert := BuildCertificate(entry.ChainDER)
-	if debugFlag.Load() { log.Printf("[H3-TLS] Certificate msg: %d bytes, first20=%x", len(cert), cert[:min(20, len(cert))]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] Certificate msg: %d bytes, first20=%x", len(cert), cert[:min(20, len(cert))])
+	}
 
 	ts.transcript.Write(ee)
 	ts.transcript.Write(cert)
 
 	cvHash := make([]byte, 0, ts.hashLen)
 	cvHash = ts.transcript.Sum(cvHash)
-	if debugFlag.Load() { log.Printf("[H3-TLS] transcript after EE+Cert: %x", cvHash) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] transcript after EE+Cert: %x", cvHash)
+	}
 	cvScheme, sig, sigErr := SignCertificateVerify(entry.PrivKey, cvHash)
 	if sigErr != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] sign CertificateVerify: %v", sigErr) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] sign CertificateVerify: %v", sigErr)
+		}
 		return
 	}
 	cv := BuildCertificateVerify(cvScheme, sig)
-	if debugFlag.Load() { log.Printf("[H3-TLS] CertificateVerify: %d bytes, sigAlg bytes=%x", len(cv), cv[4:min(8, len(cv))]) }
+	if debugFlag.Load() {
+		log.Printf("[H3-TLS] CertificateVerify: %d bytes, sigAlg bytes=%x", len(cv), cv[4:min(8, len(cv))])
+	}
 	ts.transcript.Write(cv)
 
 	finHash := make([]byte, 0, ts.hashLen)
@@ -189,8 +259,10 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 	fin := BuildFinished(finData)
 	ts.transcript.Write(fin)
 
-	if debugFlag.Load() { log.Printf("[QUIC-DBG] HS message sizes: serverHello=%d ee=%d cert=%d cv=%d fin=%d chainDER=%d certs",
-		len(serverHello), len(ee), len(cert), len(cv), len(fin), len(entry.ChainDER)) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-DBG] HS message sizes: serverHello=%d ee=%d cert=%d cv=%d fin=%d chainDER=%d certs",
+			len(serverHello), len(ee), len(cert), len(cv), len(fin), len(entry.ChainDER))
+	}
 	qc.sendFirstFlight(serverHello, ee, cert, cv, fin)
 
 	ts.clientHSSecret = make([]byte, len(clientHSSecret))
@@ -208,12 +280,16 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 
 	clientAppKeys, err := quicDeriveKeys(h, clientAppSecret, suite)
 	if err != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] derive client app keys: %v", err) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] derive client app keys: %v", err)
+		}
 		return
 	}
 	serverAppKeys, err := quicDeriveKeys(h, serverAppSecret, suite)
 	if err != nil {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] derive server app keys: %v", err) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] derive server app keys: %v", err)
+		}
 		return
 	}
 
@@ -222,20 +298,22 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 
 	ts.stage = quicTLSStageWaitFinished
 
-	if debugFlag.Load() { log.Printf("[QUIC-TLS] server handshake flight sent, waiting for client Finished") }
+	if debugFlag.Load() {
+		log.Printf("[QUIC-TLS] server handshake flight sent, waiting for client Finished")
+	}
 }
 
 const (
-	quicTPOrigDstCID              = 0x00
-	quicTPMaxIdleTimeout          = 0x01
-	quicTPInitialMaxData          = 0x04
-	quicTPInitialMaxStreamBidiL   = 0x05
-	quicTPInitialMaxStreamBidiR   = 0x06
-	quicTPInitialMaxStreamUni     = 0x07
-	quicTPInitialMaxStreamsBidi   = 0x08
-	quicTPInitialMaxStreamsUni    = 0x09
-	quicTPInitialSrcCID           = 0x0f
-	quicTPActiveConnIDLimit       = 0x0e
+	quicTPOrigDstCID            = 0x00
+	quicTPMaxIdleTimeout        = 0x01
+	quicTPInitialMaxData        = 0x04
+	quicTPInitialMaxStreamBidiL = 0x05
+	quicTPInitialMaxStreamBidiR = 0x06
+	quicTPInitialMaxStreamUni   = 0x07
+	quicTPInitialMaxStreamsBidi = 0x08
+	quicTPInitialMaxStreamsUni  = 0x09
+	quicTPInitialSrcCID         = 0x0f
+	quicTPActiveConnIDLimit     = 0x0e
 )
 
 func quicBuildTransportParams(qc *QUICConn) []byte {
@@ -255,9 +333,9 @@ func quicBuildTransportParams(qc *QUICConn) []byte {
 	appendTP(quicTPInitialSrcCID, qc.srcCID())
 	appendTPVarint(quicTPMaxIdleTimeout, 30000)
 	appendTPVarint(quicTPInitialMaxData, quicInitialMaxData)
-	appendTPVarint(quicTPInitialMaxStreamBidiL, 1<<18)
-	appendTPVarint(quicTPInitialMaxStreamBidiR, 1<<18)
-	appendTPVarint(quicTPInitialMaxStreamUni, 1<<18)
+	appendTPVarint(quicTPInitialMaxStreamBidiL, quicInitialMaxStreamData)
+	appendTPVarint(quicTPInitialMaxStreamBidiR, quicInitialMaxStreamData)
+	appendTPVarint(quicTPInitialMaxStreamUni, quicInitialMaxStreamData)
 	appendTPVarint(quicTPInitialMaxStreamsBidi, quicMaxBidiStreams)
 	appendTPVarint(quicTPInitialMaxStreamsUni, quicMaxUniStreams)
 	appendTPVarint(quicTPActiveConnIDLimit, 2)
@@ -289,7 +367,9 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 		return
 	}
 	if data[0] != 0x14 {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] expected Finished (0x14), got 0x%02x", data[0]) }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] expected Finished (0x14), got 0x%02x", data[0])
+		}
 		return
 	}
 	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
@@ -303,7 +383,9 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 	finHash = ts.transcript.Sum(finHash)
 	expectedFin := ts.suite.ComputeFinishedTo(ts.clientHSSecret, finHash, nil)
 	if len(clientFinData) != len(expectedFin) {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] client Finished length mismatch") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] client Finished length mismatch")
+		}
 		return
 	}
 	match := true
@@ -314,7 +396,9 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 		}
 	}
 	if !match {
-		if debugFlag.Load() { log.Printf("[QUIC-TLS] client Finished verify failed") }
+		if debugFlag.Load() {
+			log.Printf("[QUIC-TLS] client Finished verify failed")
+		}
 		return
 	}
 
@@ -330,7 +414,9 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 	frames = quicAppendMaxStreamsFrame(frames, quicMaxUniStreams, false)
 	qc.sendFrames(quicSpaceAppData, frames, true)
 
-	if debugFlag.Load() { log.Printf("[QUIC] handshake complete for %s", qc.remoteAddr.String()) }
+	if debugFlag.Load() {
+		log.Printf("[QUIC] handshake complete for %s", qc.remoteAddr.String())
+	}
 
 	h3 := newH3Conn(qc)
 	h3.start()
