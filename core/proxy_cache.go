@@ -3,6 +3,7 @@ package core
 import (
 	"compress/flate"
 	"compress/gzip"
+	"errors"
 	"io"
 	"sort"
 	"strings"
@@ -460,8 +461,26 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 	needsDecompress, backendEncoding := detectBackendEncoding(headers)
 	if needsDecompress {
-		raw, err := decompressBody(bodyCopy, backendEncoding)
+		// Cap the inflate at MaxEntrySize+1 so a small compressed body can't balloon
+		// the cache (decompression bomb); the +1 lets the recheck below detect overflow.
+		maxInflate := cfg.MaxEntrySize
+		if maxInflate <= 0 {
+			maxInflate = 64 << 20
+		}
+		raw, err := decompressBody(bodyCopy, backendEncoding, maxInflate+1)
+		if errors.Is(err, ErrBodyTooLarge) {
+			// Fail closed on a decompression bomb: the body inflated past the cap, so
+			// drop it entirely rather than caching the compressed blob (which would
+			// defeat MaxEntrySize accounting). Other decompress errors fall through to
+			// the legacy behavior of caching the body as received.
+			return
+		}
 		if err == nil {
+			// Re-validate the inflated length: MaxEntrySize was only checked against the
+			// compressed body, so refuse to cache an entry that exceeds it after inflate.
+			if cfg.MaxEntrySize > 0 && int64(len(raw)) > cfg.MaxEntrySize {
+				return
+			}
 			entry.body = raw
 			entry.bodyLen = int32(len(raw))
 			bodyLen = int64(len(raw))
@@ -658,20 +677,19 @@ func detectBackendEncoding(headers [][2]string) (bool, string) {
 	return false, ""
 }
 
-func decompressBody(data []byte, encoding string) ([]byte, error) {
+func decompressBody(data []byte, encoding string, maxDecompressedSize int64) ([]byte, error) {
 	switch encoding {
 	case "gzip":
-		return decompressGzip(data)
+		return decompressGzip(data, maxDecompressedSize)
 	case "deflate":
-		return decompressDeflate(data)
+		return decompressDeflate(data, maxDecompressedSize)
 	case "br":
-		return decompressBrotli(data)
+		return decompressBrotli(data, maxDecompressedSize)
 	}
 	return data, nil
 }
 
-func decompressGzip(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
+func decompressGzip(data []byte, maxDecompressedSize int64) ([]byte, error) {
 	r, err := gzip.NewReader(newBytesReader(data))
 	if err != nil {
 		return nil, err
@@ -684,7 +702,7 @@ func decompressGzip(data []byte) ([]byte, error) {
 		n, rerr := r.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
+			if int64(len(buf)) > maxDecompressedSize {
 				*bp = buf[:0]
 				LargeBufPool.Put(bp)
 				return nil, ErrBodyTooLarge
@@ -706,8 +724,7 @@ func decompressGzip(data []byte) ([]byte, error) {
 	return result, nil
 }
 
-func decompressDeflate(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
+func decompressDeflate(data []byte, maxDecompressedSize int64) ([]byte, error) {
 	r := flate.NewReader(newBytesReader(data))
 	defer r.Close()
 	bp := LargeBufPool.Get().(*[]byte)
@@ -717,7 +734,7 @@ func decompressDeflate(data []byte) ([]byte, error) {
 		n, rerr := r.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
+			if int64(len(buf)) > maxDecompressedSize {
 				*bp = buf[:0]
 				LargeBufPool.Put(bp)
 				return nil, ErrBodyTooLarge
@@ -739,8 +756,7 @@ func decompressDeflate(data []byte) ([]byte, error) {
 	return result, nil
 }
 
-func decompressBrotli(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
+func decompressBrotli(data []byte, maxDecompressedSize int64) ([]byte, error) {
 	r := brotli.NewReader(newBytesReader(data))
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
@@ -749,7 +765,7 @@ func decompressBrotli(data []byte) ([]byte, error) {
 		n, rerr := r.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
+			if int64(len(buf)) > maxDecompressedSize {
 				*bp = buf[:0]
 				LargeBufPool.Put(bp)
 				return nil, ErrBodyTooLarge
