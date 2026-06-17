@@ -3,13 +3,13 @@ package core
 import "encoding/binary"
 
 const (
-	quicVersion1       uint32 = 0x00000001
-	quicLongHeaderBit  byte   = 0x80
-	quicFixedBit       byte   = 0x40
-	quicInitialType    byte   = 0x00
-	quicZeroRTTType    byte   = 0x01
-	quicHandshakeType  byte   = 0x02
-	quicRetryType      byte   = 0x03
+	quicVersion1      uint32 = 0x00000001
+	quicLongHeaderBit byte   = 0x80
+	quicFixedBit      byte   = 0x40
+	quicInitialType   byte   = 0x00
+	quicZeroRTTType   byte   = 0x01
+	quicHandshakeType byte   = 0x02
+	quicRetryType     byte   = 0x03
 )
 
 const (
@@ -46,6 +46,14 @@ func quicParseLongHeader(data []byte) (hdr quicPacketHeader, total int, err erro
 	hdr.version = binary.BigEndian.Uint32(data[1:5])
 	dcidLen := int(data[5])
 	if dcidLen > 20 || 6+dcidLen >= len(data) {
+		return hdr, 0, ErrTruncated
+	}
+	// RFC 9000 §7.2: servers MUST drop Initial packets whose Destination
+	// Connection ID is shorter than 8 bytes. This applies only to version-1
+	// Initial packets — Version Negotiation (version == 0) and other long-header
+	// types legitimately carry shorter DCIDs. A 0-length DCID would otherwise be
+	// used to derive Initial keys, lowering attacker entropy in a connection flood.
+	if hdr.version != 0 && (first&0x30)>>4 == quicInitialType && dcidLen < 8 {
 		return hdr, 0, ErrTruncated
 	}
 	hdr.dcid = data[6 : 6+dcidLen]
