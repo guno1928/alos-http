@@ -242,7 +242,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 				cache.PutManual(req.Method, host, cPath, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
 			}
 
-			if keepAlive {
+			if keepAlive && pc.br.Buffered() == 0 {
 				b.pool.put(pc)
 			} else {
 				b.pool.discard(pc)
@@ -282,7 +282,7 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			cache.Put(req.Method, host, cPath, statusCode, headers, contentType, resp.GetBody())
 		}
 
-		if keepAlive {
+		if keepAlive && pc.br.Buffered() == 0 {
 			b.pool.put(pc)
 		} else {
 			b.pool.discard(pc)
@@ -645,6 +645,8 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 
 	var contentType string
 	contentLength := int64(-1)
+	contentLengthSeen := false
+	hasTransferEncoding := false
 	isChunked := false
 	keepAlive := true
 	var headers [][2]string
@@ -676,10 +678,15 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 			contentType = val
 		case EqualFoldASCII(name, "content-length"):
 			cl, ok := parseUint(val)
-			if ok {
-				contentLength = int64(cl)
+			if !ok || (contentLengthSeen && int64(cl) != contentLength) {
+				*bp = lineBuf[:0]
+				SmallBufPool.Put(bp)
+				return statusCode, contentType, contentLength, isChunked, keepAlive, headers, ErrProxyBadResponse
 			}
+			contentLength = int64(cl)
+			contentLengthSeen = true
 		case EqualFoldASCII(name, "transfer-encoding"):
+			hasTransferEncoding = true
 			if EqualFoldASCII(val, "chunked") {
 				isChunked = true
 			}
@@ -701,6 +708,11 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 
 	*bp = lineBuf[:0]
 	SmallBufPool.Put(bp)
+
+	if hasTransferEncoding && contentLengthSeen {
+		return statusCode, contentType, contentLength, isChunked, keepAlive, headers, ErrProxyBadResponse
+	}
+
 	return statusCode, contentType, contentLength, isChunked, keepAlive, headers, nil
 }
 
