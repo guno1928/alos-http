@@ -197,6 +197,47 @@ func findCRLFBytes(buf []byte, start int) int {
 	return start + idx
 }
 
+// h1TokenChar marks the bytes permitted in an HTTP/1 header field-name per
+// RFC 7230 §3.2.6 (tchar). Any other byte — including SP/HTAB before the colon —
+// is rejected, so a name like "Transfer-Encoding " cannot smuggle past the
+// fixed-offset header dispatch below.
+var h1TokenChar = buildH1TokenTable()
+
+func buildH1TokenTable() [256]bool {
+	var t [256]bool
+	const tchar = "!#$%&'*+-.^_`|~"
+	for c := '0'; c <= '9'; c++ {
+		t[c] = true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		t[c] = true
+	}
+	for c := 'A'; c <= 'Z'; c++ {
+		t[c] = true
+	}
+	for i := 0; i < len(tchar); i++ {
+		t[tchar[i]] = true
+	}
+	return t
+}
+
+// validH1HeaderName reports whether name is a non-empty, all-token field-name.
+// Allocation-free: scans the bytes in place against a 256-entry lookup table.
+// A trailing SP/HTAB before the colon fails here (SP/HTAB are not tchar),
+// which closes the whitespace-before-colon request-smuggling vector that hides
+// Transfer-Encoding / Content-Length from the fixed-offset dispatch.
+func validH1HeaderName(name []byte) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !h1TokenChar[name[i]] {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, ok bool) {
 	const maxHeaders = 128
 
@@ -259,6 +300,16 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		line := data[pos:nl]
 		colon := bytes.IndexByte(line, ':')
 		if colon > 0 {
+			if !validH1HeaderName(line[:colon]) {
+				// Whitespace or other non-token bytes before the colon
+				// (e.g. "Transfer-Encoding : chunked") would shift the colon
+				// offset and slip past the fixed-offset dispatch below, hiding
+				// the framing header. Fail closed via the bad-request path the
+				// drivers already surface for badTransferEncoding (400 + close).
+				badTransferEncoding = true
+				pos = nl + 2
+				continue
+			}
 			name := UnsafeString(line[:colon])
 			val := line[colon+1:]
 			if len(val) > 0 && val[0] == ' ' {
