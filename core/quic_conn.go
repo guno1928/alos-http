@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/rand"
+	"hash"
 	"log"
 	"net"
 	"sync"
@@ -24,41 +25,52 @@ const (
 )
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
 	sendPN      [3]uint64
 	recvLargest [3]int64
-	loss        *quicLossState
-	cryptoBuf   [3][]byte
-	cryptoRcv   [3][]bool
+
+	// 1-RTT key update state (RFC 9001 §6). appKeyPhase is the key phase bit
+	// currently installed for the application space; the *AppSecret fields hold
+	// the current-generation traffic secrets used to derive the next generation.
+	appKeyPhase     uint8     // key phase the peer is currently sending in (recv side)
+	sendKeyPhase    uint8     // key phase we emit on outgoing app packets (send side)
+	prevRecvKeys    *quicKeys // previous-generation recv keys, retained for reordered packets
+	clientAppSecret []byte
+	serverAppSecret []byte
+	keyUpdateHash   func() hash.Hash
+	keyUpdateSuite  *CipherSuiteConfig
+	loss            *quicLossState
+	cryptoBuf       [3][]byte
+	cryptoRcv       [3][]bool
 
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -205,12 +217,106 @@ func (qc *QUICConn) handleShortHeaderPacket(data []byte) {
 		return
 	}
 
-	plaintext, err := quicDecryptPacket(data, &hdr, keys, qc.loss.largestAcked[quicSpaceAppData])
+	// Header protection is removed with the current keys. The HP key is not
+	// rotated across key updates (RFC 9001 §6.1), so the current protector is
+	// always correct regardless of key phase.
+	pnLen := keys.removeHeaderProtection(data, hdr.pnOffset)
+	if pnLen == 0 {
+		return
+	}
+
+	// Packet-number reconstruction (RFC 9000 §A.3) keys off the largest packet
+	// number *received* from the peer in this space, not the server's own acked
+	// send PNs. Using loss.largestAcked here desyncs once the server's send PN
+	// races ahead of the peer's (e.g. a large response).
+	truncatedPN := quicReadPacketNumber(data[hdr.pnOffset:], pnLen)
+	hdr.pn = quicDecodePacketNumber(truncatedPN, pnLen, qc.recvLargest[quicSpaceAppData])
+	hdr.pnLen = pnLen
+
+	headerEnd := hdr.pnOffset + pnLen
+	payloadEnd := hdr.payloadOff + hdr.payloadLen
+	if headerEnd > payloadEnd || payloadEnd > len(data) {
+		return
+	}
+	header := data[:headerEnd]
+	ciphertext := data[headerEnd:payloadEnd]
+
+	phaseBit := (data[0] >> 2) & 1
+
+	if phaseBit == qc.appKeyPhase {
+		// Current generation: decrypt in place (the hot path).
+		plaintext, err := keys.decrypt(ciphertext[:0], header, ciphertext, hdr.pn)
+		if err != nil {
+			return
+		}
+		qc.processFrames(quicSpaceAppData, hdr.pn, plaintext)
+		return
+	}
+
+	// Differing key phase (RFC 9001 §6.3): the packet is either a reordered
+	// packet from the previous generation or the first of a new key update. Both
+	// carry the same phase bit, so we trial-decrypt. AEAD Open zeroes its output
+	// on failure, so decrypt into a separate scratch buffer to avoid destroying
+	// the ciphertext for the second attempt.
+	scratch := make([]byte, 0, len(ciphertext))
+
+	if qc.prevRecvKeys != nil {
+		if plaintext, e := qc.prevRecvKeys.decrypt(scratch, header, ciphertext, hdr.pn); e == nil {
+			// Reordered packet from the previous generation: process without
+			// rotating keys.
+			qc.processFrames(quicSpaceAppData, hdr.pn, plaintext)
+			return
+		}
+	}
+
+	// Trial-decrypt with the next generation. Failure here means a forged or
+	// undecryptable packet, which we drop without rotating keys.
+	pendingRecv, pendingRecvSecret := qc.deriveNextAppKeys(keys, qc.clientAppSecret)
+	if pendingRecv == nil {
+		return
+	}
+	plaintext, err := pendingRecv.decrypt(scratch[:0], header, ciphertext, hdr.pn)
 	if err != nil {
 		return
 	}
 
+	// Commit the key update (RFC 9001 §6). Receive state is owned solely by this
+	// goroutine; retain the prior generation to decrypt reordered packets.
+	qc.prevRecvKeys = keys
+	qc.keys[quicSpaceAppData] = pendingRecv
+	qc.clientAppSecret = pendingRecvSecret
+	qc.appKeyPhase = phaseBit
+
+	// Roll our send keys to the same phase and start emitting the new key phase
+	// bit. The peer requires that ACKs of its new-phase packets come back under
+	// the new phase; otherwise it aborts with KEY_UPDATE_ERROR. Send state is
+	// shared with the response goroutine, so mutate it under writeMu (the same
+	// lock sendFrames holds).
+	qc.writeMu.Lock()
+	if nextSend, nextSendSecret := qc.deriveNextAppKeys(qc.sendKeys[quicSpaceAppData], qc.serverAppSecret); nextSend != nil {
+		qc.sendKeys[quicSpaceAppData] = nextSend
+		qc.serverAppSecret = nextSendSecret
+		qc.sendKeyPhase = phaseBit
+	}
+	qc.writeMu.Unlock()
+
 	qc.processFrames(quicSpaceAppData, hdr.pn, plaintext)
+}
+
+// deriveNextAppKeys derives the next-generation application keys from the given
+// current traffic secret. The header-protection key is carried over unchanged,
+// since QUIC key updates rotate only the AEAD key and IV (RFC 9001 §6.1).
+func (qc *QUICConn) deriveNextAppKeys(currentKeys *quicKeys, currentSecret []byte) (*quicKeys, []byte) {
+	if qc.keyUpdateHash == nil || qc.keyUpdateSuite == nil || currentKeys == nil || len(currentSecret) == 0 {
+		return nil, nil
+	}
+	nextSecret := quicNextKeyUpdateSecret(qc.keyUpdateHash, currentSecret)
+	k, err := quicDeriveKeys(qc.keyUpdateHash, nextSecret, qc.keyUpdateSuite)
+	if err != nil {
+		return nil, nil
+	}
+	k.hp = currentKeys.hp
+	return k, nextSecret
 }
 
 func (qc *QUICConn) handleInitialPacket(packet []byte, hdr *quicPacketHeader) {
@@ -222,7 +328,7 @@ func (qc *QUICConn) handleInitialPacket(packet []byte, hdr *quicPacketHeader) {
 		return
 	}
 
-	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceInitial])
+	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.recvLargest[quicSpaceInitial])
 	if err != nil {
 		if debugFlag.Load() {
 			log.Printf("[QUIC-DBG] handleInitial: decrypt failed: %v (pktLen=%d pnOff=%d payOff=%d payLen=%d)", err, len(packet), hdr.pnOffset, hdr.payloadOff, hdr.payloadLen)
@@ -245,7 +351,7 @@ func (qc *QUICConn) handleHandshakePacket(packet []byte, hdr *quicPacketHeader) 
 		return
 	}
 
-	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.loss.largestAcked[quicSpaceHandshake])
+	plaintext, err := quicDecryptPacket(packet, hdr, keys, qc.recvLargest[quicSpaceHandshake])
 	if err != nil {
 		if debugFlag.Load() {
 			log.Printf("[QUIC-DBG] handleHandshake: decrypt failed: %v", err)
@@ -468,7 +574,9 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 	case quicSpaceHandshake:
 		packet = quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), frames, pn, largestAcked, keys)
 	case quicSpaceAppData:
-		packet = quicBuildShortPacket(nil, qc.dstCID(), frames, pn, largestAcked, keys)
+		// sendKeyPhase is mutated only under writeMu (held here), so this read is
+		// race-free with a concurrent key-update commit.
+		packet = quicBuildShortPacket(nil, qc.dstCID(), frames, pn, largestAcked, keys, qc.sendKeyPhase)
 	}
 
 	if len(packet) > 0 {

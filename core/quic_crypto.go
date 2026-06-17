@@ -118,6 +118,14 @@ func quicDeriveKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*
 	return qk, nil
 }
 
+// quicNextKeyUpdateSecret derives the next-generation 1-RTT traffic secret from
+// the current one per RFC 9001 §6.1: secret_<n+1> = HKDF-Expand-Label(secret_<n>,
+// "quic ku", "", Hash.length). The secret length equals the hash output, i.e.
+// len(secret).
+func quicNextKeyUpdateSecret(h func() hash.Hash, secret []byte) []byte {
+	return TLSExpandLabel(h, secret, "quic ku", nil, len(secret))
+}
+
 func quicDeriveInitialKeys(dcid []byte) (client, server *quicKeys, err error) {
 	h := sha256.New
 	cs := FindSuiteByID(0x1301)

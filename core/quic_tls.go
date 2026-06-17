@@ -220,6 +220,15 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 	qc.keys[quicSpaceAppData] = clientAppKeys
 	qc.sendKeys[quicSpaceAppData] = serverAppKeys
 
+	// Seed key-update state with the generation-0 1-RTT secrets so the receive
+	// path can derive the next generation when the peer flips the key phase.
+	qc.appKeyPhase = 0
+	qc.sendKeyPhase = 0
+	qc.clientAppSecret = append([]byte(nil), clientAppSecret...)
+	qc.serverAppSecret = append([]byte(nil), serverAppSecret...)
+	qc.keyUpdateHash = h
+	qc.keyUpdateSuite = suite
+
 	ts.stage = quicTLSStageWaitFinished
 
 	if debugFlag.Load() { log.Printf("[QUIC-TLS] server handshake flight sent, waiting for client Finished") }
