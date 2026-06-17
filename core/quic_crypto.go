@@ -103,7 +103,7 @@ func quicDeriveKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*
 	copy(qk.iv[:], iv)
 
 	switch cs.ID {
-	case 0x1301, 0x1302, 0x1306:
+	case 0x1301, 0x1302:
 		block, err := aes.NewCipher(hpKey)
 		if err != nil {
 			return nil, err

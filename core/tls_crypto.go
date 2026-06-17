@@ -6,7 +6,6 @@ import (
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"errors"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -14,6 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"hash"
 	"log"
 	"math/big"
@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ericlagergren/aegis"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -49,14 +48,14 @@ type CipherSuiteConfig struct {
 	labelServerAppTraffic hkdfLabelTemplate
 }
 
-var SupportedSuites = [4]CipherSuiteConfig{
-	{
-		ID: 0x1306, KeyLen: 16, IVLen: 16,
-		HashFn: sha256.New, HashLen: 32,
-		MakeAEAD: func(key []byte) (cipher.AEAD, error) {
-			return aegis.New(key)
-		},
-	},
+// SupportedSuites omits the non-standard AEGIS suite (0x1306). Its third-party
+// AEAD (github.com/ericlagergren/aegis) does not document the in-place
+// dst==src aliasing guarantee that Encrypt/Decrypt rely on; that guarantee
+// holds only for the stdlib AES-GCM / ChaCha20-Poly1305 AEADs. Relying on the
+// library's incidental aliasing tolerance risks silent plaintext corruption
+// (and a potential integrity bypass if corruption precedes the tag check), so
+// the suite is not negotiable. AEGIS is non-standard and unused by real clients.
+var SupportedSuites = [3]CipherSuiteConfig{
 	{
 		ID: 0x1301, KeyLen: 16, IVLen: 12,
 		HashFn: sha256.New, HashLen: 32,
