@@ -241,7 +241,11 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 	} else {
 		rawURI = UnsafeString(rl[sp1+1 : sp2])
 	}
-	req.Path = sanitizeRequestPath(rawURI)
+	sanitizedPath, pathOK := sanitizeRequestPath(rawURI)
+	if !pathOK {
+		return 0, 0, false, false, false, false
+	}
+	req.Path = sanitizedPath
 	_, req.Query = splitPathQuery(rawURI)
 	req.RawPath = rawURI
 

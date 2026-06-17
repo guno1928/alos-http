@@ -93,7 +93,9 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 					method = h[1]
 				case ":path":
 					rawPath = h[1]
-					path = sanitizeRequestPath(h[1])
+					// On a malformed/rejected path leave path empty; the
+					// method == "" || path == "" guard below rejects the request.
+					path, _ = sanitizeRequestPath(h[1])
 					_, query = splitPathQuery(h[1])
 				case ":authority":
 					authority = h[1]

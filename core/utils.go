@@ -549,25 +549,87 @@ func splitPathQuery(raw string) (string, string) {
 	return raw, ""
 }
 
-func sanitizeRequestPath(path string) string {
-	if nul := strings.IndexByte(path, 0); nul >= 0 {
-		path = path[:nul]
-	} else if cr := strings.IndexByte(path, '\r'); cr >= 0 {
+// decodePercent decodes percent-escapes in s once. It fails closed (ok=false)
+// on a malformed escape (a '%' not followed by two hex digits) and on a decoded
+// NUL byte (%00). Decoding before segment normalization is what makes encoded
+// traversal (%2e%2e, ..%2f) collapse to "." / ".." and get stripped — otherwise
+// the still-encoded bytes survive sanitization and any handler that later decodes
+// a path param becomes traversable. Returns s unchanged when it has no escapes.
+func decodePercent(s string) (string, bool) {
+	if strings.IndexByte(s, '%') < 0 {
+		if strings.IndexByte(s, 0) >= 0 {
+			return "", false
+		}
+		return s, true
+	}
+
+	dst := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '%' {
+			if c == 0 {
+				return "", false
+			}
+			dst = append(dst, c)
+			continue
+		}
+		if i+2 >= len(s) {
+			return "", false
+		}
+		hi, hiOK := fromHexDigit(s[i+1])
+		lo, loOK := fromHexDigit(s[i+2])
+		if !hiOK || !loOK {
+			return "", false
+		}
+		b := hi<<4 | lo
+		if b == 0 {
+			return "", false
+		}
+		dst = append(dst, b)
+		i += 2
+	}
+	return string(dst), true
+}
+
+func fromHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	}
+	return 0, false
+}
+
+func sanitizeRequestPath(path string) (string, bool) {
+	if cr := strings.IndexByte(path, '\r'); cr >= 0 {
 		path = path[:cr]
 	} else if lf := strings.IndexByte(path, '\n'); lf >= 0 {
 		path = path[:lf]
 	}
 	if len(path) == 0 {
-		return "/"
+		return "/", true
 	}
 
-	p, _ := splitPathQuery(path)
+	// Split off the query before decoding so escapes inside the query string
+	// can't introduce a '/' that would be mistaken for a path separator.
+	rawP, _ := splitPathQuery(path)
+	if len(rawP) == 0 {
+		return "/", true
+	}
+
+	p, ok := decodePercent(rawP)
+	if !ok {
+		return "", false
+	}
 	if len(p) == 0 {
-		return "/"
+		return "/", true
 	}
 
 	if p[0] == '/' && strings.IndexByte(p, '.') < 0 && !strings.Contains(p, "//") {
-		return p
+		return p, true
 	}
 
 	needsSanitize := p[0] != '/'
@@ -580,7 +642,7 @@ func sanitizeRequestPath(path string) string {
 		}
 	}
 	if !needsSanitize {
-		return p
+		return p, true
 	}
 
 	if len(p) == 0 || p[0] != '/' {
@@ -605,14 +667,14 @@ func sanitizeRequestPath(path string) string {
 		}
 	}
 	if len(segments) == 0 {
-		return "/"
+		return "/", true
 	}
 	clean := make([]byte, 0, len(p))
 	for _, seg := range segments {
 		clean = append(clean, '/')
 		clean = append(clean, seg...)
 	}
-	return string(clean)
+	return string(clean), true
 }
 
 var badHostChar [256]bool

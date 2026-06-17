@@ -904,7 +904,11 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 	}
 	headers = headers[:0]
 	rawPath := path
-	path = sanitizeRequestPath(path)
+	sanitizedPath, pathOK := sanitizeRequestPath(path)
+	if !pathOK {
+		return nil, meta, true, ErrH2BadHeader
+	}
+	path = sanitizedPath
 	_, query := splitPathQuery(rawPath)
 	headers = append(headers,
 		[2]string{":method", "GET"},
@@ -1032,7 +1036,11 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 			if value == "/" {
 				meta.path = "/"
 			} else {
-				meta.path = sanitizeRequestPath(value)
+				sanitizedPath, pathOK := sanitizeRequestPath(value)
+				if !pathOK {
+					return ErrH2BadHeader
+				}
+				meta.path = sanitizedPath
 			}
 		case ":authority":
 			if meta.pseudoMask&hpackPseudoAuthority != 0 {
