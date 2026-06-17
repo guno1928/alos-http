@@ -271,6 +271,11 @@ func tls12Handshake(typ byte, body []byte) []byte {
 	return append(out, body...)
 }
 
+// tls12DowngradeSentinel is the RFC 8446 §4.1.3 value a TLS 1.3-capable server
+// places in the last 8 bytes of ServerHello.random when it negotiates TLS 1.2,
+// so a TLS 1.3-capable client can detect a downgrade attack ("DOWNGRD\x01").
+var tls12DowngradeSentinel = [8]byte{0x44, 0x4f, 0x57, 0x4e, 0x47, 0x52, 0x44, 0x01}
+
 func buildTLS12ServerHello(serverRandom []byte, suite uint16, alpn string) []byte {
 	body := make([]byte, 0, 80)
 	body = append(body, 0x03, 0x03)
