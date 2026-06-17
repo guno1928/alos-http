@@ -155,11 +155,28 @@ func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
 	return dst
 }
 
+// MaxInnerPadding bounds the backward scan over TLS 1.3 inner-plaintext
+// trailing zero padding (RFC 8446 §5.4). Legitimate padding is small; without
+// a cap an attacker can send a single content byte followed by ~16 KiB of zero
+// padding to force a full-record scan per record (CPU amplification). 256 bytes
+// is generous for any conformant peer (matches MaxRecordOverhead and the
+// WriteAppData fast-path) while bounding the scan to a constant.
+const MaxInnerPadding = 256
+
 func StripInnerPlaintext(data []byte) (content []byte, contentType byte, err error) {
-	for i := len(data) - 1; i >= 0; i-- {
+	limit := len(data) - MaxInnerPadding
+	if limit < 0 {
+		limit = 0
+	}
+	for i := len(data) - 1; i >= limit; i-- {
 		if data[i] != 0 {
 			return data[:i], data[i], nil
 		}
+	}
+	if limit > 0 {
+		// Content-type byte is more than MaxInnerPadding bytes from the end:
+		// reject rather than keep scanning attacker-controlled padding.
+		return nil, 0, ErrExcessiveInnerPadding
 	}
 	return nil, 0, ErrAllZeroInner
 }
