@@ -55,18 +55,40 @@ func parseCookieHeader(header string) []Cookie {
 	return cookies
 }
 
+// sanitizeCookieField strips ';', CR, LF, and other control bytes from a
+// cookie field. Fail closed: a Value or Path carrying "x; Domain=evil" must
+// not inject extra attributes into the Set-Cookie line (RFC 6265 forbids
+// control chars and ';' in these fields). String() has no error path, so we
+// drop the offending bytes rather than signal — valid cookies are unchanged.
+func sanitizeCookieField(v string) string {
+	if strings.IndexFunc(v, isInvalidCookieByte) < 0 {
+		return v
+	}
+	b := make([]byte, 0, len(v))
+	for j := 0; j < len(v); j++ {
+		if !isInvalidCookieByte(rune(v[j])) {
+			b = append(b, v[j])
+		}
+	}
+	return string(b)
+}
+
+func isInvalidCookieByte(r rune) bool {
+	return r == ';' || r < 0x20 || r == 0x7f
+}
+
 func (c *Cookie) String() string {
 	var b strings.Builder
-	b.WriteString(c.Name)
+	b.WriteString(sanitizeCookieField(c.Name))
 	b.WriteByte('=')
-	b.WriteString(c.Value)
+	b.WriteString(sanitizeCookieField(c.Value))
 	if c.Path != "" {
 		b.WriteString("; Path=")
-		b.WriteString(c.Path)
+		b.WriteString(sanitizeCookieField(c.Path))
 	}
 	if c.Domain != "" {
 		b.WriteString("; Domain=")
-		b.WriteString(c.Domain)
+		b.WriteString(sanitizeCookieField(c.Domain))
 	}
 	if c.MaxAge > 0 {
 		b.WriteString("; Max-Age=")

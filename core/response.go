@@ -158,7 +158,10 @@ func (r *Response) SetHeader(name, value string) *Response {
 	return r
 }
 
-// SetHeaderUnsafe appends a trusted response header without sanitization.
+// SetHeaderUnsafe appends a response header verbatim, with no CR/LF/NUL
+// sanitization. Footgun: only feed it trusted, non-request-derived values.
+// Passing attacker-controlled data (anything from the request) enables CRLF
+// response splitting / header injection — use SetHeader for that input.
 //
 //	resp.SetHeaderUnsafe("Server", "ALOS")
 func (r *Response) SetHeaderUnsafe(name, value string) *Response {
