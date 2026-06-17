@@ -340,6 +340,12 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	}
 	sidLen := int(ch[pos])
 	pos++
+	// RFC 8446 §4.1.2 / RFC 5246 §7.4.1.2 cap legacy_session_id at 32 bytes.
+	// sessionIDBuf is [32]byte, so a larger length would panic on the reslice
+	// below; reject at the boundary instead of relying on a recover().
+	if sidLen > len(result.sessionIDBuf) {
+		return ErrSessionIDTooLong
+	}
 	if pos+sidLen > len(ch) {
 		return ErrSessionIDTruncated
 	}
