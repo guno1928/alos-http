@@ -622,6 +622,26 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			} else {
 				tmpReq.Body = nil
 			}
+			// The handler runs in a detached goroutine that can outlive the
+			// timeout; once it does, req may be Reset and reused for the next
+			// request on the connection. tmpReq := *req shallow-copies the
+			// store/queryCache/formCache map headers, so the still-running
+			// handler and the recycled req would race on the same maps
+			// (concurrent map write -> panic). Give tmpReq its own maps:
+			// store may carry context from upstream middleware so copy it;
+			// the query/form caches are pure derivations of the copied
+			// Query/Body and are reparsed lazily, so nil suffices.
+			if req.store != nil {
+				storeCopy := make(map[string]any, len(req.store))
+				for k, v := range req.store {
+					storeCopy[k] = v
+				}
+				tmpReq.store = storeCopy
+			} else {
+				tmpReq.store = nil
+			}
+			tmpReq.queryCache = nil
+			tmpReq.formCache = nil
 			tmpReq.StreamWriter = nil
 			tmpReq.conn = nil
 			tmpReq.tlsReader = nil
