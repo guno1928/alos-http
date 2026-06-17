@@ -316,7 +316,11 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			pos += int(nameLen)
 			var name string
 			if huffName {
-				name = hpackHuffmanDecode(nameRaw)
+				decoded, ok := hpackHuffmanDecode(nameRaw)
+				if !ok {
+					return nil, ErrHuffmanDecode
+				}
+				name = decoded
 			} else {
 				name = string(nameRaw)
 			}
@@ -351,7 +355,11 @@ func qpackDecodeString(data []byte) (string, int) {
 	}
 	raw := data[n : n+int(sLen)]
 	if huffman {
-		return hpackHuffmanDecode(raw), n + int(sLen)
+		decoded, ok := hpackHuffmanDecode(raw)
+		if !ok {
+			return "", 0
+		}
+		return decoded, n + int(sLen)
 	}
 	return string(raw), n + int(sLen)
 }

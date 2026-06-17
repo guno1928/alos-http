@@ -609,7 +609,10 @@ func (d *HpackDecoder) decodeString(data []byte) (string, int) {
 			return d.huffmanCache[i].value, n + int(sLen)
 		}
 	}
-	decoded := hpackHuffmanDecode(raw)
+	decoded, ok := hpackHuffmanDecode(raw)
+	if !ok {
+		return "", 0
+	}
 	slot := int(d.huffmanCacheNext) % len(d.huffmanCache)
 	d.huffmanCacheNext++
 	d.huffmanCache[slot].store(hash, raw, decoded)
@@ -1257,13 +1260,20 @@ func HpackDecodeString(data []byte) (string, int) {
 	}
 	raw := data[n : n+int(sLen)]
 	if huffman {
-		decoded := hpackHuffmanDecode(raw)
+		decoded, ok := hpackHuffmanDecode(raw)
+		if !ok {
+			return "", 0
+		}
 		return decoded, n + int(sLen)
 	}
 	return string(raw), n + int(sLen)
 }
 
-func hpackHuffmanDecode(src []byte) string {
+// hpackHuffmanDecode decodes an HPACK/QPACK Huffman string. It returns ok=false
+// on any RFC 7541 §5.2 violation (embedded EOS, >7 bits of padding, or padding
+// that is not the all-ones EOS prefix); callers must treat that as a
+// COMPRESSION error and not use the value.
+func hpackHuffmanDecode(src []byte) (string, bool) {
 	var stackBuf [256]byte
 	var dst []byte
 	if len(src)*2 <= len(stackBuf) {
@@ -1293,7 +1303,20 @@ func hpackHuffmanDecode(src []byte) string {
 		}
 	}
 
-	return string(dst)
+	// RFC 7541 §5.2: any leftover must be valid padding — at most 7 bits, all
+	// set to 1. A full byte or more of undecodable bits means an embedded EOS
+	// or over-long padding; a non-all-ones tail is also a decoding error.
+	if nbits >= 8 {
+		return "", false
+	}
+	if nbits > 0 {
+		pad := uint64(1)<<nbits - 1
+		if bits&pad != pad {
+			return "", false
+		}
+	}
+
+	return string(dst), true
 }
 
 var huffmanCodes = [257]struct {
