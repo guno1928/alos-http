@@ -20,19 +20,37 @@ const (
 	quicInitialMaxData       = 10 << 20
 	quicInitialMaxStreamData = 1 << 20
 	quicMaxCryptoBuf         = 64 << 10
+	// maxQUICConns bounds concurrent QUIC connections per server to limit the
+	// memory/goroutines an attacker can force by flooding spoofed Initials.
+	maxQUICConns                = 65536
 	quicMaxConcurrentReqStreams = 256
-	quicMaxBidiStreams       = 1024
-	quicMaxUniStreams        = 128
+	quicMaxBidiStreams          = 1024
+	quicMaxUniStreams           = 128
 )
 
+// admitQUICConn reserves a slot for a new QUIC connection, returning false when
+// the per-server cardinality cap is reached (the caller drops the Initial).
+// Every successful admit must be paired with releaseQUICConn on teardown.
+func (s *Server) admitQUICConn() bool {
+	if s.quicConns.Add(1) > maxQUICConns {
+		s.quicConns.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (s *Server) releaseQUICConn() {
+	s.quicConns.Add(-1)
+}
+
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -45,22 +63,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	server     *Server
 	remoteAddr net.Addr

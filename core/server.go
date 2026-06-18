@@ -177,34 +177,35 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config         Config
-	caps           Capabilities
-	capsLogOnce    sync.Once
-	Router         *Router
-	CORS           *CORSEngine
-	RateLimit      *RateLimitEngine
-	certStore      *CertStore
-	fallbackTLS    atomic.Pointer[tls.Config]
-	proxy          atomic.Pointer[ProxyEngine]
-	httpRouter     *HTTPRouter
-	acme           *acmeIntegration
-	listeners      []net.Listener
-	done           chan struct{}
-	tlsRuntimeOnce sync.Once
-	x25519Pool     *x25519KeyPool
-	activeConns    atomic.Int64
-	shuttingDown   atomic.Bool
-	drainDone      chan struct{}
-	drainOnce      sync.Once
-	shutdownOnce   sync.Once
-	connLimiter    *ConnectionLimiter
-	globalLimiter  *GlobalLimiter
-	activeReqs     atomic.Int64
-	fastDispatch   atomic.Bool
-	plainRootFast  plainRootFastResponse
-	h2RootFast     h2RootFastResponse
-	trustedProxies trustedProxyMatcher
-	perIPLimiter   *perIPRequestLimiter
+	config          Config
+	caps            Capabilities
+	capsLogOnce     sync.Once
+	Router          *Router
+	CORS            *CORSEngine
+	RateLimit       *RateLimitEngine
+	certStore       *CertStore
+	fallbackTLS     atomic.Pointer[tls.Config]
+	proxy           atomic.Pointer[ProxyEngine]
+	httpRouter      *HTTPRouter
+	acme            *acmeIntegration
+	listeners       []net.Listener
+	done            chan struct{}
+	tlsRuntimeOnce  sync.Once
+	x25519Pool      *x25519KeyPool
+	activeConns     atomic.Int64
+	shuttingDown    atomic.Bool
+	drainDone       chan struct{}
+	drainOnce       sync.Once
+	shutdownOnce    sync.Once
+	connLimiter     *ConnectionLimiter
+	globalLimiter   *GlobalLimiter
+	activeReqs      atomic.Int64
+	quicConns       atomic.Int64
+	fastDispatch    atomic.Bool
+	plainRootFast   plainRootFastResponse
+	h2RootFast      h2RootFastResponse
+	trustedProxies  trustedProxyMatcher
+	perIPLimiter    *perIPRequestLimiter
 	trackedConnMu   sync.Mutex
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool
