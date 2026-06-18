@@ -152,6 +152,16 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 		return nil
 	}
 
+	// Cardinality cap: a QUIC Initial creates connection state from a single
+	// (spoofable) packet. Bound concurrent connections so a flood of Initials
+	// can't exhaust memory/goroutines; over the cap the Initial is dropped.
+	if !s.admitQUICConn() {
+		if debugFlag.Load() {
+			log.Printf("[QUIC] connection cap %d reached; dropping new conn from %s", maxQUICConns, remoteAddr)
+		}
+		return nil
+	}
+
 	qc := newQUICConn(s, pc, remoteAddr, dcid, scid)
 	qc.keys[quicSpaceInitial] = clientKeys
 	qc.sendKeys[quicSpaceInitial] = serverKeys
@@ -175,6 +185,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 		<-qc.done
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		s.releaseQUICConn()
 	}()
 
 	return qc

@@ -76,8 +76,8 @@ func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *ShardedMap[string
 		if err != nil {
 			if s.shuttingDown.Load() || uc.closed.Load() {
 				if debugFlag.Load() {
-				log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
-			}
+					log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
+				}
 				return
 			}
 			if debugFlag.Load() {
@@ -207,6 +207,16 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 		return nil
 	}
 
+	// Cardinality cap: bound concurrent QUIC connections so an attacker cannot
+	// exhaust memory/goroutines by flooding spoofable Initials; over the cap the
+	// Initial is dropped.
+	if !s.admitQUICConn() {
+		if debugFlag.Load() {
+			log.Printf("[QUIC] connection cap %d reached; dropping new conn from %s", maxQUICConns, remoteAddr)
+		}
+		return nil
+	}
+
 	qc := newQUICConnIOUring(s, uc, remoteAddr, dcid, scid)
 	qc.keys[quicSpaceInitial] = clientKeys
 	qc.sendKeys[quicSpaceInitial] = serverKeys
@@ -231,6 +241,7 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 		<-qc.done
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		s.releaseQUICConn()
 	}()
 
 	return qc
