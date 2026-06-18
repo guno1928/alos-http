@@ -242,9 +242,11 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 				cache.PutManual(req.Method, host, cPath, statusCode, headers, contentType, body, manualTTL, manualMaxHits, manualCompress, manualCompressMin)
 			}
 
-			if keepAlive {
+			if keepAlive && pc.br.Buffered() == 0 {
 				b.pool.put(pc)
 			} else {
+				// Never pool a connection with unread bytes buffered: leftover
+				// data desyncs the next request reusing it (response smuggling).
 				b.pool.discard(pc)
 			}
 			return nil
@@ -282,9 +284,11 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 			cache.Put(req.Method, host, cPath, statusCode, headers, contentType, resp.GetBody())
 		}
 
-		if keepAlive {
+		if keepAlive && pc.br.Buffered() == 0 {
 			b.pool.put(pc)
 		} else {
+			// Never pool a connection with unread bytes buffered: leftover data
+			// desyncs the next request reusing it (response smuggling).
 			b.pool.discard(pc)
 		}
 		return nil
@@ -704,6 +708,12 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 
 	*bp = lineBuf[:0]
 	SmallBufPool.Put(bp)
+	// RFC 9112 §6.1: a message with both Transfer-Encoding and Content-Length is
+	// ambiguous and must be rejected — front-end and back-end can disagree on
+	// the body boundary (response smuggling / cache poisoning).
+	if isChunked && contentLength >= 0 {
+		return statusCode, contentType, contentLength, isChunked, keepAlive, headers, ErrProxyBadResponse
+	}
 	return statusCode, contentType, contentLength, isChunked, keepAlive, headers, nil
 }
 
