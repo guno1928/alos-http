@@ -1,5 +1,7 @@
 package core
 
+import "github.com/zeebo/xxh3"
+
 var HpackStaticTable = [62][2]string{
 	{},
 	{":authority", ""},
@@ -488,16 +490,7 @@ type hpackHuffmanDecodeCacheEntry struct {
 }
 
 func hpackHashBytes(data []byte) uint64 {
-	const (
-		offset64 = 1469598103934665603
-		prime64  = 1099511628211
-	)
-	hash := uint64(offset64)
-	for _, b := range data {
-		hash ^= uint64(b)
-		hash *= prime64
-	}
-	return hash
+	return xxh3.Hash(data)
 }
 
 func (e *hpackHuffmanDecodeCacheEntry) match(hash uint64, data []byte) bool {

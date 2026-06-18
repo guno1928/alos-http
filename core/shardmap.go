@@ -1,6 +1,10 @@
 package core
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/zeebo/xxh3"
+)
 
 const shardCount = 64
 
@@ -76,12 +80,7 @@ func (s *ShardedMap[K, V]) Range(fn func(K, V) bool) {
 }
 
 func StringHash(s string) uint64 {
-	var h uint64 = 14695981039346656037
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= 1099511628211
-	}
-	return h
+	return xxh3.HashString(s)
 }
 
 func Uint32Hash(v uint32) uint64 {
