@@ -1,6 +1,6 @@
 module github.com/guno1928/alos-http
 
-go 1.26
+go 1.26.4
 
 require (
 	github.com/andybalholm/brotli v1.2.1

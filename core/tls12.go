@@ -18,8 +18,6 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// ---- PRF (RFC 5246 §5) ----
-
 func tls12PRF(newHash func() hash.Hash, secret, label, seed []byte, length int) []byte {
 	labelSeed := make([]byte, 0, len(label)+len(seed))
 	labelSeed = append(labelSeed, label...)
@@ -66,8 +64,6 @@ func tls12KeyBlock(newHash func() hash.Hash, master, clientRandom, serverRandom 
 func tls12Finished(newHash func() hash.Hash, master []byte, label string, transcriptHash []byte) []byte {
 	return tls12PRF(newHash, master, []byte(label), transcriptHash, 12)
 }
-
-// ---- Cipher suites ----
 
 type tls12KeyType uint8
 
@@ -117,8 +113,6 @@ func negotiateTLS12Suite(clientIDs []uint16, kt tls12KeyType) *tls12Suite {
 	return nil
 }
 
-// ---- ECDHE (crypto/ecdh: P-256 + X25519) ----
-
 type tls12Curve uint16
 
 const (
@@ -163,8 +157,6 @@ func tls12ECDHEShared(c tls12Curve, priv *ecdh.PrivateKey, peer []byte) ([]byte,
 	}
 	return shared, true
 }
-
-// ---- AEAD record layer (RFC 5288 GCM / RFC 7905 ChaCha) ----
 
 type tls12AEAD struct {
 	aead     cipher.AEAD
@@ -232,7 +224,6 @@ func (c *tls12AEAD) open(record []byte) (byte, []byte, bool) {
 	}
 	fragment := record[5 : 5+fragLen]
 	seq := c.seq
-	c.seq++
 
 	var nonce, ct []byte
 	if c.isChaCha {
@@ -257,10 +248,9 @@ func (c *tls12AEAD) open(record []byte) (byte, []byte, bool) {
 	if err != nil {
 		return 0, nil, false
 	}
+	c.seq++
 	return typ, pt, true
 }
-
-// ---- Handshake messages ----
 
 func tls12Handshake(typ byte, body []byte) []byte {
 	out := make([]byte, 4, 4+len(body))

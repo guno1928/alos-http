@@ -8,8 +8,11 @@ import (
 	"net"
 	"runtime"
 	"sync"
+
+	"github.com/guno1928/alosmap"
 )
 
+// ListenAndServeQUIC serves HTTP/3 over QUIC on the server's configured address (Addr, default ":443") using the loaded TLS certificates, blocking until the server stops. It is the QUIC counterpart to ListenAndServe.
 func (s *Server) ListenAndServeQUIC() error {
 	if err := s.loadCerts(); err != nil {
 		return err
@@ -42,7 +45,7 @@ func (s *Server) ListenAndServeQUIC() error {
 	log.Printf("=== ALOS QUIC Server (HTTP/3 io_uring) ===")
 	log.Printf("Listening on %s (UDP io_uring, %d listener(s))", addr, len(listeners))
 
-	connMap := NewShardedMap[string, *QUICConn](StringHash)
+	connMap := alosmap.New(alosmap.WithoutCleanup())
 
 	var wg sync.WaitGroup
 	for _, ln := range listeners {
@@ -65,7 +68,7 @@ func (s *Server) ListenAndServeQUIC() error {
 	return nil
 }
 
-func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *ShardedMap[string, *QUICConn]) {
+func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *alosmap.Map) {
 	if debugFlag.Load() {
 		log.Printf("[H3-DBG] serveQUICIOUring: recv loop starting, fd=%d", uc.fd)
 	}
@@ -76,8 +79,8 @@ func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *ShardedMap[string
 		if err != nil {
 			if s.shuttingDown.Load() || uc.closed.Load() {
 				if debugFlag.Load() {
-				log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
-			}
+					log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
+				}
 				return
 			}
 			if debugFlag.Load() {
@@ -102,7 +105,7 @@ func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *ShardedMap[string
 	}
 }
 
-func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *ShardedMap[string, *QUICConn]) {
+func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *alosmap.Map) {
 	if len(data) < 5 {
 		return
 	}
@@ -119,7 +122,7 @@ func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDP
 	}
 }
 
-func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *ShardedMap[string, *QUICConn]) {
+func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *alosmap.Map) {
 	hdr, _, err := quicParseLongHeader(data)
 	if err != nil {
 		if debugFlag.Load() {
@@ -143,8 +146,14 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 	dcidKey := hex.EncodeToString(hdr.dcid)
 
 	if hdr.pktType == quicPktInitial {
-		qc, exists := connMap.Load(dcidKey)
-		if !exists {
+		var qc *QUICConn
+		if v, exists := connMap.Load(alosmap.S(dcidKey)); exists {
+			qc, _ = v.(*QUICConn)
+			if debugFlag.Load() {
+				log.Printf("[H3-DBG] handleLongPacket: existing conn for dcid=%s", dcidKey)
+			}
+		}
+		if qc == nil {
 			if debugFlag.Load() {
 				log.Printf("[H3-DBG] handleLongPacket: NEW Initial from %s, creating conn", remoteAddr)
 			}
@@ -155,21 +164,18 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 				}
 				return
 			}
-		} else {
-			if debugFlag.Load() {
-				log.Printf("[H3-DBG] handleLongPacket: existing conn for dcid=%s", dcidKey)
-			}
 		}
 		qc.handlePacket(data)
 		return
 	}
 
-	qc, exists := connMap.Load(dcidKey)
-	if exists {
-		if debugFlag.Load() {
-			log.Printf("[H3-DBG] handleLongPacket: forwarding type=%d to existing conn", hdr.pktType)
+	if v, exists := connMap.Load(alosmap.S(dcidKey)); exists {
+		if qc, ok := v.(*QUICConn); ok {
+			if debugFlag.Load() {
+				log.Printf("[H3-DBG] handleLongPacket: forwarding type=%d to existing conn", hdr.pktType)
+			}
+			qc.handlePacket(data)
 		}
-		qc.handlePacket(data)
 	} else {
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] handleLongPacket: no conn found for dcid=%s type=%d", dcidKey, hdr.pktType)
@@ -177,15 +183,19 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 	}
 }
 
-func (s *Server) handleQUICShortPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *ShardedMap[string, *QUICConn]) {
+func (s *Server) handleQUICShortPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *alosmap.Map) {
 	if len(data) < 1+quicConnIDLen {
 		return
 	}
 	dcid := data[1 : 1+quicConnIDLen]
 	dcidKey := hex.EncodeToString(dcid)
 
-	qc, exists := connMap.Load(dcidKey)
+	v, exists := connMap.Load(alosmap.S(dcidKey))
 	if !exists {
+		return
+	}
+	qc, ok := v.(*QUICConn)
+	if !ok {
 		return
 	}
 	qc.handlePacket(data)
@@ -198,7 +208,10 @@ func newQUICConnIOUring(server *Server, uc *ioUringUDPConn, remoteAddr *net.UDPA
 	return qc
 }
 
-func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *ShardedMap[string, *QUICConn]) *QUICConn {
+func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *alosmap.Map) *QUICConn {
+	if quicActiveConns.Load() >= quicMaxConns {
+		return nil
+	}
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
 		if debugFlag.Load() {
@@ -214,13 +227,14 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 	qc.tlsState = newQuicTLSState()
 
 	dcidKey := hex.EncodeToString(dcid)
-	connMap.Store(dcidKey, qc)
+	connMap.Store(alosmap.S(dcidKey), qc)
 	srcCIDKey := hex.EncodeToString(qc.srcCID())
-	connMap.Store(srcCIDKey, qc)
+	connMap.Store(alosmap.S(srcCIDKey), qc)
 
 	go qc.recvLoop()
 	go qc.runIdleTimer()
 
+	quicActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
 		log.Printf("[QUIC] new io_uring connection from %s dcid=%s scid=%s tlsState=%v keys=%v",
@@ -229,8 +243,9 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 
 	go func() {
 		<-qc.done
-		connMap.Delete(dcidKey)
-		connMap.Delete(srcCIDKey)
+		quicActiveConns.Add(-1)
+		connMap.Delete(alosmap.S(dcidKey))
+		connMap.Delete(alosmap.S(srcCIDKey))
 	}()
 
 	return qc

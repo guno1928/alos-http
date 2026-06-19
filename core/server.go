@@ -11,52 +11,153 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/alosmap"
 )
 
 var timeNow = time.Now
 
-// Config controls every aspect of the ALOS server. Pass it to New to
-// create a Server. Zero values use sane defaults (see DefaultConfig).
+// Config controls every aspect of the ALOS server. Pass it to New; zero values use the defaults applied by New (see DefaultConfig).
 //
-//	s := core.New(core.Config{
-//		Addr:        ":443",
-//		IdleTimeout: 120 * time.Second,
-//		Listeners:   4,
-//		PlainHTTP:   false,
-//		ServerName:  "ALOS",
-//		ACME: &core.ACMEConfig{
-//			Email:   "admin@example.com",
-//			Domains: []string{"example.com"},
-//		},
-//	})
+// Addr is the HTTPS/HTTP listen address; defaults to ":8443".
 //
-// Fields:
-//   - Addr: listen address (":443", ":8443", "0.0.0.0:443", etc.)
-//   - HTTPAddr: listen address for the HTTP-to-HTTPS redirect listener. Defaults
-//     to ":80" when Addr uses port 443, otherwise disabled.
-//   - PlainHTTP: when true the server speaks plain HTTP/1.1 on Addr, skipping
-//     TLS entirely.
-//   - DisableHTTP2: when true the server never negotiates HTTP/2 and only
-//     serves HTTP/1.1 over TLS.
-//   - ProxyMode: enable when the server runs behind a reverse proxy / load
-//     balancer. The server then trusts the X-Forwarded-For / X-Real-IP headers
-//     and rewrites RemoteAddr to the real client IP for every request (rate
-//     limiting, logging, and handlers all see the client). Leave it off when the
-//     server is internet-facing, otherwise clients can spoof their IP. When on,
-//     TrustedProxies is ignored (all peers are trusted); leave ProxyMode off and
-//     set TrustedProxies to trust forwarding headers only from specific peers.
-//   - IdleTimeout: how long an idle keep-alive connection stays open.
-//   - HandshakeTimeout: deadline for the TLS handshake.
-//   - MaxBodySize: reject request bodies larger than this (0 = unlimited).
-//   - MaxReadSize / MaxWriteSize: per-connection I/O caps.
-//   - MaxHeaderSize: maximum header block in bytes.
-//   - MaxConcurrentReqs: server-wide concurrency cap (0 = unlimited).
-//   - Listeners: number of SO_REUSEPORT listeners (Linux only, 1 elsewhere).
-//   - Certs: per-domain certificate configs (manual, self-signed, or ACME).
-//   - ACME: automatic Let's Encrypt certificates.
-//   - ConnBandwidth / GlobalBandwidth: per-connection and global rate limits.
-//   - Debug: enable verbose internal logging.
-//   - LogRequests: log every accepted and closed connection.
+//	Example: Addr: ":443" listens on the standard HTTPS port.
+//	Example: Addr: "0.0.0.0:8443" listens on all interfaces.
+//
+// HTTPAddr is the listen address for the HTTP-to-HTTPS redirect (or plain HTTP routes); defaults to ":80" when Addr uses port 443, otherwise disabled.
+//
+//	Example: HTTPAddr: ":80" enables the redirect listener.
+//	Example: HTTPAddr: "" disables it.
+//
+// ReadTimeout bounds how long a full request read may take; 0 disables it.
+//
+//	Example: ReadTimeout: 10 * time.Second.
+//
+// WriteTimeout bounds how long a response write may take; 0 disables it.
+//
+//	Example: WriteTimeout: 10 * time.Second.
+//
+// IdleTimeout is how long an idle keep-alive connection stays open; defaults to 120s.
+//
+//	Example: IdleTimeout: 30 * time.Second.
+//
+// HandshakeTimeout is the deadline for the TLS handshake; defaults to 30s.
+//
+//	Example: HandshakeTimeout: 5 * time.Second.
+//
+// MaxBodySize rejects request bodies larger than this many bytes; 0 means unlimited.
+//
+//	Example: MaxBodySize: 10 << 20 caps bodies at 10 MiB.
+//	Example: MaxBodySize: 0 allows unlimited bodies.
+//
+// MaxReadSize caps total bytes read per connection; 0 means unlimited.
+//
+//	Example: MaxReadSize: 1 << 20.
+//
+// MaxWriteSize caps total response bytes per connection; 0 means unlimited. Oversized responses are replaced with 500.
+//
+//	Example: MaxWriteSize: 5 << 20.
+//
+// MaxHeaderSize is the maximum header block in bytes; defaults to 8192.
+//
+//	Example: MaxHeaderSize: 16384.
+//
+// MaxRequestsPerIP caps concurrent in-flight requests per client IP; 0 disables the per-IP limiter.
+//
+//	Example: MaxRequestsPerIP: 100.
+//	Example: MaxRequestsPerIP: 0 disables per-IP limiting.
+//
+// MaxConcurrentReqs is a server-wide concurrency cap; 0 means unlimited. Excess requests get 503.
+//
+//	Example: MaxConcurrentReqs: 10000.
+//
+// TLSCertFile and TLSKeyFile point to a PEM certificate/key pair used when Certs and ACME are unset.
+//
+//	Example: TLSCertFile: "cert.pem", TLSKeyFile: "key.pem".
+//	Example: TLSCertFile: "" generates a self-signed localhost certificate.
+//
+// Certs lists per-domain certificate configs (manual, self-signed, or ACME).
+//
+//	Example: Certs: []CertConfig{{Domain: "example.com", Source: CertManual, CertFile: "c.pem", KeyFile: "k.pem"}}.
+//
+// DefaultDomain selects which loaded certificate to use when SNI does not match.
+//
+//	Example: DefaultDomain: "example.com".
+//
+// ACME enables automatic Let's Encrypt certificates.
+//
+//	Example: ACME: &ACMEConfig{Email: "admin@example.com", Domains: []string{"example.com"}}.
+//	Example: ACME: nil disables ACME.
+//
+// WorkerCount sets the number of I/O workers; 0 auto-sizes from GOMAXPROCS.
+//
+//	Example: WorkerCount: 8.
+//	Example: WorkerCount: 0 auto-sizes.
+//
+// ConnBandwidth rate-limits each connection.
+//
+//	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 1 << 20, MaxDownloadRate: 1 << 20}.
+//
+// GlobalBandwidth rate-limits all connections in aggregate.
+//
+//	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 100 << 20}.
+//
+// Listeners is the number of SO_REUSEPORT listeners (Linux/amd64; 1 elsewhere); 0 auto-sizes.
+//
+//	Example: Listeners: 4.
+//	Example: Listeners: 0 auto-sizes.
+//
+// ServerName is the value sent in the Server header; defaults to "ALOS".
+//
+//	Example: ServerName: "my-api".
+//
+// TrustedProxies lists peer IPs/CIDRs whose X-Forwarded-For / X-Real-IP headers are trusted; ignored when ProxyMode is true.
+//
+//	Example: TrustedProxies: []string{"10.0.0.0/8", "192.168.1.1"}.
+//
+// EnableCompress turns on automatic gzip/deflate response compression.
+//
+//	Example: EnableCompress: true.
+//
+// CompressLevel is the compression level 1–9 used when EnableCompress is set; defaults to 6.
+//
+//	Example: CompressLevel: 9.
+//
+// CompressMinSize is the minimum body size in bytes to compress; defaults to 256.
+//
+//	Example: CompressMinSize: 1024.
+//
+// Debug enables verbose internal logging.
+//
+//	Example: Debug: true.
+//
+// LogRequests logs every accepted and closed connection; defaults to true.
+//
+//	Example: LogRequests: false silences per-connection logs.
+//
+// ShutdownTimeout bounds graceful shutdown; defaults to 30s.
+//
+//	Example: ShutdownTimeout: 10 * time.Second.
+//
+// PlainHTTP serves plain HTTP/1.1 on Addr with no TLS.
+//
+//	Example: PlainHTTP: true.
+//
+// DisableHTTP2 serves only HTTP/1.1 over TLS, never negotiating HTTP/2.
+//
+//	Example: DisableHTTP2: true.
+//
+// ProxyMode trusts forwarding headers from all peers and rewrites RemoteAddr to the real client IP; only enable behind a trusted reverse proxy. When true, TrustedProxies is ignored.
+//
+//	Example: ProxyMode: true.
+//
+// WebSocketOriginMode controls Origin validation for WebSocket upgrades; defaults to WSOriginSameOrigin.
+//
+//	Example: WebSocketOriginMode: WSOriginAllowlist.
+//
+// WebSocketAllowedOrigins lists origins accepted when WebSocketOriginMode is WSOriginAllowlist.
+//
+//	Example: WebSocketAllowedOrigins: []string{"https://example.com"}.
 type Config struct {
 	Addr             string
 	HTTPAddr         string
@@ -100,9 +201,7 @@ type Config struct {
 	WebSocketAllowedOrigins []string
 }
 
-// DefaultConfig returns a Config with sensible defaults. It listens on
-// :8443 with a 120s idle timeout, 30s handshake timeout, 8 KiB header
-// limit, gzip level 6, and request logging enabled.
+// DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
 func DefaultConfig() Config {
 	return Config{
 		Addr:              ":8443",
@@ -127,10 +226,26 @@ func DefaultConfig() Config {
 }
 
 func newPerIPRequestLimiter() *perIPRequestLimiter {
-	l := &perIPRequestLimiter{}
-	for i := range l.shards {
-		l.shards[i].counts = make(map[string]int64)
-	}
+	l := &perIPRequestLimiter{m: alosmap.New(alosmap.WithoutCleanup())}
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						Dbg("[iplimiter sweep] recovered panic: %v", r)
+					}
+				}()
+				l.m.Range(func(key alosmap.Key, value any) bool {
+					if c, ok := value.(*ipReqCounter); ok && c.n.Load() <= 0 {
+						l.m.Delete(key)
+					}
+					return true
+				})
+			}()
+		}
+	}()
 	return l
 }
 
@@ -138,73 +253,74 @@ func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
 		return true
 	}
-	shard := &l.shards[StringHash(ip)%shardCount]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	if shard.counts[ip] >= limit {
-		return false
+	v, ok := l.m.Load(alosmap.S(ip))
+	if !ok {
+		v, _ = l.m.LoadOrStore(alosmap.S(ip), &ipReqCounter{})
 	}
-	shard.counts[ip]++
-	return true
+	c := v.(*ipReqCounter)
+	for {
+		cur := c.n.Load()
+		if cur >= limit {
+			return false
+		}
+		if c.n.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
 }
 
 func (l *perIPRequestLimiter) release(ip string) {
 	if l == nil || ip == "" {
 		return
 	}
-	shard := &l.shards[StringHash(ip)%shardCount]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	if current := shard.counts[ip] - 1; current > 0 {
-		shard.counts[ip] = current
-	} else {
-		delete(shard.counts, ip)
+	if v, ok := l.m.Load(alosmap.S(ip)); ok {
+		c := v.(*ipReqCounter)
+		if c.n.Add(-1) < 0 {
+			c.n.Add(1)
+		}
 	}
 }
 
-// Server is the main entry point. Create one with New, configure
-// routes on its Router field, then call ListenAndServeTLS or ListenAndServe.
+// Server is the main entry point. Create one with New, register routes on its Router, then call ListenAndServeTLS (or ListenAndServe). It manages its own TLS 1.3/1.2 stack, optional HTTP/2 and HTTP/3, connection pooling, reverse proxy, CORS, rate limiting, and ACME. All exported methods are safe for concurrent use.
 //
-//	s := core.New(core.Config{Addr: ":443"})
-//	s.Router.GET("/", handler)
-//	log.Fatal(s.ListenAndServeTLS())
+// Router holds the route table; register handlers on it.
 //
-// The Server manages its own TLS 1.3 implementation, optional HTTP/2
-// multiplexing, connection pooling, reverse proxy, CORS, rate limiting,
-// and ACME.
-// All public methods are safe for concurrent use.
+//	Example: s.Router.GET("/", handler)
+//
+// CORS is the active CORS engine, or nil until SetCORS is called.
+// RateLimit is the active rate-limit engine, or nil until a rate-limit rule or callback is set.
 type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config         Config
-	caps           Capabilities
-	capsLogOnce    sync.Once
-	Router         *Router
-	CORS           *CORSEngine
-	RateLimit      *RateLimitEngine
-	certStore      *CertStore
-	fallbackTLS    atomic.Pointer[tls.Config]
-	proxy          atomic.Pointer[ProxyEngine]
-	httpRouter     *HTTPRouter
-	acme           *acmeIntegration
-	listeners      []net.Listener
-	done           chan struct{}
-	tlsRuntimeOnce sync.Once
-	x25519Pool     *x25519KeyPool
-	activeConns    atomic.Int64
-	shuttingDown   atomic.Bool
-	drainDone      chan struct{}
-	drainOnce      sync.Once
-	shutdownOnce   sync.Once
-	connLimiter    *ConnectionLimiter
-	globalLimiter  *GlobalLimiter
-	activeReqs     atomic.Int64
-	fastDispatch   atomic.Bool
-	plainRootFast  plainRootFastResponse
-	h2RootFast     h2RootFastResponse
-	trustedProxies trustedProxyMatcher
-	perIPLimiter   *perIPRequestLimiter
+	config          Config
+	caps            Capabilities
+	capsLogOnce     sync.Once
+	Router          *Router
+	CORS            *CORSEngine
+	RateLimit       *RateLimitEngine
+	certStore       *CertStore
+	fallbackTLS     atomic.Pointer[tls.Config]
+	proxy           atomic.Pointer[ProxyEngine]
+	httpRouter      *HTTPRouter
+	acme            *acmeIntegration
+	listeners       []net.Listener
+	done            chan struct{}
+	tlsRuntimeOnce  sync.Once
+	x25519Pool      *x25519KeyPool
+	activeConns     atomic.Int64
+	shuttingDown    atomic.Bool
+	drainDone       chan struct{}
+	drainOnce       sync.Once
+	shutdownOnce    sync.Once
+	connLimiter     *ConnectionLimiter
+	globalLimiter   *GlobalLimiter
+	activeReqs      atomic.Int64
+	fastDispatch    atomic.Bool
+	plainRootFast   plainRootFastResponse
+	h2RootFast      h2RootFastResponse
+	trustedProxies  trustedProxyMatcher
+	perIPLimiter    *perIPRequestLimiter
 	trackedConnMu   sync.Mutex
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool
@@ -217,13 +333,12 @@ type trackedHandoffConn struct {
 	closeOnce sync.Once
 }
 
-type perIPRequestShard struct {
-	mu     sync.Mutex
-	counts map[string]int64
+type ipReqCounter struct {
+	n atomic.Int64
 }
 
 type perIPRequestLimiter struct {
-	shards [shardCount]perIPRequestShard
+	m *alosmap.Map
 }
 
 type plainRootFastResponse struct {
@@ -245,20 +360,11 @@ type h2RootFastResponse struct {
 	dataIDOff     int
 }
 
-// New creates a Server with the given Config. When called without
-// arguments it uses DefaultConfig. The returned server is ready
-// for route registration; call ListenAndServeTLS or ListenAndServe
-// to start accepting connections.
+// New creates a Server from the given Config, applying defaults to zero-valued fields; called with no arguments it uses DefaultConfig. The returned server is ready for route registration.
 //
-//	s := core.New(core.Config{
-//		Addr:      ":443",
-//		PlainHTTP: false,
-//		Listeners: 4,
-//	})
-//	s.Router.GET("/hello", func(req *core.Request, resp *core.Response) {
-//		resp.Status(200).String("hello")
-//	})
-//	log.Fatal(s.ListenAndServeTLS())
+// Example: s := New()
+// Example: s := New(Config{Addr: ":443", Listeners: 4})
+// Example: s := New(Config{Addr: ":80", PlainHTTP: true})
 func New(configs ...Config) *Server {
 	var cfg Config
 	if len(configs) > 0 {
@@ -349,6 +455,10 @@ func autoListenerCount() int {
 	return autoWorkerCount()
 }
 
+// NewServer creates a Server listening on addr with otherwise-default configuration; it is shorthand for New(Config{Addr: addr}).
+//
+// Example: s := NewServer(":443")
+// Example: s := NewServer("0.0.0.0:8443")
 func NewServer(addr string) *Server {
 	return New(Config{Addr: addr})
 }
@@ -374,27 +484,31 @@ func (s *Server) negotiateALPN(clientProtos []string) string {
 	return NegotiateALPN(clientProtos, s.http2Enabled())
 }
 
+// SetDebug toggles verbose internal logging at runtime.
+//
+// Example: s.SetDebug(true)
+// Example: s.SetDebug(false)
 func (s *Server) SetDebug(on bool) {
 	s.debug.Store(on)
 	SetDebugFlag(on)
 }
 
+// SetLogRequests toggles per-connection request logging at runtime.
+//
+// Example: s.SetLogRequests(false)
+// Example: s.SetLogRequests(true)
 func (s *Server) SetLogRequests(on bool) {
 	s.logRequests.Store(on)
 }
 
+// IsDebug reports whether verbose internal logging is enabled.
 func (s *Server) IsDebug() bool {
 	return s.debug.Load()
 }
 
-// ListenAndServeTLS starts the HTTPS server with ALOS's built-in TLS 1.3
-// stack. It loads certificates (self-signed, manual PEM, or ACME),
-// opens the configured number of SO_REUSEPORT listeners, optionally
-// advertises HTTP/2 depending on Config.DisableHTTP2, starts the
-// HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called
-// or an unrecoverable error occurs.
+// ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack: it loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
 //
-//	log.Fatal(s.ListenAndServeTLS())
+// Example: log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ListenAndServeTLS() error {
 	s.logCapabilities()
 	maybeRaiseProcessFileLimit()
@@ -462,12 +576,6 @@ func (s *Server) ListenAndServeTLS() error {
 	return backend.wait()
 }
 
-// ListenAndServe starts a plain HTTP/1.1 server (no TLS). Use this when
-// Config.PlainHTTP is true or when TLS termination is handled upstream.
-//
-//	s := core.New(core.Config{Addr: ":80", PlainHTTP: true})
-//	s.Router.GET("/", handler)
-//	log.Fatal(s.ListenAndServe())
 func (s *Server) Capabilities() Capabilities { return s.caps }
 
 func (s *Server) logCapabilities() {
@@ -478,6 +586,9 @@ func (s *Server) logCapabilities() {
 	})
 }
 
+// ListenAndServe starts a plain HTTP/1.1 (and HTTP/2 prior-knowledge) server with no TLS. Use it when Config.PlainHTTP is true or TLS is terminated upstream; it blocks until Shutdown is called or an unrecoverable error occurs.
+//
+// Example: log.Fatal(s.ListenAndServe())
 func (s *Server) ListenAndServe() error {
 	s.logCapabilities()
 	workers := s.config.WorkerCount
@@ -697,7 +808,7 @@ func (s *Server) primeTLSCertificates() {
 func (s *Server) rebuildFallbackTLSConfig() {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
 		NextProtos: s.tlsNextProtos(),
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			entry := s.certStore.Lookup(hello.ServerName)
@@ -710,15 +821,10 @@ func (s *Server) rebuildFallbackTLSConfig() {
 	s.fallbackTLS.Store(cfg)
 }
 
-// Shutdown gracefully drains in-flight connections and stops ACME
-// renewal, rate-limit cleanup, and listener goroutines. Pass a context
-// with a deadline to bound how long the drain may take.
+// Shutdown gracefully drains in-flight connections and stops ACME renewal, rate-limit cleanup, the proxy, and listener goroutines. The provided context bounds how long the drain may take.
 //
-//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-//	defer cancel()
-//	if err := s.Shutdown(ctx); err != nil {
-//		log.Printf("shutdown: %v", err)
-//	}
+// Example: ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second); defer cancel(); s.Shutdown(ctx)
+// Example: s.Shutdown(context.Background())
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		s.shuttingDown.Store(true)
@@ -1019,34 +1125,24 @@ func tlsAlertName(desc byte) string {
 	}
 }
 
+// SetProxy installs a reverse-proxy engine, replacing any existing one.
+//
+// Example: s.SetProxy(NewProxyEngine())
+// Example: s.SetProxy(pe)
 func (s *Server) SetProxy(pe *ProxyEngine) {
 	s.proxy.Store(pe)
 	s.computeFastDispatch()
 }
 
+// Proxy returns the server's reverse-proxy engine, or nil if none is configured.
 func (s *Server) Proxy() *ProxyEngine {
 	return s.proxy.Load()
 }
 
-// AddProxyDomain registers a reverse-proxy domain. If the ProxyEngine
-// does not exist yet it is created automatically. Safe to call at runtime.
-// When a request host matches a proxy domain, the proxy runs before local
-// router handlers.
+// AddProxyDomain registers a reverse-proxy domain, creating the proxy engine if needed; safe to call at runtime. When a request host matches a proxy domain, the proxy runs before local router handlers.
 //
-//	s.AddProxyDomain(core.DomainConfig{
-//		Domain: "api.example.com",
-//		Backends: []core.BackendConfig{
-//			{Addr: "10.0.0.1:8080", Weight: 3},
-//			{Addr: "10.0.0.2:8080", Weight: 1},
-//		},
-//		Balancer:   core.LBWeightedRR,
-//		MaxRetries: 2,
-//		HealthCheck: core.HealthCheckConfig{
-//			Path:     "/health",
-//			Interval: 10 * time.Second,
-//			Timeout:  2 * time.Second,
-//		},
-//	})
+// Example: s.AddProxyDomain(DomainConfig{Domain: "api.example.com", Backends: []BackendConfig{{Addr: "10.0.0.1:8080"}}})
+// Example: s.AddProxyDomain(DomainConfig{Domain: "api.example.com", Backends: []BackendConfig{{Addr: "10.0.0.1:8080", Weight: 3}, {Addr: "10.0.0.2:8080", Weight: 1}}, Balancer: LBWeightedRR, MaxRetries: 2, HealthCheck: HealthCheckConfig{Path: "/health", Interval: 10 * time.Second, Timeout: 2 * time.Second}})
 func (s *Server) AddProxyDomain(cfg DomainConfig) {
 	pe := s.proxy.Load()
 	if pe == nil {
@@ -1057,8 +1153,10 @@ func (s *Server) AddProxyDomain(cfg DomainConfig) {
 	s.computeFastDispatch()
 }
 
-// RemoveProxyDomain removes a domain and cleans up health checkers
-// and connection pools for all its backends.
+// RemoveProxyDomain removes a domain and cleans up health checkers and connection pools for all its backends.
+//
+// Example: s.RemoveProxyDomain("api.example.com")
+// Example: s.RemoveProxyDomain("static.example.com")
 func (s *Server) RemoveProxyDomain(domain string) {
 	pe := s.proxy.Load()
 	if pe != nil {
@@ -1067,13 +1165,10 @@ func (s *Server) RemoveProxyDomain(domain string) {
 	s.computeFastDispatch()
 }
 
-// OnProxyError registers a callback invoked whenever a backend request
-// fails. Use it for alerting or structured logging.
+// OnProxyError registers a callback invoked whenever a backend request fails, e.g. for alerting or structured logging.
 //
-//	s.OnProxyError(func(pe core.ProxyError) {
-//		log.Printf("proxy error: domain=%s backend=%s err=%v",
-//			pe.Domain, pe.Backend, pe.Err)
-//	})
+// Example: s.OnProxyError(func(pe ProxyError) { log.Printf("proxy error: domain=%s backend=%s err=%v", pe.Domain, pe.Backend, pe.Err) })
+// Example: s.OnProxyError(func(pe ProxyError) { metrics.Inc("proxy_errors") })
 func (s *Server) OnProxyError(fn ProxyErrorFunc) {
 	pe := s.proxy.Load()
 	if pe == nil {
@@ -1084,14 +1179,10 @@ func (s *Server) OnProxyError(fn ProxyErrorFunc) {
 	s.computeFastDispatch()
 }
 
-// OnProxyRequest registers a callback invoked before the request is
-// forwarded to a backend. Modify pr.Headers or pr.Host to alter the
-// outgoing request. Return false to reject with 502.
+// OnProxyRequest registers a callback invoked before a request is forwarded to a backend; modify pr.Headers or pr.Host to alter the outgoing request, or return false to reject with 502.
 //
-//	s.OnProxyRequest(func(pr *core.ProxyRequest) bool {
-//		pr.Headers = append(pr.Headers, [2]string{"X-Forwarded-For", pr.ClientAddr})
-//		return true
-//	})
+// Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { pr.Headers = append(pr.Headers, [2]string{"X-Forwarded-For", pr.ClientAddr}); return true })
+// Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { return pr.Host != "blocked.example.com" })
 func (s *Server) OnProxyRequest(fn ProxyInterceptFunc) {
 	pe := s.proxy.Load()
 	if pe == nil {
@@ -1102,13 +1193,10 @@ func (s *Server) OnProxyRequest(fn ProxyInterceptFunc) {
 	s.computeFastDispatch()
 }
 
-// OnProxyResponse registers a callback invoked after a backend responds
-// (or a cache hit is served). Modify pr.Headers or pr.StatusCode before
-// they reach the client. Call pr.CacheThis() to store the response.
+// OnProxyResponse registers a callback invoked after a backend responds (or a cache hit is served); modify pr.Headers or pr.StatusCode before they reach the client, or call pr.CacheThis to store the response.
 //
-//	s.OnProxyResponse(func(pr *core.ProxyResponse) {
-//		pr.Headers = append(pr.Headers, [2]string{"X-Proxy-By", "ALOS"})
-//	})
+// Example: s.OnProxyResponse(func(pr *ProxyResponse) { pr.Headers = append(pr.Headers, [2]string{"X-Proxy-By", "ALOS"}) })
+// Example: s.OnProxyResponse(func(pr *ProxyResponse) { if pr.StatusCode == 200 { pr.CacheThis() } })
 func (s *Server) OnProxyResponse(fn ProxyResponseFunc) {
 	pe := s.proxy.Load()
 	if pe == nil {
@@ -1119,22 +1207,10 @@ func (s *Server) OnProxyResponse(fn ProxyResponseFunc) {
 	s.computeFastDispatch()
 }
 
-// SetProxyCache enables proxy response caching. Cached responses are
-// matched by method + host + path (including the query string). Configure
-// per-path rules, total budget, entry size limits, and pre-compression.
+// SetProxyCache enables proxy response caching, keyed by method + host + path (including the query string). See ProxyCacheConfig for per-path rules, total budget, entry-size limits, and pre-compression.
 //
-//	s.SetProxyCache(core.ProxyCacheConfig{
-//		MaxEntrySize:   4 << 20,
-//		MaxTotalBytes:  256 << 20,
-//		DefaultMaxAge:  5 * time.Minute,
-//		PreCompress:    true,
-//		CompressLevel:  6,
-//		CompressMinLen: 512,
-//		Rules: []core.CacheRule{
-//			{PathPrefix: "/api/", MaxAge: 30 * time.Second},
-//			{PathPrefix: "/static/", MaxAge: 24 * time.Hour},
-//		},
-//	})
+// Example: s.SetProxyCache(ProxyCacheConfig{MaxEntrySize: 4 << 20, MaxTotalBytes: 256 << 20, DefaultMaxAge: 5 * time.Minute})
+// Example: s.SetProxyCache(ProxyCacheConfig{PreCompress: true, CompressLevel: 6, CompressMinLen: 512, Rules: []CacheRule{{PathPrefix: "/api/", MaxAge: 30 * time.Second}, {PathPrefix: "/static/", MaxAge: 24 * time.Hour}}})
 func (s *Server) SetProxyCache(cfg ProxyCacheConfig) {
 	pe := s.proxy.Load()
 	if pe == nil {
@@ -1148,8 +1224,7 @@ func (s *Server) SetProxyCache(cfg ProxyCacheConfig) {
 	s.computeFastDispatch()
 }
 
-// ProxyCacheStats returns current cache metrics: number of entries,
-// total bytes used, cumulative hits, and cumulative misses.
+// ProxyCacheStats returns current cache metrics: number of entries, total bytes used, cumulative hits, and cumulative misses.
 func (s *Server) ProxyCacheStats() (entries int64, totalBytes int64, hits uint64, misses uint64) {
 	pe := s.proxy.Load()
 	if pe == nil || pe.Cache == nil {
@@ -1158,8 +1233,10 @@ func (s *Server) ProxyCacheStats() (entries int64, totalBytes int64, hits uint64
 	return pe.Cache.Stats()
 }
 
-// PurgeProxyCache removes a single cached response by method, host, and path.
-// Returns true if an entry was found and removed.
+// PurgeProxyCache removes a single cached response by method, host, and path, reporting whether an entry was found and removed.
+//
+// Example: s.PurgeProxyCache("GET", "example.com", "/index.html")
+// Example: s.PurgeProxyCache("GET", "api.example.com", "/v1/users")
 func (s *Server) PurgeProxyCache(method, host, path string) bool {
 	pe := s.proxy.Load()
 	if pe == nil || pe.Cache == nil {
@@ -1177,8 +1254,10 @@ func (s *Server) PurgeAllProxyCache() {
 	pe.Cache.PurgeAll()
 }
 
-// PurgeDomainCache removes all cached responses for the given domain.
-// Returns the number of entries purged.
+// PurgeDomainCache removes all cached responses for the given domain and returns the number of entries purged.
+//
+// Example: s.PurgeDomainCache("example.com")
+// Example: s.PurgeDomainCache("api.example.com")
 func (s *Server) PurgeDomainCache(domain string) int64 {
 	pe := s.proxy.Load()
 	if pe == nil || pe.Cache == nil {
@@ -1187,10 +1266,18 @@ func (s *Server) PurgeDomainCache(domain string) int64 {
 	return pe.Cache.PurgeDomain(domain)
 }
 
+// OnRequest registers a hook run before routing each request; returning false stops further processing of that request. Multiple hooks run in registration order.
+//
+// Example: s.OnRequest(func(req *Request, resp *Response) bool { return true })
+// Example: s.OnRequest(func(req *Request, resp *Response) bool { if req.Path == "/blocked" { resp.Status(403); return false }; return true })
 func (s *Server) OnRequest(fn func(*Request, *Response) bool) {
 	s.onRequestHooks = append(s.onRequestHooks, fn)
 }
 
+// OnResponse registers a hook run after each handler completes. Multiple hooks run in registration order.
+//
+// Example: s.OnResponse(func(req *Request, resp *Response) { log.Printf("%s %d", req.Path, resp.StatusCode) })
+// Example: s.OnResponse(func(req *Request, resp *Response) { resp.SetHeader("X-Served-By", "ALOS") })
 func (s *Server) OnResponse(fn func(*Request, *Response)) {
 	s.onResponseHooks = append(s.onResponseHooks, fn)
 }
@@ -1293,13 +1380,10 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 	handler(req, resp)
 }
 
-// SetHTTPRoutes configures port-80 HTTP routes that proxy plain HTTP
-// traffic to backend servers (instead of 301-redirecting to HTTPS).
+// SetHTTPRoutes configures port-80 HTTP routes that proxy plain HTTP traffic to backend servers instead of redirecting to HTTPS, replacing any existing HTTP routes.
 //
-//	s.SetHTTPRoutes([]core.HTTPRoute{
-//		{PathPrefix: "/api/", Backend: "10.0.0.5:3000"},
-//		{PathPrefix: "/",     Backend: "10.0.0.6:8080", HostHeader: "backend.local"},
-//	})
+// Example: s.SetHTTPRoutes([]HTTPRoute{{PathPrefix: "/api/", Backend: "10.0.0.5:3000"}})
+// Example: s.SetHTTPRoutes([]HTTPRoute{{PathPrefix: "/", Backend: "10.0.0.6:8080", HostHeader: "backend.local"}})
 func (s *Server) SetHTTPRoutes(routes []HTTPRoute) {
 	if s.httpRouter == nil {
 		s.httpRouter = newHTTPRouter()
@@ -1310,6 +1394,10 @@ func (s *Server) SetHTTPRoutes(routes []HTTPRoute) {
 	}
 }
 
+// AddHTTPRoute appends a single port-80 HTTP proxy route without replacing existing ones.
+//
+// Example: s.AddHTTPRoute(HTTPRoute{PathPrefix: "/api/", Backend: "10.0.0.5:3000"})
+// Example: s.AddHTTPRoute(HTTPRoute{PathPrefix: "/", Backend: "10.0.0.6:8080", HostHeader: "backend.local"})
 func (s *Server) AddHTTPRoute(route HTTPRoute) {
 	if s.httpRouter == nil {
 		s.httpRouter = newHTTPRouter()
@@ -1320,6 +1408,10 @@ func (s *Server) AddHTTPRoute(route HTTPRoute) {
 	}
 }
 
+// RemoveHTTPRoute removes the port-80 HTTP proxy route with the given path prefix.
+//
+// Example: s.RemoveHTTPRoute("/api/")
+// Example: s.RemoveHTTPRoute("/")
 func (s *Server) RemoveHTTPRoute(pathPrefix string) {
 	if s.httpRouter != nil {
 		s.httpRouter.RemoveRoute(pathPrefix)
@@ -1329,16 +1421,10 @@ func (s *Server) RemoveHTTPRoute(pathPrefix string) {
 	}
 }
 
-// SetCORS configures CORS policy for the server.
+// SetCORS sets or replaces the server's CORS policy.
 //
-//	s.SetCORS(core.CORSConfig{
-//		AllowOrigins:     []string{"https://example.com"},
-//		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-//		AllowHeaders:     []string{"Content-Type", "Authorization"},
-//		ExposeHeaders:    []string{"X-Request-ID"},
-//		AllowCredentials: true,
-//		MaxAge:           86400,
-//	})
+// Example: s.SetCORS(CORSConfig{AllowOrigins: []string{"*"}})
+// Example: s.SetCORS(CORSConfig{AllowOrigins: []string{"https://example.com"}, AllowMethods: []string{"GET", "POST"}, AllowCredentials: true})
 func (s *Server) SetCORS(cfg CORSConfig) {
 	if s.CORS == nil {
 		s.CORS = NewCORSEngine(cfg)
@@ -1348,6 +1434,10 @@ func (s *Server) SetCORS(cfg CORSConfig) {
 	s.computeFastDispatch()
 }
 
+// UpdateCORS replaces the server's CORS policy; it is an alias for SetCORS.
+//
+// Example: s.UpdateCORS(CORSConfig{AllowOrigins: []string{"https://new.example.com"}})
+// Example: s.UpdateCORS(CORSConfig{AllowOrigins: []string{"*"}})
 func (s *Server) UpdateCORS(cfg CORSConfig) {
 	s.SetCORS(cfg)
 }
@@ -1359,25 +1449,28 @@ func (s *Server) ensureRateLimit() {
 	}
 }
 
-// SetRateLimitRules replaces all rate-limit rules. Each rule matches a
-// path pattern and enforces a request budget per client IP.
+// SetRateLimitRules replaces all rate-limit rules; each rule matches a path pattern and enforces a per-client-IP request budget.
 //
-//	s.SetRateLimitRules([]core.RateLimitRule{
-//		{Path: "/api/*",  MaxReqs: 100, Window: 60 * time.Second, BlockFor: 5 * time.Minute},
-//		{Path: "/*",      MaxReqs: 300, Window: 60 * time.Second, BlockFor: 2 * time.Minute},
-//	})
+// Example: s.SetRateLimitRules([]RateLimitRule{{Path: "/api/*", MaxReqs: 100, Window: 60 * time.Second, BlockFor: 5 * time.Minute}})
+// Example: s.SetRateLimitRules([]RateLimitRule{{Path: "/*", MaxReqs: 300, Window: 60 * time.Second, BlockFor: 2 * time.Minute}})
 func (s *Server) SetRateLimitRules(rules []RateLimitRule) {
 	s.ensureRateLimit()
 	s.RateLimit.SetRules(rules)
 }
 
-// AddRateLimitRule appends a single rule without replacing existing ones.
+// AddRateLimitRule appends a single rate-limit rule without replacing existing ones.
+//
+// Example: s.AddRateLimitRule(RateLimitRule{Path: "/login", MaxReqs: 5, Window: time.Minute, BlockFor: 10 * time.Minute})
+// Example: s.AddRateLimitRule(RateLimitRule{Path: "/api/*", MaxReqs: 100, Window: time.Minute})
 func (s *Server) AddRateLimitRule(rule RateLimitRule) {
 	s.ensureRateLimit()
 	s.RateLimit.AddRule(rule)
 }
 
 // RemoveRateLimitRule removes the rule matching the given path pattern.
+//
+// Example: s.RemoveRateLimitRule("/api/*")
+// Example: s.RemoveRateLimitRule("/login")
 func (s *Server) RemoveRateLimitRule(path string) {
 	if s.RateLimit == nil {
 		return
@@ -1385,14 +1478,10 @@ func (s *Server) RemoveRateLimitRule(path string) {
 	s.RateLimit.RemoveRule(path)
 }
 
-// OnRateLimit registers a global callback invoked when a request is
-// rate-limited. Return true to indicate the response has been handled,
-// or false to fall through to the default 429 response.
+// OnRateLimit registers a global callback invoked when a request is rate-limited; return true if the callback wrote the response, or false to fall through to the default 429.
 //
-//	s.OnRateLimit(func(event core.RateLimitEvent, req *core.Request, resp *core.Response) bool {
-//		resp.Status(429).JSON([]byte(`{"error":"too many requests"}`))
-//		return true
-//	})
+// Example: s.OnRateLimit(func(event RateLimitEvent, req *Request, resp *Response) bool { resp.Status(429).JSON([]byte(`{"error":"too many requests"}`)); return true })
+// Example: s.OnRateLimit(func(event RateLimitEvent, req *Request, resp *Response) bool { metrics.Inc("ratelimited"); return false })
 func (s *Server) OnRateLimit(fn RateLimitFunc) {
 	s.ensureRateLimit()
 	s.RateLimit.OnLimit = fn

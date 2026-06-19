@@ -10,12 +10,32 @@ import (
 	"github.com/bytedance/sonic"
 )
 
+// JWTConfig configures the JWT middleware.
+//
+// Secret is the HMAC-SHA256 key used to verify token signatures; required.
+//
+//	Example: Secret: []byte("my-256-bit-secret") verifies tokens signed with that key.
+//
+// ContextKey is the request key under which validated claims are stored; defaults to "jwt_claims" when empty.
+//
+//	Example: ContextKey: "user" stores claims under req.Get("user") (and also "jwt_claims").
+//	Example: ContextKey: "" stores claims under "jwt_claims".
+//
+// TokenLookup selects where the token is read, as "source:name"; defaults to "header:Authorization" when empty. Supported sources are "header" and "query".
+//
+//	Example: TokenLookup: "header:Authorization" reads a "Bearer <token>" Authorization header.
+//	Example: TokenLookup: "query:token" reads the token from the "token" query parameter.
 type JWTConfig struct {
 	Secret      []byte
 	ContextKey  string
 	TokenLookup string
 }
 
+// JWT returns middleware that validates a signed JWT (HMAC-SHA256), rejecting requests whose token is missing, malformed, or expired with HTTP 401, and stores the claims on the request per cfg.ContextKey. See JWTConfig for defaults.
+//
+// Example: app.Use(JWT(JWTConfig{Secret: []byte("secret")}))
+// Example: app.Use(JWT(JWTConfig{Secret: key, TokenLookup: "query:token"}))
+// Example: app.Use(JWT(JWTConfig{Secret: key, ContextKey: "user"}))
 func JWT(cfg JWTConfig) MiddlewareFunc {
 	if cfg.ContextKey == "" {
 		cfg.ContextKey = "jwt_claims"
@@ -82,6 +102,9 @@ func JWT(cfg JWTConfig) MiddlewareFunc {
 			}
 
 			req.Set(contextKey, claims)
+			if contextKey != "jwt_claims" {
+				req.Set("jwt_claims", claims)
+			}
 			next(req, resp)
 		}
 	}
@@ -136,6 +159,10 @@ func validateJWT(token string, secret []byte) (map[string]any, bool) {
 	return claims, true
 }
 
+// JWTClaims returns the validated claims attached to req by the JWT middleware, or nil if none are present.
+//
+// Example: claims := JWTClaims(req); if claims == nil { return }
+// Example: sub, _ := JWTClaims(req)["sub"].(string)
 func JWTClaims(req *Request) map[string]any {
 	v, ok := req.Get("jwt_claims")
 	if !ok {

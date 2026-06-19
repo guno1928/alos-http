@@ -6,8 +6,15 @@ import (
 	"time"
 )
 
+// SameSite controls the SameSite attribute emitted on a Set-Cookie header.
 type SameSite uint8
 
+// SameSite attribute values for Cookie.SameSite.
+//
+// Example: SameSiteDefault omits the SameSite attribute entirely.
+// Example: SameSiteLax restricts the cookie to same-site requests and top-level navigations ("; SameSite=Lax").
+// Example: SameSiteStrict restricts the cookie to same-site requests only ("; SameSite=Strict").
+// Example: SameSiteNone sends the cookie on cross-site requests and emits "; SameSite=None" (pair with Secure: true).
 const (
 	SameSiteDefault SameSite = 0
 	SameSiteLax     SameSite = 1
@@ -15,6 +22,47 @@ const (
 	SameSiteNone    SameSite = 3
 )
 
+// Cookie is an HTTP cookie that serializes into a Set-Cookie header value via String.
+//
+// Name is the cookie name.
+//
+//	Example: Name: "session" emits "session=...".
+//
+// Value is the cookie value; it is written verbatim with CR, LF, and NUL bytes stripped.
+//
+//	Example: Value: "abc123" emits "session=abc123".
+//
+// Path scopes the cookie to a URL path; omitted when empty.
+//
+//	Example: Path: "/" emits "; Path=/".
+//	Example: Path: "" omits the Path attribute.
+//
+// Domain scopes the cookie to a domain; omitted when empty.
+//
+//	Example: Domain: "example.com" emits "; Domain=example.com".
+//
+// MaxAge sets the Max-Age attribute in seconds.
+//
+//	Example: MaxAge: 3600 emits "; Max-Age=3600".
+//	Example: MaxAge: -1 emits "; Max-Age=0" (expire immediately).
+//	Example: MaxAge: 0 omits the Max-Age attribute.
+//
+// Expires sets an absolute expiry time; a zero time omits the attribute.
+//
+//	Example: Expires: time.Now().Add(24 * time.Hour) emits "; Expires=<GMT date>".
+//	Example: Expires: time.Time{} omits the Expires attribute.
+//
+// Secure emits "; Secure" when true, restricting the cookie to HTTPS.
+//
+//	Example: Secure: true emits "; Secure".
+//
+// HttpOnly emits "; HttpOnly" when true, hiding the cookie from client-side scripts.
+//
+//	Example: HttpOnly: true emits "; HttpOnly".
+//
+// SameSite selects the SameSite attribute; see the SameSite constants.
+//
+//	Example: SameSite: SameSiteLax emits "; SameSite=Lax".
 type Cookie struct {
 	Name     string
 	Value    string
@@ -62,6 +110,7 @@ func cookieStripCTL(s string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
 }
 
+// String serializes the cookie into a Set-Cookie header value, stripping CR, LF, and NUL bytes from Name, Value, Path, and Domain.
 func (c *Cookie) String() string {
 	var b strings.Builder
 	b.WriteString(cookieStripCTL(c.Name))
@@ -69,11 +118,11 @@ func (c *Cookie) String() string {
 	b.WriteString(cookieStripCTL(c.Value))
 	if c.Path != "" {
 		b.WriteString("; Path=")
-		b.WriteString(c.Path)
+		b.WriteString(cookieStripCTL(c.Path))
 	}
 	if c.Domain != "" {
 		b.WriteString("; Domain=")
-		b.WriteString(c.Domain)
+		b.WriteString(cookieStripCTL(c.Domain))
 	}
 	if c.MaxAge > 0 {
 		b.WriteString("; Max-Age=")

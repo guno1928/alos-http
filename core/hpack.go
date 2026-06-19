@@ -153,9 +153,6 @@ func (e *HpackEncoder) EncodeHeader(name, value string) {
 	}
 }
 
-// EncodeHeaderFold encodes a header using case-insensitive name lookup,
-// avoiding allocation from ToLowerASCII. The name is lowered on-the-fly
-// during Huffman/literal encoding when not found in the static table.
 func (e *HpackEncoder) EncodeHeaderFold(name, value string) {
 	idx := hpackFindStaticNameFold(name)
 	if idx > 0 {
@@ -168,9 +165,6 @@ func (e *HpackEncoder) EncodeHeaderFold(name, value string) {
 	}
 }
 
-// hpackFindStaticNameFold looks up a header name in the HPACK static table
-// using case-insensitive comparison. Returns the 1-based index or 0 if not found.
-// Uses length-discriminated dispatch for fast rejection of non-matching entries.
 func hpackFindStaticNameFold(name string) int {
 	switch len(name) {
 	case 3:
@@ -360,8 +354,6 @@ func hpackFindStaticNameFold(name string) int {
 	return 0
 }
 
-// encodeStringLower encodes a string into the HPACK buffer while lowercasing
-// each byte on-the-fly. Zero allocations.
 func (e *HpackEncoder) encodeStringLower(s string) {
 	n := len(s)
 	var bits int
@@ -1066,7 +1058,7 @@ func hpackSkipString(data []byte) (int, error) {
 		return 0, ErrH2BadHeader
 	}
 	sLen, n := HpackDecodeInt(data, 7)
-	if n <= 0 || n+int(sLen) > len(data) {
+	if n <= 0 || sLen > uint64(len(data)) || n+int(sLen) > len(data) {
 		return 0, ErrH2BadHeader
 	}
 	return n + int(sLen), nil
@@ -1228,15 +1220,15 @@ func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 		b := data[i]
 		i++
 		if m > 63 {
-			return val, i
+			return 0, 0
 		}
 		val += uint64(b&0x7f) << m
 		m += 7
 		if b&0x80 == 0 {
-			break
+			return val, i
 		}
 	}
-	return val, i
+	return 0, 0
 }
 
 func HpackDecodeString(data []byte) (string, int) {

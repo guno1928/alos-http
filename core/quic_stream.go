@@ -68,6 +68,9 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 	}
 
 	if f.offset == s.recvOff {
+		if uint64(len(s.recvBuf))+uint64(len(f.data)) > s.maxRecv {
+			return
+		}
 		s.recvBuf = append(s.recvBuf, f.data...)
 		s.recvOff += uint64(len(f.data))
 	} else if f.offset > s.recvOff {

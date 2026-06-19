@@ -74,12 +74,16 @@ func TestWebSocketOriginSameOrigin(t *testing.T) {
 	}
 }
 
-func TestWebSocketOriginOffIsBackwardCompatible(t *testing.T) {
+func TestWebSocketOriginDefaultIsSameOrigin(t *testing.T) {
 	srv := &Server{}
 	cross := &Request{Host: "app.example.com", server: srv,
 		Headers: [][2]string{{"Origin", "https://evil.example.com"}}}
+	if checkWebSocketOrigin(cross) {
+		t.Fatal("default mode must reject cross-site origins (secure by default)")
+	}
+	srv.config.WebSocketOriginMode = WSOriginOff
 	if !checkWebSocketOrigin(cross) {
-		t.Fatal("default WSOriginOff must allow all origins (backward compatible)")
+		t.Fatal("explicit WSOriginOff must allow all origins")
 	}
 }
 

@@ -9,21 +9,27 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 // WSOriginMode controls how UpgradeWebSocket validates the Origin header to
-// prevent Cross-Site WebSocket Hijacking. WSOriginOff is the default and
-// preserves legacy behavior (no check); applications that authenticate
-// WebSocket sessions with cookies should use WSOriginSameOrigin or
-// WSOriginAllowlist.
+// prevent Cross-Site WebSocket Hijacking. WSOriginSameOrigin is the default
+// (the zero value): cross-site handshakes carrying an Origin are rejected.
+// WSOriginAllowlist checks against WebSocketAllowedOrigins. WSOriginOff disables
+// the check entirely and must be selected explicitly.
 type WSOriginMode int
 
+// WSOrigin modes for the server's WebSocketOriginMode setting.
+//
+// Example: WSOriginSameOrigin (the default) rejects handshakes whose Origin host differs from the request Host.
+// Example: WSOriginAllowlist accepts only origins listed in WebSocketAllowedOrigins.
+// Example: WSOriginOff disables Origin checking entirely.
 const (
-	WSOriginOff WSOriginMode = iota
-	WSOriginSameOrigin
+	WSOriginSameOrigin WSOriginMode = iota
 	WSOriginAllowlist
+	WSOriginOff
 )
 
 func wsOriginHost(s string) string {
@@ -77,25 +83,14 @@ const (
 )
 
 const wsStatusProtocolError uint16 = 1002
+const wsStatusInvalidPayload uint16 = 1007
+const wsDefaultReadTimeout = 120 * time.Second
 
-// WSConn is a server-side WebSocket connection (RFC 6455). Create one with
-// ServeWebSocket inside a route handler, then use ReadMessage and WriteMessage
-// (or WriteText / WriteBinary) to exchange data.
-//
-//	r.GET("/ws", func(req *core.Request, resp *core.Response) {
-//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
-//	        for {
-//	            _, msg, err := ws.ReadMessage()
-//	            if err != nil {
-//	                return
-//	            }
-//	            ws.WriteText("echo: " + string(msg))
-//	        }
-//	    })
-//	})
+// WSConn is a server-side WebSocket connection (RFC 6455). Obtain one with ServeWebSocket (or UpgradeWebSocket) inside a route handler, then exchange data with ReadMessage and WriteMessage (or WriteText / WriteBinary).
 type WSConn struct {
-	conn   net.Conn
-	closed atomic.Bool
+	conn        net.Conn
+	closed      atomic.Bool
+	readTimeout time.Duration
 }
 
 func wsAcceptKey(clientKey string) string {
@@ -108,31 +103,12 @@ func wsAcceptKey(clientKey string) string {
 	return string(b64[:])
 }
 
-// UpgradeWebSocket performs the WebSocket handshake on the current request. It
-// validates the required headers (Upgrade, Connection, Sec-WebSocket-Key,
-// Sec-WebSocket-Version) and hijacks the underlying connection.
+// UpgradeWebSocket performs the WebSocket handshake (RFC 6455) on the current request, validating the Upgrade, Connection, Sec-WebSocket-Key, and Sec-WebSocket-Version headers and the Origin per the server's WSOriginMode, then hijacks the connection. It returns a *WSConn on success, or nil if the handshake failed (an error response has already been written).
 //
-// Returns a *WSConn on success, or nil if the handshake fails (in which case an
-// error response is already written).
+// After a successful upgrade the handler must return promptly and service the connection on its own goroutine: handlers run inline on a shared pool of worker event loops, so a handler that blocks reading the socket pins a worker for the connection's lifetime. Prefer ServeWebSocket, which does this.
 //
-// WARNING: route handlers run INLINE on a fixed pool of server worker event
-// loops. A handler that keeps reading the socket until it closes pins that
-// worker's entire event loop for the connection's lifetime — a handful of open
-// sockets starves the pool and every other request on those workers hangs.
-// After UpgradeWebSocket the handler must RETURN immediately and service the
-// connection on its own goroutine. Use ServeWebSocket, which does this for you:
-//
-//	r.GET("/ws", func(req *core.Request, resp *core.Response) {
-//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
-//	        for {
-//	            _, msg, err := ws.ReadMessage()
-//	            if err != nil {
-//	                return
-//	            }
-//	            ws.WriteText(string(msg))
-//	        }
-//	    })
-//	})
+// Example: ws := UpgradeWebSocket(req, resp); if ws == nil { return }
+// Example: if ws := UpgradeWebSocket(req, resp); ws != nil { go handle(ws) }
 func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 	upgradeHdr := req.Header("upgrade")
 	if !EqualFoldASCII(upgradeHdr, "websocket") {
@@ -176,9 +152,6 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		return nil
 	}
 
-	// The connection inherits the server's absolute idle deadline, which would
-	// silently kill the WebSocket once it elapses. Clear it: liveness is the
-	// protocol's job (ping/pong), not the HTTP idle timeout's.
 	conn.SetReadDeadline(time.Time{})
 	conn.SetWriteDeadline(time.Time{})
 
@@ -202,27 +175,13 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		resp.SetStreamer(sw)
 	}
 
-	return &WSConn{conn: conn}
+	return &WSConn{conn: conn, readTimeout: wsDefaultReadTimeout}
 }
 
-// ServeWebSocket upgrades the request and services the connection on its own
-// goroutine, returning immediately so the worker that dispatched the handler is
-// released. This is the safe way to host a WebSocket: see the UpgradeWebSocket
-// warning about handlers that block on the socket. fn runs until it returns;
-// the connection is closed afterwards. Returns false if the upgrade failed (an
-// error response has already been written).
+// ServeWebSocket upgrades the request and runs fn on a new goroutine, returning immediately so the dispatching worker is released; the connection is closed when fn returns. It reports false if the upgrade failed (an error response has already been written). This is the safe way to host a WebSocket — see the UpgradeWebSocket note about handlers that block on the socket.
 //
-//	r.GET("/ws", func(req *core.Request, resp *core.Response) {
-//	    core.ServeWebSocket(req, resp, func(ws *core.WSConn) {
-//	        for {
-//	            _, msg, err := ws.ReadMessage()
-//	            if err != nil {
-//	                return
-//	            }
-//	            ws.WriteText(string(msg))
-//	        }
-//	    })
-//	})
+// Example: ServeWebSocket(req, resp, func(ws *WSConn) { for { _, msg, err := ws.ReadMessage(); if err != nil { return }; ws.WriteText(string(msg)) } })
+// Example: if !ServeWebSocket(req, resp, handleWS) { return }
 func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 	ws := UpgradeWebSocket(req, resp)
 	if ws == nil {
@@ -235,19 +194,18 @@ func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 	return true
 }
 
-// NetConn exposes the underlying hijacked connection, e.g. to set per-write
-// deadlines so a dead peer cannot block WriteMessage forever.
+// NetConn returns the underlying hijacked connection, e.g. to set per-write deadlines so a dead peer cannot block WriteMessage forever.
 func (ws *WSConn) NetConn() net.Conn { return ws.conn }
 
-// ReadMessage reads the next WebSocket frame. It returns the opcode (0x1 for
-// text, 0x2 for binary), the payload, and any error. Close frames are handled
-// automatically — a close reply is sent and io.EOF is returned. Ping frames
-// trigger an automatic pong response.
+// ReadMessage reads and reassembles the next WebSocket message, returning its opcode (0x1 text, 0x2 binary), payload, and any error. Close frames are answered and reported as io.EOF, and ping frames are answered with a pong automatically.
 func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 	var msgOpcode byte
 	var assembled []byte
 
 	for {
+		if ws.readTimeout > 0 {
+			ws.conn.SetReadDeadline(time.Now().Add(ws.readTimeout))
+		}
 		var header [2]byte
 		if _, err := io.ReadFull(ws.conn, header[:]); err != nil {
 			return 0, nil, err
@@ -276,7 +234,20 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 				return 0, nil, err
 			}
 			if opcode == wsOpClose {
+				if len(payload) == 1 {
+					ws.closeWithStatus(wsStatusProtocolError)
+					return 0, nil, ErrWebSocketProtocol
+				}
 				if len(payload) >= 2 {
+					code := binary.BigEndian.Uint16(payload[:2])
+					if !wsValidCloseCode(code) {
+						ws.closeWithStatus(wsStatusProtocolError)
+						return 0, nil, ErrWebSocketProtocol
+					}
+					if !utf8.Valid(payload[2:]) {
+						ws.closeWithStatus(wsStatusInvalidPayload)
+						return 0, nil, ErrWebSocketProtocol
+					}
 					ws.WriteMessage(wsOpClose, payload[:2])
 				} else {
 					ws.WriteMessage(wsOpClose, nil)
@@ -315,8 +286,24 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 		}
 
 		if fin {
+			if msgOpcode == wsOpText && !utf8.Valid(assembled) {
+				ws.closeWithStatus(wsStatusInvalidPayload)
+				return 0, nil, ErrWebSocketProtocol
+			}
 			return msgOpcode, assembled, nil
 		}
+	}
+}
+
+func wsValidCloseCode(code uint16) bool {
+	switch {
+	case code >= 3000 && code <= 4999:
+		return true
+	case code == 1000 || code == 1001 || code == 1002 || code == 1003 ||
+		code == 1007 || code == 1008 || code == 1009 || code == 1010 || code == 1011:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -376,8 +363,10 @@ func (ws *WSConn) readFramePayload(secondByte byte, masked bool) ([]byte, error)
 	return payload, nil
 }
 
-// WriteMessage writes a WebSocket frame with the given opcode and payload.
-// Typically use WriteText or WriteBinary instead of calling this directly.
+// WriteMessage writes a single WebSocket frame with the given opcode and payload; prefer WriteText or WriteBinary for ordinary messages.
+//
+// Example: ws.WriteMessage(0x1, []byte("hi"))
+// Example: ws.WriteMessage(0x2, payload)
 func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
 	payloadLen := len(data)
 	var header [10]byte
@@ -417,24 +406,26 @@ func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
 
 // WriteText sends a text WebSocket frame.
 //
-//	ws.WriteText("hello client")
+// Example: ws.WriteText("hello client")
+// Example: ws.WriteText(fmt.Sprintf("count=%d", n))
 func (ws *WSConn) WriteText(msg string) error {
 	return ws.WriteMessage(wsOpText, UnsafeBytes(msg))
 }
 
 // WriteBinary sends a binary WebSocket frame.
+//
+// Example: ws.WriteBinary([]byte{0x01, 0x02})
+// Example: ws.WriteBinary(buf)
 func (ws *WSConn) WriteBinary(data []byte) error {
 	return ws.WriteMessage(wsOpBinary, data)
 }
 
-// Ping sends a WebSocket ping frame to the client. The client should respond
-// with a pong automatically.
+// Ping sends a WebSocket ping frame; a conforming client replies with a pong automatically.
 func (ws *WSConn) Ping() error {
 	return ws.WriteMessage(wsOpPing, nil)
 }
 
-// Close sends a close frame and closes the underlying connection. Safe to call
-// multiple times.
+// Close sends a close frame and closes the underlying connection. It is safe to call multiple times.
 func (ws *WSConn) Close() error {
 	if ws.closed.CompareAndSwap(false, true) {
 		ws.WriteMessage(wsOpClose, nil)
@@ -444,8 +435,19 @@ func (ws *WSConn) Close() error {
 }
 
 // SetDeadline sets the read and write deadline on the underlying connection.
+//
+// Example: ws.SetDeadline(time.Now().Add(30 * time.Second))
+// Example: ws.SetDeadline(time.Time{})
 func (ws *WSConn) SetDeadline(t time.Time) error {
 	return ws.conn.SetDeadline(t)
+}
+
+// SetReadTimeout sets the idle read timeout applied before each frame read; a value <= 0 disables it. The default prevents a stalled peer from pinning the connection's goroutine indefinitely.
+//
+// Example: ws.SetReadTimeout(60 * time.Second)
+// Example: ws.SetReadTimeout(0)
+func (ws *WSConn) SetReadTimeout(d time.Duration) {
+	ws.readTimeout = d
 }
 
 func containsTokenFold(header, token string) bool {

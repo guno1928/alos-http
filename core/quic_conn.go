@@ -23,7 +23,11 @@ const (
 	quicMaxConcurrentReqStreams = 256
 	quicMaxBidiStreams       = 1024
 	quicMaxUniStreams        = 128
+	quicMaxTrackedStreams    = 2048
+	quicMaxConns             = 1 << 16
 )
+
+var quicActiveConns atomic.Int64
 
 type QUICConn struct {
 	srcConnID  [20]byte
@@ -72,7 +76,7 @@ type QUICConn struct {
 	writeMu    sync.Mutex
 
 	idleTimeout time.Duration
-	lastActive  time.Time
+	lastActive  atomic.Int64
 
 	pendingFrames []byte
 	h3            *H3Conn
@@ -91,7 +95,6 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		streams:        make(map[uint64]*QUICStream),
 		loss:           newQuicLossState(),
 		idleTimeout:    quicDefaultIdleTimeout,
-		lastActive:     time.Now(),
 		maxDataLocal:   quicInitialMaxData,
 		maxDataRemote:  quicInitialMaxData,
 		nextBidiRemote: 0,
@@ -100,6 +103,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		nextUniLocal:   3,
 	}
 
+	qc.lastActive.Store(time.Now().UnixNano())
 	qc.inbound = make(chan []byte, 256)
 	qc.recvLargest[0] = -1
 	qc.recvLargest[1] = -1
@@ -148,7 +152,7 @@ func (qc *QUICConn) recvLoop() {
 	for {
 		select {
 		case data := <-qc.inbound:
-			qc.lastActive = time.Now()
+			qc.lastActive.Store(time.Now().UnixNano())
 			qc.processPacket(data)
 		case <-qc.done:
 			return
@@ -374,6 +378,10 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 	qc.streamsMu.Lock()
 	s, ok := qc.streams[f.streamID]
 	if !ok {
+		if len(qc.streams) >= quicMaxTrackedStreams {
+			qc.streamsMu.Unlock()
+			return
+		}
 		s = newQUICStream(f.streamID, qc)
 		qc.streams[f.streamID] = s
 	}
@@ -386,9 +394,13 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 			qc.activeReqStreams.Add(-1)
 			return
 		}
+		streamID := f.streamID
 		go func() {
 			defer qc.activeReqStreams.Add(-1)
 			qc.h3.handleRequestStream(s)
+			qc.streamsMu.Lock()
+			delete(qc.streams, streamID)
+			qc.streamsMu.Unlock()
 		}()
 	}
 }
@@ -467,7 +479,7 @@ func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 
 	pn := qc.sendPN[space]
 	qc.sendPN[space]++
-	largestAcked := qc.loss.largestAcked[space]
+	largestAcked := qc.loss.largestAckedPN(space)
 
 	var packet []byte
 	switch space {
@@ -567,7 +579,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 
 	pn0 := qc.sendPN[quicSpaceInitial]
 	qc.sendPN[quicSpaceInitial]++
-	la0 := qc.loss.largestAcked[quicSpaceInitial]
+	la0 := qc.loss.largestAckedPN(quicSpaceInitial)
 
 	var hsMessages []byte
 	hsMessages = append(hsMessages, ee...)
@@ -585,7 +597,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	firstHSFrames = quicAppendCryptoFrame(firstHSFrames, 0, firstHSChunk)
 	pnHS0 := qc.sendPN[quicSpaceHandshake]
 	qc.sendPN[quicSpaceHandshake]++
-	laHS := qc.loss.largestAcked[quicSpaceHandshake]
+	laHS := qc.loss.largestAckedPN(quicSpaceHandshake)
 	firstHSPkt := quicBuildHandshakePacket(nil, qc.dstCID(), qc.srcCID(), firstHSFrames, pnHS0, laHS, hsKeys)
 
 	if debugFlag.Load() {
@@ -689,7 +701,7 @@ func (qc *QUICConn) runIdleTimer() {
 		case <-qc.done:
 			return
 		case <-ticker.C:
-			if time.Since(qc.lastActive) > qc.idleTimeout {
+			if time.Duration(time.Now().UnixNano()-qc.lastActive.Load()) > qc.idleTimeout {
 				qc.close()
 				return
 			}

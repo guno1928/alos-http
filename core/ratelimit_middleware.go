@@ -4,8 +4,31 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/alosmap"
 )
 
+// RateLimitMiddlewareConfig configures the RateLimitMiddleware.
+//
+// MaxRequests is the maximum number of requests allowed per key within Window; defaults to 100 when <= 0.
+//
+//	Example: MaxRequests: 1000 allows 1000 requests per window.
+//	Example: MaxRequests: 0 uses the default of 100.
+//
+// Window is the duration of the rate-limit window; defaults to time.Minute when <= 0.
+//
+//	Example: Window: time.Second allows MaxRequests per second.
+//	Example: Window: 0 uses the default of one minute.
+//
+// KeyFunc derives the rate-limit key from a request; defaults to the client IP parsed from RemoteAddr when nil.
+//
+//	Example: KeyFunc: nil keys by client IP.
+//	Example: KeyFunc: func(r *Request) string { return r.Header("X-API-Key") } keys by API key.
+//
+// OnLimit is called when a request is rejected; returning true means the callback wrote the response, otherwise a 429 with a Retry-After header is sent.
+//
+//	Example: OnLimit: nil sends a default 429 "Too Many Requests".
+//	Example: OnLimit: func(ev RateLimitEvent, req *Request, resp *Response) bool { resp.Status(429).JSONString(`{"error":"slow down"}`); return true } sends a custom response.
 type RateLimitMiddlewareConfig struct {
 	MaxRequests int64
 	Window      time.Duration
@@ -52,6 +75,11 @@ func extractClientIP(remoteAddr string) string {
 	return remoteAddr
 }
 
+// RateLimitMiddleware returns middleware that limits requests per key to cfg.MaxRequests within cfg.Window, blocking offending keys for a fixed cooldown and responding 429 with a Retry-After header. See RateLimitMiddlewareConfig for defaults.
+//
+// Example: app.Use(RateLimitMiddleware(RateLimitMiddlewareConfig{}))
+// Example: app.Use(RateLimitMiddleware(RateLimitMiddlewareConfig{MaxRequests: 10, Window: time.Second}))
+// Example: app.Use(RateLimitMiddleware(RateLimitMiddlewareConfig{KeyFunc: func(r *Request) string { return r.Header("X-API-Key") }}))
 func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 	if cfg.MaxRequests <= 0 {
 		cfg.MaxRequests = 100
@@ -70,18 +98,30 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 	windowNanos := cfg.Window.Nanoseconds()
 	blockNanos := rateLimitBlockFor.Nanoseconds()
 	blockSecs := int64(rateLimitBlockFor / time.Second)
-	entries := NewShardedMap[string, *rateLimitMWEntry](StringHash)
+	entries := alosmap.New(alosmap.WithCapacity(1024), alosmap.WithoutCleanup())
 
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
 		for range ticker.C {
-			now := CoarseNanotime()
-			entries.Range(func(key string, entry *rateLimitMWEntry) bool {
-				if entry.resetAt.Load() < now && entry.blockedUntil.Load() < now {
-					entries.Delete(key)
-				}
-				return true
-			})
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						Dbg("[ratelimit cleanup] recovered panic: %v", r)
+					}
+				}()
+				now := CoarseNanotime()
+				entries.Range(func(key alosmap.Key, val any) bool {
+					entry, ok := val.(*rateLimitMWEntry)
+					if !ok {
+						return true
+					}
+					if entry.resetAt.Load() < now && entry.blockedUntil.Load() < now {
+						entries.Delete(key)
+					}
+					return true
+				})
+			}()
 		}
 	}()
 
@@ -116,7 +156,12 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 			key := keyFunc(req)
 			now := CoarseNanotime()
 
-			entry, _ := entries.LoadOrStore(key, &rateLimitMWEntry{})
+			v, _ := entries.LoadOrStore(alosmap.S(key), &rateLimitMWEntry{})
+			entry, ok := v.(*rateLimitMWEntry)
+			if !ok {
+				entry = &rateLimitMWEntry{}
+				entries.Store(alosmap.S(key), entry)
+			}
 
 			blockedUntil := entry.blockedUntil.Load()
 			if blockedUntil != 0 {
@@ -128,15 +173,17 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 					reject(req, resp, key, retryAfterSecs)
 					return
 				}
-				entry.blockedUntil.Store(0)
-				entry.count.Store(0)
-				entry.resetAt.Store(now + windowNanos)
+				if entry.blockedUntil.CompareAndSwap(blockedUntil, 0) {
+					entry.resetAt.Store(now + windowNanos)
+					entry.count.Store(0)
+				}
 			}
 
 			resetAt := entry.resetAt.Load()
 			if resetAt == 0 || now >= resetAt {
-				entry.count.Store(0)
-				entry.resetAt.Store(now + windowNanos)
+				if entry.resetAt.CompareAndSwap(resetAt, now+windowNanos) {
+					entry.count.Store(0)
+				}
 			}
 
 			count := entry.count.Add(1)

@@ -270,7 +270,7 @@ func (worker *tlsUringWorker) processHTTP2Frames(conn *tlsWorkerConn) (int, erro
 		frameType := conn.appBuf[base+3]
 		frameFlags := conn.appBuf[base+4]
 		streamID := (uint32(conn.appBuf[base+5])<<24 | uint32(conn.appBuf[base+6])<<16 | uint32(conn.appBuf[base+7])<<8 | uint32(conn.appBuf[base+8])) & 0x7fffffff
-		if frameLen > int(H2MaxFrameSize) {
+		if frameLen > H2DefaultMaxFrameSize {
 			if worker.server.IsDebug() {
 				Dbg("[%s] worker HTTP/2 frame too large len=%d", conn.remoteAddr, frameLen)
 			}

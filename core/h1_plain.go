@@ -307,12 +307,18 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 				if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Content-Length") {
 					req.cachedCL = valStr
 					req.headerCacheMask |= headerCacheContentLength
-					hasContentLength = true
 					parsedCL, parsedOK := parseUint(valStr)
-					if parsedOK {
-						contentLength = parsedCL
+					if hasContentLength {
+						if !parsedOK || contentLength < 0 || parsedCL != contentLength {
+							contentLength = -1
+						}
 					} else {
-						contentLength = -1
+						hasContentLength = true
+						if parsedOK {
+							contentLength = parsedCL
+						} else {
+							contentLength = -1
+						}
 					}
 				}
 			case 15:

@@ -15,11 +15,7 @@ import (
 	"time"
 )
 
-// Recovery returns middleware that catches panics in downstream handlers
-// and responds with 500 Internal Server Error instead of crashing the
-// process. Always register it first in the middleware chain.
-//
-//	s.Router.Use(core.Recovery())
+// Recovery returns middleware that recovers from panics in downstream handlers and responds with 500 Internal Server Error. Register it first in the chain.
 func Recovery() MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -34,10 +30,7 @@ func Recovery() MiddlewareFunc {
 	}
 }
 
-// Logger returns middleware that logs every request with method, path,
-// status code, and elapsed time to the standard logger.
-//
-//	s.Router.Use(core.Logger())
+// Logger returns middleware that logs each request's protocol, method, path, status code, and elapsed time to the standard logger.
 func Logger() MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -50,20 +43,34 @@ func Logger() MiddlewareFunc {
 	}
 }
 
-// CORSConfig controls Cross-Origin Resource Sharing headers.
+// CORSConfig controls Cross-Origin Resource Sharing response headers.
 //
-//	cfg := core.CORSConfig{
-//		AllowOrigins:     []string{"https://example.com", "https://app.example.com"},
-//		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-//		AllowHeaders:     []string{"Content-Type", "Authorization"},
-//		ExposeHeaders:    []string{"X-Request-ID"},
-//		AllowCredentials: true,
-//		MaxAge:           86400,
-//	}
+// AllowOrigins lists permitted origins; an empty slice or []string{"*"} allows all origins.
 //
-// Set AllowOrigins to []string{"*"} to allow all origins. When
-// AllowCredentials is true and the origin is "*", the actual
-// Origin header value is reflected back (per the CORS spec).
+//	Example: AllowOrigins: []string{"https://example.com"} allows a single origin.
+//	Example: AllowOrigins: []string{"*"} allows all origins (Access-Control-Allow-Origin: *).
+//	Example: AllowOrigins: nil also allows all origins.
+//
+// AllowMethods lists methods sent in Access-Control-Allow-Methods; omitted when empty.
+//
+//	Example: AllowMethods: []string{"GET", "POST", "OPTIONS"} advertises those methods.
+//
+// AllowHeaders lists request headers sent in Access-Control-Allow-Headers; omitted when empty.
+//
+//	Example: AllowHeaders: []string{"Content-Type", "Authorization"} permits those request headers.
+//
+// ExposeHeaders lists response headers sent in Access-Control-Expose-Headers; omitted when empty.
+//
+//	Example: ExposeHeaders: []string{"X-Request-ID"} exposes that header to the browser.
+//
+// AllowCredentials sets Access-Control-Allow-Credentials; it is not emitted alongside a wildcard origin.
+//
+//	Example: AllowCredentials: true allows cookies and credentials on matched non-wildcard origins.
+//
+// MaxAge is the preflight cache lifetime in seconds for Access-Control-Max-Age; omitted when 0.
+//
+//	Example: MaxAge: 86400 caches preflight results for one day.
+//	Example: MaxAge: 0 omits the Access-Control-Max-Age header.
 type CORSConfig struct {
 	AllowOrigins     []string
 	AllowMethods     []string
@@ -111,20 +118,25 @@ func newCORSSnapshot(cfg CORSConfig) *corsSnapshot {
 	return snap
 }
 
-// CORSEngine holds a snapshot of the CORS config and can be updated
-// at runtime without restarting the server. Access to the snapshot is
-// lock-free via atomic.Pointer.
+// CORSEngine holds a CORS configuration snapshot that can be replaced at runtime without restarting the server. Reads of the snapshot are lock-free.
 type CORSEngine struct {
 	snapshot atomic.Pointer[corsSnapshot]
 }
 
-// NewCORSEngine creates a CORSEngine with the given config.
+// NewCORSEngine returns a CORSEngine initialized with cfg.
+//
+// Example: ce := NewCORSEngine(CORSConfig{AllowOrigins: []string{"*"}})
+// Example: ce := NewCORSEngine(CORSConfig{AllowOrigins: []string{"https://app.example.com"}, AllowCredentials: true})
 func NewCORSEngine(cfg CORSConfig) *CORSEngine {
 	ce := &CORSEngine{}
 	ce.snapshot.Store(newCORSSnapshot(cfg))
 	return ce
 }
 
+// Update atomically replaces the engine's configuration with cfg.
+//
+// Example: ce.Update(CORSConfig{AllowOrigins: []string{"https://new.example.com"}})
+// Example: ce.Update(CORSConfig{AllowOrigins: []string{"*"}})
 func (ce *CORSEngine) Update(cfg CORSConfig) {
 	ce.snapshot.Store(newCORSSnapshot(cfg))
 }
@@ -204,6 +216,7 @@ func lastXFFEntry(xff string) string {
 	return trimASCIISpace(last)
 }
 
+// Config returns a CORSConfig reflecting the engine's current origins and credentials setting.
 func (ce *CORSEngine) Config() CORSConfig {
 	snap := ce.snapshot.Load()
 	if snap == nil {
@@ -224,6 +237,7 @@ func (ce *CORSEngine) Config() CORSConfig {
 	}
 }
 
+// Middleware returns a MiddlewareFunc that applies the engine's current CORS headers and answers preflight OPTIONS requests with 204.
 func (ce *CORSEngine) Middleware() MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -248,7 +262,7 @@ func (ce *CORSEngine) applyCORS(snap *corsSnapshot, req *Request, resp *Response
 		resp.SetHeaderUnsafe("access-control-allow-origin", "*")
 	} else if origin != "" {
 		if _, ok := snap.originMap[origin]; ok {
-			resp.SetHeaderUnsafe("access-control-allow-origin", origin)
+			resp.SetHeaderUnsafe("access-control-allow-origin", cookieStripCTL(origin))
 			resp.SetHeaderUnsafe("vary", "Origin")
 		}
 	}
@@ -269,13 +283,11 @@ func (ce *CORSEngine) applyCORS(snap *corsSnapshot, req *Request, resp *Response
 	}
 }
 
-// CORS returns a one-shot middleware from a static CORSConfig. For
-// runtime-updatable CORS use NewCORSEngine + CORSEngine.Middleware.
+// CORS returns middleware built from a static CORSConfig. For runtime-updatable CORS, use NewCORSEngine with CORSEngine.Middleware.
 //
-//	s.Router.Use(core.CORS(core.CORSConfig{
-//		AllowOrigins: []string{"*"},
-//		AllowMethods: []string{"GET", "POST"},
-//	}))
+// Example: app.Use(CORS(CORSConfig{AllowOrigins: []string{"*"}}))
+// Example: app.Use(CORS(CORSConfig{AllowOrigins: []string{"https://example.com"}, AllowMethods: []string{"GET", "POST"}}))
+// Example: app.Use(CORS(CORSConfig{AllowOrigins: []string{"https://app.example.com"}, AllowCredentials: true}))
 func CORS(config CORSConfig) MiddlewareFunc {
 	ce := NewCORSEngine(config)
 	return ce.Middleware()
@@ -283,10 +295,7 @@ func CORS(config CORSConfig) MiddlewareFunc {
 
 var requestIDCounter atomic.Uint64
 
-// RequestID returns middleware that assigns a monotonically increasing
-// integer ID to each request via the X-Request-ID response header.
-//
-//	s.Router.Use(core.RequestID())
+// RequestID returns middleware that assigns each request a monotonically increasing id via the X-Request-ID response header.
 func RequestID() MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -299,18 +308,38 @@ func RequestID() MiddlewareFunc {
 	}
 }
 
-// SecurityHeadersConfig controls which security-related headers are
-// injected into every response.
+// SecurityHeadersConfig selects which security-related response headers are injected into every response.
 //
-//	cfg := core.SecurityHeadersConfig{
-//		ContentTypeNosniff: true,
-//		XFrameOptions:      "DENY",
-//		XSSProtection:      true,
-//		HSTSMaxAge:         63072000,
-//		HSTSSubdomains:     true,
-//		HSTSPreload:        true,
-//		ReferrerPolicy:     "strict-origin-when-cross-origin",
-//	}
+// ContentTypeNosniff emits "X-Content-Type-Options: nosniff" when true.
+//
+//	Example: ContentTypeNosniff: true prevents MIME type sniffing.
+//
+// XFrameOptions sets the X-Frame-Options header; omitted when empty.
+//
+//	Example: XFrameOptions: "DENY" forbids framing entirely.
+//	Example: XFrameOptions: "SAMEORIGIN" allows framing by same-origin pages.
+//
+// XSSProtection emits "X-XSS-Protection: 1; mode=block" when true.
+//
+//	Example: XSSProtection: true enables the legacy XSS filter.
+//
+// HSTSMaxAge sets the Strict-Transport-Security max-age in seconds; the header is omitted when <= 0.
+//
+//	Example: HSTSMaxAge: 63072000 enables HSTS for two years.
+//	Example: HSTSMaxAge: 0 omits the Strict-Transport-Security header.
+//
+// HSTSSubdomains appends "; includeSubDomains" to the HSTS header when true (requires HSTSMaxAge > 0).
+//
+//	Example: HSTSSubdomains: true applies HSTS to all subdomains.
+//
+// HSTSPreload appends "; preload" to the HSTS header when true (requires HSTSMaxAge > 0).
+//
+//	Example: HSTSPreload: true marks the host eligible for browser preload lists.
+//
+// ReferrerPolicy sets the Referrer-Policy header; omitted when empty.
+//
+//	Example: ReferrerPolicy: "strict-origin-when-cross-origin" sends the origin on cross-origin requests.
+//	Example: ReferrerPolicy: "no-referrer" never sends the Referer header.
 type SecurityHeadersConfig struct {
 	ContentTypeNosniff bool
 	XFrameOptions      string
@@ -321,10 +350,7 @@ type SecurityHeadersConfig struct {
 	ReferrerPolicy     string
 }
 
-// DefaultSecurityHeaders returns a SecurityHeadersConfig with all
-// protections enabled: nosniff, DENY framing, XSS filter, 2-year HSTS
-// with includeSubDomains and preload, and strict-origin-when-cross-origin
-// referrer policy.
+// DefaultSecurityHeaders returns a SecurityHeadersConfig with nosniff, X-Frame-Options DENY, the XSS filter, two-year HSTS with includeSubDomains and preload, and a strict-origin-when-cross-origin referrer policy.
 func DefaultSecurityHeaders() SecurityHeadersConfig {
 	return SecurityHeadersConfig{
 		ContentTypeNosniff: true,
@@ -337,10 +363,11 @@ func DefaultSecurityHeaders() SecurityHeadersConfig {
 	}
 }
 
-// SecurityHeaders returns middleware that injects the configured
-// security headers into every response.
+// SecurityHeaders returns middleware that appends the configured security headers to every response. See SecurityHeadersConfig for per-field behavior.
 //
-//	s.Router.Use(core.SecurityHeaders(core.DefaultSecurityHeaders()))
+// Example: app.Use(SecurityHeaders(DefaultSecurityHeaders()))
+// Example: app.Use(SecurityHeaders(SecurityHeadersConfig{ContentTypeNosniff: true, XFrameOptions: "DENY"}))
+// Example: app.Use(SecurityHeaders(SecurityHeadersConfig{HSTSMaxAge: 31536000, HSTSSubdomains: true}))
 func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 	var hsts string
 	if cfg.HSTSMaxAge > 0 {
@@ -384,10 +411,16 @@ func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 
 // CompressConfig controls response compression.
 //
-//	cfg := core.CompressConfig{
-//		Level:   6,     // gzip/deflate level (1-9)
-//		MinSize: 512,   // skip compression below this body size
-//	}
+// Level is the gzip/deflate compression level from 1 (fastest) to 9 (smallest); values outside 1–9 fall back to 6.
+//
+//	Example: Level: 1 favors speed over ratio.
+//	Example: Level: 9 favors ratio over speed.
+//	Example: Level: 0 is out of range and uses the default 6.
+//
+// MinSize is the minimum body size in bytes to compress; smaller bodies are sent uncompressed. Values <= 0 fall back to 256.
+//
+//	Example: MinSize: 512 skips compression for bodies under 512 bytes.
+//	Example: MinSize: 0 uses the default of 256.
 type CompressConfig struct {
 	Level   int
 	MinSize int
@@ -414,11 +447,11 @@ func init() {
 	}
 }
 
-// Compress returns middleware that gzip- or deflate-compresses response
-// bodies based on the client's Accept-Encoding header. Responses below
-// MinSize bytes or already streamed are left untouched.
+// Compress returns middleware that gzip- or deflate-compresses response bodies per the request's Accept-Encoding header, leaving streamed responses and bodies below cfg.MinSize untouched. See CompressConfig for defaults.
 //
-//	s.Router.Use(core.Compress(core.CompressConfig{Level: 6, MinSize: 512}))
+// Example: app.Use(Compress(CompressConfig{}))
+// Example: app.Use(Compress(CompressConfig{Level: 6, MinSize: 512}))
+// Example: app.Use(Compress(CompressConfig{Level: 9, MinSize: 1024}))
 func Compress(cfg CompressConfig) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -601,10 +634,11 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Timeout returns middleware that aborts the handler if it takes longer
-// than d. The client receives a 504 Gateway Timeout.
+// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
 //
-//	s.Router.Use(core.Timeout(10 * time.Second))
+// Example: app.Use(Timeout(5 * time.Second))
+// Example: app.Use(Timeout(100 * time.Millisecond))
+// Example: app.Use(Timeout(time.Minute))
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -682,11 +716,11 @@ func Timeout(d time.Duration) MiddlewareFunc {
 	}
 }
 
-// BodyLimit returns middleware that rejects bodies larger than maxBytes
-// with 413 Payload Too Large. It checks Content-Length first, then the
-// actual body length.
+// BodyLimit returns middleware that rejects requests whose body exceeds maxBytes with 413 Payload Too Large, checking Content-Length first and then the actual body length.
 //
-//	s.Router.Use(core.BodyLimit(10 << 20)) // 10 MiB
+// Example: app.Use(BodyLimit(1 << 20))
+// Example: app.Use(BodyLimit(10 << 20))
+// Example: app.Use(BodyLimit(512 * 1024))
 func BodyLimit(maxBytes int64) MiddlewareFunc {
 	maxStr := string(appendUint(nil, maxBytes))
 	return func(next HandlerFunc) HandlerFunc {
@@ -709,13 +743,11 @@ func BodyLimit(maxBytes int64) MiddlewareFunc {
 	}
 }
 
-// RealIP returns middleware that overwrites req.RemoteAddr with the
-// value from X-Forwarded-For or X-Real-IP headers. When trustedProxies
-// is non-empty, the header is only trusted if the direct client IP
-// matches one of the listed CIDRs or IPs. When trustedProxies is empty,
-// the header is always trusted — only use this behind a known proxy.
+// RealIP returns middleware that overwrites req.RemoteAddr from the X-Forwarded-For or X-Real-IP header. When trustedProxies are given, the header is honored only if the direct peer matches one of the listed IPs or CIDRs; when none are given, the header is always trusted, so use that form only behind a trusted proxy.
 //
-//	s.Router.Use(core.RealIP("10.0.0.0/8", "172.16.0.0/12"))
+// Example: app.Use(RealIP())
+// Example: app.Use(RealIP("10.0.0.0/8"))
+// Example: app.Use(RealIP("172.16.0.0/12", "192.168.1.1"))
 func RealIP(trustedProxies ...string) MiddlewareFunc {
 	var nets []*net.IPNet
 	var ips []net.IP
@@ -770,10 +802,11 @@ func RealIP(trustedProxies ...string) MiddlewareFunc {
 	}
 }
 
-// AllowMethods returns middleware that rejects requests whose method
-// is not in the given list with 405 Method Not Allowed.
+// AllowMethods returns middleware that responds 405 Method Not Allowed when the request method is not in methods.
 //
-//	s.Router.Use(core.AllowMethods("GET", "POST"))
+// Example: app.Use(AllowMethods("GET"))
+// Example: app.Use(AllowMethods("GET", "POST", "OPTIONS"))
+// Example: app.Use(AllowMethods("GET", "HEAD", "PUT", "DELETE"))
 func AllowMethods(methods ...string) MiddlewareFunc {
 	allowed := make(map[string]struct{}, len(methods))
 	for _, m := range methods {
@@ -790,26 +823,26 @@ func AllowMethods(methods ...string) MiddlewareFunc {
 	}
 }
 
-// BasicAuthConfig holds username/password pairs and the HTTP Basic
-// Auth realm string.
+// BasicAuthConfig configures the BasicAuth middleware.
 //
-//	cfg := core.BasicAuthConfig{
-//		Users: map[string]string{"admin": "secret"},
-//		Realm: "Admin Panel",
-//	}
+// Users maps usernames to passwords; passwords are compared in constant time.
+//
+//	Example: Users: map[string]string{"admin": "secret"} accepts admin/secret.
+//	Example: Users: map[string]string{"alice": "pw1", "bob": "pw2"} accepts multiple users.
+//
+// Realm is the HTTP Basic authentication realm; defaults to "Restricted" when empty.
+//
+//	Example: Realm: "Admin Panel" shows that realm in the auth prompt.
+//	Example: Realm: "" uses the default "Restricted".
 type BasicAuthConfig struct {
 	Users map[string]string
 	Realm string
 }
 
-// BasicAuth returns middleware that requires HTTP Basic credentials.
-// Passwords are compared in constant time. If the realm is empty it
-// defaults to "Restricted".
+// BasicAuth returns middleware that requires HTTP Basic credentials, comparing passwords in constant time and challenging unauthenticated requests with 401 and a WWW-Authenticate header. See BasicAuthConfig for defaults.
 //
-//	s.Router.Use(core.BasicAuth(core.BasicAuthConfig{
-//		Users: map[string]string{"admin": "secret"},
-//		Realm: "Admin Panel",
-//	}))
+// Example: app.Use(BasicAuth(BasicAuthConfig{Users: map[string]string{"admin": "secret"}}))
+// Example: app.Use(BasicAuth(BasicAuthConfig{Users: users, Realm: "Admin Panel"}))
 func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 	realm := cfg.Realm
 	if realm == "" {
@@ -878,13 +911,10 @@ func sanitizeAuthRealm(s string) string {
 	return string(b)
 }
 
-// If returns middleware that conditionally applies inner only when
-// predicate returns true for the current request.
+// If returns middleware that applies inner only when predicate returns true for the request, otherwise the request bypasses inner.
 //
-//	s.Router.Use(core.If(
-//		func(req *core.Request) bool { return req.Path != "/health" },
-//		core.Logger(),
-//	))
+// Example: app.Use(If(func(r *Request) bool { return r.Path != "/health" }, Logger()))
+// Example: app.Use(If(func(r *Request) bool { return r.Method == "POST" }, BodyLimit(1<<20)))
 func If(predicate func(*Request) bool, inner MiddlewareFunc) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		wrapped := inner(next)
@@ -898,10 +928,10 @@ func If(predicate func(*Request) bool, inner MiddlewareFunc) MiddlewareFunc {
 	}
 }
 
-// Header returns middleware that sets a fixed response header on every
-// request.
+// Header returns middleware that sets a fixed response header on every request.
 //
-//	s.Router.Use(core.Header("X-Powered-By", "ALOS"))
+// Example: app.Use(Header("X-Powered-By", "ALOS"))
+// Example: app.Use(Header("Cache-Control", "no-store"))
 func Header(name, value string) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {

@@ -64,11 +64,16 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	if consumed > 0 {
 		h3.qconn.streamsMu.Lock()
 		h3.qconn.dataRecv += consumed
+		connFC := h3.qconn.dataRecv + uint64(quicInitialMaxData)
 		h3.qconn.streamsMu.Unlock()
 
+		s.mu.Lock()
+		streamFC := s.recvOff + uint64(quicInitialMaxStreamData)
+		s.mu.Unlock()
+
 		var fc []byte
-		fc = quicAppendMaxStreamDataFrame(fc, s.id, s.recvOff+uint64(quicInitialMaxStreamData))
-		fc = quicAppendMaxDataFrame(fc, h3.qconn.dataRecv+uint64(quicInitialMaxData))
+		fc = quicAppendMaxStreamDataFrame(fc, s.id, streamFC)
+		fc = quicAppendMaxDataFrame(fc, connFC)
 		h3.qconn.sendFrames(quicSpaceAppData, fc, false)
 	}
 

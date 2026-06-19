@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"hash"
 	"log"
 )
@@ -306,14 +307,7 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 		if debugFlag.Load() { log.Printf("[QUIC-TLS] client Finished length mismatch") }
 		return
 	}
-	match := true
-	for i := range expectedFin {
-		if clientFinData[i] != expectedFin[i] {
-			match = false
-			break
-		}
-	}
-	if !match {
+	if subtle.ConstantTimeCompare(clientFinData, expectedFin) != 1 {
 		if debugFlag.Load() { log.Printf("[QUIC-TLS] client Finished verify failed") }
 		return
 	}

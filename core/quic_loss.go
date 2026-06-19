@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 const (
 	quicInitialRTT        = 333 * time.Millisecond
@@ -20,6 +23,8 @@ type quicSentPacket struct {
 }
 
 type quicLossState struct {
+	mu sync.Mutex
+
 	smoothedRTT  time.Duration
 	rttVar       time.Duration
 	minRTT       time.Duration
@@ -49,6 +54,8 @@ func newQuicLossState() *quicLossState {
 }
 
 func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit bool, frames []byte) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
 	sp := quicSentPacket{
 		pn:        pn,
 		sent:      time.Now(),
@@ -64,6 +71,13 @@ func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit 
 }
 
 func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay time.Duration) [][]byte {
+	if ack.firstRange > ack.largestAck {
+		return nil
+	}
+
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
 	largest := int64(ack.largestAck)
 	if largest > ls.largestAcked[space] {
 		ls.largestAcked[space] = largest
@@ -77,10 +91,13 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 	ackedPackets = ls.markAcked(space, lo, hi, ackedPackets)
 
 	for _, r := range ack.ranges {
-		if hi < r.gap+2 {
+		if lo < r.gap+2 {
 			break
 		}
 		hi = lo - r.gap - 2
+		if hi < r.count {
+			break
+		}
 		lo = hi - r.count
 		ackedPackets = ls.markAcked(space, lo, hi, ackedPackets)
 	}
@@ -117,7 +134,11 @@ func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
 	if ls.largestAcked[space] < 0 {
 		return lostFrames
 	}
-	threshold := uint64(ls.largestAcked[space]) - quicPktThreshold + 1
+	la := uint64(ls.largestAcked[space])
+	var threshold uint64
+	if la+1 > quicPktThreshold {
+		threshold = la - quicPktThreshold + 1
+	}
 	lossDelay := time.Duration(float64(max64(ls.smoothedRTT, ls.minRTT)) * quicTimeThreshold)
 	if lossDelay < quicTimerGranularity {
 		lossDelay = quicTimerGranularity
@@ -179,6 +200,13 @@ func (ls *quicLossState) hasUnackedCrypto(space int) bool {
 		}
 	}
 	return false
+}
+
+func (ls *quicLossState) largestAckedPN(space int) int64 {
+	ls.mu.Lock()
+	v := ls.largestAcked[space]
+	ls.mu.Unlock()
+	return v
 }
 
 func max64(a, b time.Duration) time.Duration {

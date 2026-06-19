@@ -282,7 +282,10 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 				return nil, ErrTruncated
 			}
 			pos += n
-			if static && idx < uint64(len(qpackStaticTable)) {
+			if static {
+				if idx >= uint64(len(qpackStaticTable)) {
+					return nil, ErrTruncated
+				}
 				headers = append(headers, qpackStaticTable[idx])
 			}
 		} else if b&0x40 != 0 {
@@ -298,7 +301,10 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			}
 			pos += vn
 			var name string
-			if nameIsStatic && nameIdx < uint64(len(qpackStaticTable)) {
+			if nameIsStatic {
+				if nameIdx >= uint64(len(qpackStaticTable)) {
+					return nil, ErrTruncated
+				}
 				name = qpackStaticTable[nameIdx][0]
 			}
 			headers = append(headers, [2]string{name, value})
