@@ -50,10 +50,19 @@ type Response struct {
 	lazyReq     *Request
 }
 
+const bufferShrinkThreshold = 64 << 10
+
+func shrinkBuffer(buf []byte, defaultCap int) []byte {
+	if cap(buf) > bufferShrinkThreshold {
+		return make([]byte, 0, defaultCap)
+	}
+	return buf[:0]
+}
+
 func (r *Response) Reset() {
 	r.StatusCode = 200
 	r.Headers = r.Headers[:0]
-	r.body = r.body[:0]
+	r.body = shrinkBuffer(r.body, 4096)
 	r.bodyString = ""
 	r.bodyIsText = false
 	r.ContentType = ""
@@ -66,7 +75,7 @@ func (r *Response) Reset() {
 func (r *Response) resetFastH1() {
 	r.StatusCode = 200
 	r.Headers = r.Headers[:0]
-	r.body = r.body[:0]
+	r.body = shrinkBuffer(r.body, 4096)
 	r.bodyString = ""
 	r.bodyIsText = false
 	r.ContentType = ""

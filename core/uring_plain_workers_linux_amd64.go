@@ -1097,12 +1097,12 @@ func (worker *plainUringWorker) recycleConnection(conn *plainWorkerConn) {
 	conn.h2.reset()
 	conn.req.resetFastH1()
 	conn.resp.resetFastH1()
-	conn.readBuf = conn.readBuf[:0]
+	conn.readBuf = shrinkBuffer(conn.readBuf, 8192)
 	if conn.writeBorrowed {
 		conn.writeBorrowed = false
 		conn.writeBuf = nil
 	} else {
-		conn.writeBuf = conn.writeBuf[:0]
+		conn.writeBuf = shrinkBuffer(conn.writeBuf, 16384)
 	}
 }
 

@@ -1642,10 +1642,10 @@ func (worker *tlsUringWorker) recycleConnection(conn *tlsWorkerConn) {
 	conn.h2.reset()
 	conn.req.Reset()
 	conn.resp.Reset()
-	conn.readBuf = conn.readBuf[:0]
-	conn.appBuf = conn.appBuf[:0]
-	conn.plainBuf = conn.plainBuf[:0]
-	conn.writeBuf = conn.writeBuf[:0]
+	conn.readBuf = shrinkBuffer(conn.readBuf, 8192)
+	conn.appBuf = shrinkBuffer(conn.appBuf, 8192)
+	conn.plainBuf = shrinkBuffer(conn.plainBuf, 16384)
+	conn.writeBuf = shrinkBuffer(conn.writeBuf, 16384)
 	conn.innerScratch = conn.innerScratch[:0]
 }
 
