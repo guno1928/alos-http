@@ -98,7 +98,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 	windowNanos := cfg.Window.Nanoseconds()
 	blockNanos := rateLimitBlockFor.Nanoseconds()
 	blockSecs := int64(rateLimitBlockFor / time.Second)
-	entries := alosmap.New(alosmap.WithCapacity(1024), alosmap.WithoutCleanup())
+	entries := alosmap.NewTypedSized[string, *rateLimitMWEntry](1024, 0).Prealloc(256)
 
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -111,11 +111,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 					}
 				}()
 				now := CoarseNanotime()
-				entries.Range(func(key alosmap.Key, val any) bool {
-					entry, ok := val.(*rateLimitMWEntry)
-					if !ok {
-						return true
-					}
+				entries.Range(func(key string, entry *rateLimitMWEntry) bool {
 					if entry.resetAt.Load() < now && entry.blockedUntil.Load() < now {
 						entries.Delete(key)
 					}
@@ -156,12 +152,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 			key := keyFunc(req)
 			now := CoarseNanotime()
 
-			v, _ := entries.LoadOrStore(alosmap.S(key), &rateLimitMWEntry{})
-			entry, ok := v.(*rateLimitMWEntry)
-			if !ok {
-				entry = &rateLimitMWEntry{}
-				entries.Store(alosmap.S(key), entry)
-			}
+			entry, _ := entries.LoadOrStore(key, &rateLimitMWEntry{})
 
 			blockedUntil := entry.blockedUntil.Load()
 			if blockedUntil != 0 {

@@ -71,14 +71,14 @@ type CertInfo struct {
 }
 
 type CertStore struct {
-	certs    *alosmap.Map
+	certs    *alosmap.TypedMap[string, *CertEntry]
 	defEntry atomic.Pointer[CertEntry]
 	mu       sync.Mutex
 }
 
 func NewCertStore() *CertStore {
 	cs := &CertStore{
-		certs: alosmap.New(alosmap.WithCapacity(32), alosmap.WithoutCleanup()),
+		certs: alosmap.NewTypedSized[string, *CertEntry](32, 0).Prealloc(256),
 	}
 	return cs
 }
@@ -92,8 +92,8 @@ func normalizeCertDomain(domain string) string {
 func (cs *CertStore) Lookup(serverName string) *CertEntry {
 	serverName = normalizeCertDomain(serverName)
 	if serverName != "" {
-		if v, ok := cs.certs.Load(alosmap.S(serverName)); ok {
-			return v.(*CertEntry)
+		if v, ok := cs.certs.Load(serverName); ok {
+			return v
 		}
 	}
 	return cs.defEntry.Load()
@@ -140,7 +140,7 @@ func (entry *CertEntry) CachedEECert(alpn string) []byte {
 func (cs *CertStore) AddCert(entry *CertEntry) {
 	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
-	cs.certs.Store(alosmap.S(entry.Domain), entry)
+	cs.certs.Store(entry.Domain, entry)
 	if cs.defEntry.Load() == nil {
 		cs.defEntry.CompareAndSwap(nil, entry)
 	}
@@ -149,11 +149,11 @@ func (cs *CertStore) AddCert(entry *CertEntry) {
 func (cs *CertStore) RemoveCert(domain string) {
 	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
-	cs.certs.Delete(alosmap.S(domain))
+	cs.certs.Delete(domain)
 	if def := cs.defEntry.Load(); def != nil && def.Domain == domain {
 		cs.defEntry.Store(nil)
-		cs.certs.Range(func(_ alosmap.Key, v any) bool {
-			cs.defEntry.Store(v.(*CertEntry))
+		cs.certs.Range(func(_ string, v *CertEntry) bool {
+			cs.defEntry.Store(v)
 			return false
 		})
 	}
@@ -162,17 +162,16 @@ func (cs *CertStore) RemoveCert(domain string) {
 
 func (cs *CertStore) SetDefault(domain string) {
 	domain = normalizeCertDomain(domain)
-	v, ok := cs.certs.Load(alosmap.S(domain))
+	v, ok := cs.certs.Load(domain)
 	if !ok {
 		return
 	}
-	cs.defEntry.Store(v.(*CertEntry))
+	cs.defEntry.Store(v)
 }
 
 func (cs *CertStore) ListCerts() []CertInfo {
 	var out []CertInfo
-	cs.certs.Range(func(_ alosmap.Key, v any) bool {
-		e := v.(*CertEntry)
+	cs.certs.Range(func(_ string, e *CertEntry) bool {
 		out = append(out, CertInfo{Domain: e.Domain, Source: e.Source})
 		return true
 	})

@@ -19,7 +19,7 @@ type dnsCacheEntry struct {
 }
 
 var (
-	dnsCache    = alosmap.New(alosmap.WithCapacity(1024), alosmap.WithCleanupInterval(30*time.Second))
+	dnsCache    = alosmap.NewTypedSized[string, *dnsCacheEntry](1024, 0, alosmap.WithCleanupInterval(30*time.Second)).Prealloc(256)
 	dnsTTL      = int64(60)
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
@@ -44,8 +44,7 @@ func timeoutFromContext(ctx context.Context, fallback time.Duration) time.Durati
 }
 
 func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
-	if v, ok := dnsCache.Load(alosmap.S(host)); ok {
-		entry := v.(*dnsCacheEntry)
+	if entry, ok := dnsCache.Load(host); ok {
 		ips := entry.ips
 		idx := entry.idx.Add(1)
 		return ips[int(idx)%len(ips)], nil
@@ -57,7 +56,7 @@ func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
 	}
 
 	entry := &dnsCacheEntry{ips: ips}
-	dnsCache.StoreWithTTL(alosmap.S(host), entry, time.Duration(dnsTTL)*time.Second)
+	dnsCache.StoreWithTTL(host, entry, time.Duration(dnsTTL)*time.Second)
 
 	return ips[0], nil
 }

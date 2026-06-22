@@ -399,7 +399,7 @@ func (s *Server) ServeH2Plain(conn net.Conn) {
 		server:            s,
 		decoder:           NewHpackDecoder(),
 		initialWindowSize: H2DefaultWindowSize,
-		streams:           alosmap.New(alosmap.WithCapacity(256), alosmap.WithoutCleanup()),
+		streams:           alosmap.NewTypedSized[int64, *H2Stream](256, 0).Prealloc(256),
 		writeCh:           make(chan WriteRequest, 512),
 		done:              make(chan struct{}),
 		decryptBuf:        make([]byte, 0, MaxRecordSize),

@@ -137,29 +137,29 @@ func (s *Session) Regenerate() bool {
 	return true
 }
 
+type sessionEntry struct {
+	data map[string]any
+}
+
 // MemorySessionStore is an in-memory SessionStore suitable for single-process use.
 type MemorySessionStore struct {
-	entries *alosmap.Map
+	entries *alosmap.TypedMap[string, *sessionEntry]
 }
 
 // NewMemorySessionStore returns an empty in-memory SessionStore.
 func NewMemorySessionStore() *MemorySessionStore {
 	return &MemorySessionStore{
-		entries: alosmap.New(),
+		entries: alosmap.NewTyped[string, *sessionEntry]().Prealloc(256),
 	}
 }
 
 func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
-	v, ok := s.entries.Load(alosmap.S(id))
+	v, ok := s.entries.Load(id)
 	if !ok {
 		return nil, false
 	}
-	data, ok := v.(map[string]any)
-	if !ok {
-		return nil, false
-	}
-	cp := make(map[string]any, len(data))
-	for k, val := range data {
+	cp := make(map[string]any, len(v.data))
+	for k, val := range v.data {
 		cp[k] = val
 	}
 	return cp, true
@@ -170,15 +170,16 @@ func (s *MemorySessionStore) Save(id string, data map[string]any, maxAge int) {
 	for k, v := range data {
 		cp[k] = v
 	}
+	entry := &sessionEntry{data: cp}
 	if maxAge > 0 {
-		s.entries.StoreWithTTL(alosmap.S(id), cp, time.Duration(maxAge)*time.Second)
+		s.entries.StoreWithTTL(id, entry, time.Duration(maxAge)*time.Second)
 	} else {
-		s.entries.Store(alosmap.S(id), cp)
+		s.entries.Store(id, entry)
 	}
 }
 
 func (s *MemorySessionStore) Delete(id string) {
-	s.entries.Delete(alosmap.S(id))
+	s.entries.Delete(id)
 }
 
 func generateSessionID() (string, bool) {

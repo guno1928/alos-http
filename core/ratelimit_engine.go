@@ -86,7 +86,7 @@ type rlEntry struct {
 // 30 seconds.
 type RateLimitEngine struct {
 	rules   atomic.Pointer[[]compiledRule]
-	clients *alosmap.Map
+	clients *alosmap.TypedMap[string, *rlEntry]
 	stopCh  chan struct{}
 	OnLimit RateLimitFunc
 }
@@ -95,7 +95,7 @@ type RateLimitEngine struct {
 // the background cleanup goroutine. Call Stop when the engine is no longer needed.
 func NewRateLimitEngine() *RateLimitEngine {
 	rle := &RateLimitEngine{
-		clients: alosmap.New(alosmap.WithCapacity(10000), alosmap.WithoutCleanup()),
+		clients: alosmap.NewTypedSized[string, *rlEntry](10000, 0).Prealloc(256),
 		stopCh:  make(chan struct{}),
 	}
 	empty := make([]compiledRule, 0)
@@ -222,14 +222,12 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 	}
 	now := CoarseNanotime()
 
-	var entry *rlEntry
-	v, ok := rle.clients.Load(alosmap.S(key))
+	entry, ok := rle.clients.Load(key)
 	if !ok {
 		newEntry := &rlEntry{}
 		newEntry.reset.Store(now + cr.rule.Window.Nanoseconds())
-		v, _ = rle.clients.LoadOrStore(alosmap.S(key), newEntry)
+		entry, _ = rle.clients.LoadOrStore(key, newEntry)
 	}
-	entry = v.(*rlEntry)
 
 	blockedUntil := entry.blocked.Load()
 	if blockedUntil > 0 && now < blockedUntil {
@@ -285,9 +283,8 @@ func (rle *RateLimitEngine) cleanupLoop() {
 					}
 				}()
 				now := CoarseNanotime()
-				var stale []alosmap.Key
-				rle.clients.Range(func(key alosmap.Key, val any) bool {
-					entry := val.(*rlEntry)
+				var stale []string
+				rle.clients.Range(func(key string, entry *rlEntry) bool {
 					resetAt := entry.reset.Load()
 					blockedUntil := entry.blocked.Load()
 					if now > resetAt+int64(60*time.Second) && (blockedUntil == 0 || now > blockedUntil) {

@@ -64,7 +64,7 @@ type acmeIntegration struct {
 	domainMu    sync.Mutex
 	initialOnce sync.Once
 
-	challenges *alosmap.Map
+	challenges *alosmap.TypedMap[string, *acmeChallenge]
 
 	localIPs atomic.Pointer[[]net.IP]
 	stop     chan struct{}
@@ -121,7 +121,7 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 		acmeNode:     cfg.ACMENode,
 		challengeDir: challengeDir,
 		domains:      cfg.Domains,
-		challenges:   alosmap.New(alosmap.WithCapacity(32), alosmap.WithoutCleanup()),
+		challenges:   alosmap.NewTypedSized[string, *acmeChallenge](32, 0).Prealloc(256),
 		stop:         make(chan struct{}),
 		client: &acme.Client{
 			Key:          key,
@@ -277,8 +277,7 @@ func (ai *acmeIntegration) HandleHTTP01(path string) ([]byte, bool) {
 	acmePrintf("[ACME] HTTP-01 challenge request: token=%s", token)
 
 	var found *acmeChallenge
-	ai.challenges.Range(func(_ alosmap.Key, val any) bool {
-		ch := val.(*acmeChallenge)
+	ai.challenges.Range(func(_ string, ch *acmeChallenge) bool {
 		if ch.token == token {
 			found = ch
 			return false
@@ -709,7 +708,7 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		acmePrintf("[ACME] challenge token: %s", chal.Token)
 		acmePrintf("[ACME] key authorization length: %d", len(keyAuth))
 
-		ai.challenges.Store(alosmap.S(domain), &acmeChallenge{
+		ai.challenges.Store(domain, &acmeChallenge{
 			token: chal.Token,
 			auth:  keyAuth,
 		})
@@ -814,7 +813,7 @@ func (ai *acmeIntegration) obtain(domain string) error {
 }
 
 func (ai *acmeIntegration) cleanupChallenge(domain, token string) {
-	ai.challenges.Delete(alosmap.S(domain))
+	ai.challenges.Delete(domain)
 	tokenFile := filepath.Join(ai.challengeDir, token)
 	if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
 		acmePrintf("[ACME] WARNING: failed to remove challenge file %s: %v", tokenFile, err)
@@ -832,19 +831,18 @@ func (ai *acmeIntegration) renewDomainOnce(domain string) {
 
 func (ai *acmeIntegration) renewAll() {
 	acmePrintf("[ACME] renewal check started")
-	ai.server.certStore.certs.Range(func(key alosmap.Key, v any) bool {
-		entry := v.(*CertEntry)
+	ai.server.certStore.certs.Range(func(key string, entry *CertEntry) bool {
 		if entry.Source != CertACME {
 			return true
 		}
 		leaf, err := x509.ParseCertificate(entry.ChainDER[0])
 		if err != nil {
-			acmePrintf("[ACME] failed to parse cert for %s during renewal check: %v", key.StringVal(), err)
+			acmePrintf("[ACME] failed to parse cert for %s during renewal check: %v", key, err)
 			return true
 		}
 		remaining := time.Until(leaf.NotAfter)
 		daysLeft := int(remaining.Hours() / 24)
-		domain := key.StringVal()
+		domain := key
 		if remaining > acmeRenewBefore {
 			acmePrintf("[ACME] cert for %s OK (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
 			return true

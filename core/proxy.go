@@ -410,7 +410,7 @@ type domainState struct {
 // ProxyEngine is created internally by the Server. Use Server.OnProxyError,
 // Server.OnProxyRequest, and Server.OnProxyResponse to register callbacks.
 type ProxyEngine struct {
-	domains    *alosmap.Map
+	domains    *alosmap.TypedMap[string, *domainState]
 	mu         sync.Mutex
 	stopCh     chan struct{}
 	stopOnce   sync.Once
@@ -424,7 +424,7 @@ type ProxyEngine struct {
 // internally by Server.New — you typically don't need to call it directly.
 func NewProxyEngine() *ProxyEngine {
 	pe := &ProxyEngine{
-		domains: alosmap.New(alosmap.WithCapacity(64), alosmap.WithoutCleanup()),
+		domains: alosmap.NewTypedSized[string, *domainState](64, 0).Prealloc(256),
 		stopCh:  make(chan struct{}),
 	}
 	return pe
@@ -465,8 +465,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	if v, ok := pe.domains.Load(alosmap.S(cfg.Domain)); ok {
-		prev := v.(*domainState)
+	if prev, ok := pe.domains.Load(cfg.Domain); ok {
 		if prev.health != nil {
 			prev.health.stop()
 		}
@@ -501,7 +500,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 		ds.health.start()
 	}
 
-	pe.domains.Store(alosmap.S(cfg.Domain), ds)
+	pe.domains.Store(cfg.Domain, ds)
 
 	log.Printf("[PROXY] domain %s configured (%d backends, lb=%d)", cfg.Domain, len(backends), cfg.LoadBalancer)
 }
@@ -514,11 +513,10 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
-	v, ok := pe.domains.Load(alosmap.S(domain))
+	prev, ok := pe.domains.Load(domain)
 	if !ok {
 		return
 	}
-	prev := v.(*domainState)
 
 	if prev.health != nil {
 		prev.health.stop()
@@ -529,16 +527,16 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 		}
 	}
 
-	pe.domains.Delete(alosmap.S(domain))
+	pe.domains.Delete(domain)
 	log.Printf("[PROXY] domain %s removed", domain)
 }
 
 func (pe *ProxyEngine) Lookup(host string) *domainState {
-	v, ok := pe.domains.Load(alosmap.S(normalizeCertDomain(host)))
+	ds, ok := pe.domains.Load(normalizeCertDomain(host))
 	if !ok {
 		return nil
 	}
-	return v.(*domainState)
+	return ds
 }
 
 // Stop shuts down all health checkers and closes all idle backend connections
@@ -549,8 +547,7 @@ func (pe *ProxyEngine) Stop() {
 		if pe.Cache != nil {
 			pe.Cache.Stop()
 		}
-		pe.domains.Range(func(_ alosmap.Key, val any) bool {
-			ds := val.(*domainState)
+		pe.domains.Range(func(_ string, ds *domainState) bool {
 			if ds.health != nil {
 				ds.health.stop()
 			}
@@ -568,8 +565,8 @@ func (pe *ProxyEngine) Stop() {
 // The order is non-deterministic.
 func (pe *ProxyEngine) ListDomains() []string {
 	var out []string
-	pe.domains.Range(func(key alosmap.Key, _ any) bool {
-		out = append(out, key.StringVal())
+	pe.domains.Range(func(key string, _ *domainState) bool {
+		out = append(out, key)
 		return true
 	})
 	return out

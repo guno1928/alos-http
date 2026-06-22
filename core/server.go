@@ -226,7 +226,7 @@ func DefaultConfig() Config {
 }
 
 func newPerIPRequestLimiter() *perIPRequestLimiter {
-	l := &perIPRequestLimiter{m: alosmap.New(alosmap.WithoutCleanup())}
+	l := &perIPRequestLimiter{m: alosmap.NewTyped[string, *ipReqCounter]().Prealloc(256)}
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -237,8 +237,8 @@ func newPerIPRequestLimiter() *perIPRequestLimiter {
 						Dbg("[iplimiter sweep] recovered panic: %v", r)
 					}
 				}()
-				l.m.Range(func(key alosmap.Key, value any) bool {
-					if c, ok := value.(*ipReqCounter); ok && c.n.Load() <= 0 {
+				l.m.Range(func(key string, c *ipReqCounter) bool {
+					if c.n.Load() <= 0 {
 						l.m.Delete(key)
 					}
 					return true
@@ -253,11 +253,10 @@ func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
 		return true
 	}
-	v, ok := l.m.Load(alosmap.S(ip))
+	c, ok := l.m.Load(ip)
 	if !ok {
-		v, _ = l.m.LoadOrStore(alosmap.S(ip), &ipReqCounter{})
+		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
-	c := v.(*ipReqCounter)
 	for {
 		cur := c.n.Load()
 		if cur >= limit {
@@ -273,8 +272,7 @@ func (l *perIPRequestLimiter) release(ip string) {
 	if l == nil || ip == "" {
 		return
 	}
-	if v, ok := l.m.Load(alosmap.S(ip)); ok {
-		c := v.(*ipReqCounter)
+	if c, ok := l.m.Load(ip); ok {
 		if c.n.Add(-1) < 0 {
 			c.n.Add(1)
 		}
@@ -338,7 +336,7 @@ type ipReqCounter struct {
 }
 
 type perIPRequestLimiter struct {
-	m *alosmap.Map
+	m *alosmap.TypedMap[string, *ipReqCounter]
 }
 
 type plainRootFastResponse struct {
