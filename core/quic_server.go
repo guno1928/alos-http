@@ -3,7 +3,6 @@
 package core
 
 import (
-	"encoding/hex"
 	"log"
 	"net"
 	"sync"
@@ -44,7 +43,7 @@ func (s *Server) ListenAndServeQUIC() error {
 	log.Printf("=== ALOS QUIC Server (HTTP/3) ===")
 	log.Printf("Listening on %s (UDP, %d listener(s))", addr, len(listeners))
 
-	connMap := alosmap.NewTyped[string, *QUICConn]().Prealloc(256)
+	connMap := alosmap.NewTyped[[20]byte, *QUICConn]().Prealloc(256)
 
 	var wg sync.WaitGroup
 	for _, ln := range listeners {
@@ -65,7 +64,7 @@ func (s *Server) ListenAndServeQUIC() error {
 	return nil
 }
 
-func (s *Server) serveQUICListener(pc net.PacketConn, connMap *alosmap.TypedMap[string, *QUICConn]) {
+func (s *Server) serveQUICListener(pc net.PacketConn, connMap *quicConnMap) {
 	if udpConn, ok := pc.(*net.UDPConn); ok {
 		udpConn.SetReadBuffer(4 << 20)
 		udpConn.SetWriteBuffer(4 << 20)
@@ -90,7 +89,7 @@ func (s *Server) serveQUICListener(pc net.PacketConn, connMap *alosmap.TypedMap[
 	}
 }
 
-func (s *Server) handleQUICPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *alosmap.TypedMap[string, *QUICConn]) {
+func (s *Server) handleQUICPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *quicConnMap) {
 	if len(data) < 5 {
 		return
 	}
@@ -102,7 +101,7 @@ func (s *Server) handleQUICPacket(pc net.PacketConn, remoteAddr net.Addr, data [
 	}
 }
 
-func (s *Server) handleQUICLongPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *alosmap.TypedMap[string, *QUICConn]) {
+func (s *Server) handleQUICLongPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *quicConnMap) {
 	hdr, _, err := quicParseLongHeader(data)
 	if err != nil {
 		return
@@ -112,7 +111,7 @@ func (s *Server) handleQUICLongPacket(pc net.PacketConn, remoteAddr net.Addr, da
 		return
 	}
 
-	dcidKey := hex.EncodeToString(hdr.dcid)
+	dcidKey := quicCIDKey(hdr.dcid)
 
 	if hdr.pktType == quicPktInitial {
 		var qc *QUICConn
@@ -134,12 +133,12 @@ func (s *Server) handleQUICLongPacket(pc net.PacketConn, remoteAddr net.Addr, da
 	}
 }
 
-func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *alosmap.TypedMap[string, *QUICConn]) {
+func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, data []byte, connMap *quicConnMap) {
 	if len(data) < 1+quicConnIDLen {
 		return
 	}
 	dcid := data[1 : 1+quicConnIDLen]
-	dcidKey := hex.EncodeToString(dcid)
+	dcidKey := quicCIDKey(dcid)
 
 	qc, exists := connMap.Load(dcidKey)
 	if !exists {
@@ -148,7 +147,7 @@ func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, d
 	qc.handlePacket(data)
 }
 
-func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, scid []byte, connMap *alosmap.TypedMap[string, *QUICConn]) *QUICConn {
+func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, scid []byte, connMap *quicConnMap) *QUICConn {
 	if quicActiveConns.Load() >= quicMaxConns {
 		return nil
 	}
@@ -166,9 +165,9 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 
 	qc.tlsState = newQuicTLSState()
 
-	dcidKey := hex.EncodeToString(dcid)
+	dcidKey := quicCIDKey(dcid)
 	connMap.Store(dcidKey, qc)
-	srcCIDKey := hex.EncodeToString(qc.srcCID())
+	srcCIDKey := quicCIDKey(qc.srcCID())
 	connMap.Store(srcCIDKey, qc)
 
 	go qc.recvLoop()
@@ -177,14 +176,18 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	quicActiveConns.Add(1)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
-		log.Printf("[QUIC] new connection from %s dcid=%s scid=%s", remoteAddr, dcidKey, srcCIDKey)
+		log.Printf("[QUIC] new connection from %s dcid=%x scid=%x", remoteAddr, dcid, qc.srcCID())
 	}
 
+	origKey := quicCIDKey(qc.getOrigDstCID())
 	go func() {
 		<-qc.done
 		quicActiveConns.Add(-1)
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		if origKey != dcidKey {
+			connMap.Delete(origKey)
+		}
 	}()
 
 	return qc

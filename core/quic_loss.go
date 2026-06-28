@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -36,6 +37,9 @@ type quicLossState struct {
 	sent          [3][]quicSentPacket
 	bytesInFlight int
 
+	cwnd     uint64
+	ssthresh uint64
+
 	ptoCount     int
 	ptoTimerSet  bool
 	ptoDeadline  time.Time
@@ -46,6 +50,8 @@ func newQuicLossState() *quicLossState {
 		smoothedRTT: quicInitialRTT,
 		rttVar:      quicInitialRTT / 2,
 		minRTT:      0,
+		cwnd:        10 * quicMaxPacketSize,
+		ssthresh:    math.MaxUint64,
 	}
 	ls.largestAcked[0] = -1
 	ls.largestAcked[1] = -1
@@ -56,6 +62,9 @@ func newQuicLossState() *quicLossState {
 func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit bool, frames []byte) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
+	if len(ls.sent[space]) >= 4096 {
+		return
+	}
 	sp := quicSentPacket{
 		pn:        pn,
 		sent:      time.Now(),
@@ -107,6 +116,20 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 		ls.updateRTT(latestRTT, ackDelay)
 	}
 
+	var ackedInFlight uint64
+	for i := range ackedPackets {
+		if ackedPackets[i].inFlight {
+			ackedInFlight += uint64(ackedPackets[i].size)
+		}
+	}
+	if ackedInFlight > 0 {
+		if ls.cwnd < ls.ssthresh {
+			ls.cwnd += ackedInFlight
+		} else {
+			ls.cwnd += quicMaxPacketSize * ackedInFlight / ls.cwnd
+		}
+	}
+
 	lostFrames = ls.detectLost(space, lostFrames)
 
 	ls.ptoCount = 0
@@ -145,12 +168,14 @@ func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
 	}
 	cutoff := time.Now().Add(-lossDelay)
 
+	hadLoss := false
 	remaining := ls.sent[space][:0]
 	for i := range ls.sent[space] {
 		sp := &ls.sent[space][i]
 		if sp.pn < threshold || sp.sent.Before(cutoff) {
 			if sp.inFlight {
 				ls.bytesInFlight -= sp.size
+				hadLoss = true
 			}
 			if len(sp.frames) > 0 {
 				lostFrames = append(lostFrames, sp.frames)
@@ -160,6 +185,15 @@ func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
 		}
 	}
 	ls.sent[space] = remaining
+
+	if hadLoss {
+		ls.ssthresh = ls.cwnd / 2
+		if ls.ssthresh < 2*quicMaxPacketSize {
+			ls.ssthresh = 2 * quicMaxPacketSize
+		}
+		ls.cwnd = ls.ssthresh
+	}
+
 	return lostFrames
 }
 
@@ -200,6 +234,12 @@ func (ls *quicLossState) hasUnackedCrypto(space int) bool {
 		}
 	}
 	return false
+}
+
+func (ls *quicLossState) canSend() bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return uint64(ls.bytesInFlight) < ls.cwnd
 }
 
 func (ls *quicLossState) largestAckedPN(space int) int64 {

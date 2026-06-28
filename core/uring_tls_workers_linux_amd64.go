@@ -1174,7 +1174,7 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	}
 
 	conn.req.resetFastH1()
-	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok := ParseH1RequestHead(conn.appBuf, &conn.req)
+	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, ok := ParseH1RequestHead(conn.appBuf, &conn.req)
 	if !ok {
 		return tlsWorkerActionContinue, nil
 	}
@@ -1182,6 +1182,11 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	if badTransferEncoding {
 		conn.resp.Reset()
 		conn.resp.Status(400).String("Bad Request")
+		return worker.queueTLSResponse(conn, false, consumed)
+	}
+	if chunkedEncoding {
+		conn.resp.Reset()
+		conn.resp.Status(501).String("Not Implemented")
 		return worker.queueTLSResponse(conn, false, consumed)
 	}
 	if hasContentLength {

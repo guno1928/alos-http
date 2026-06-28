@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"io"
+	"log"
 	"net"
 	"sync"
 
@@ -197,18 +198,18 @@ func findCRLFBytes(buf []byte, start int) int {
 	return start + idx
 }
 
-func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, ok bool) {
+func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, ok bool) {
 	const maxHeaders = 128
 
 	idx := bytes.Index(data, crlfSlice)
 	if idx < 0 {
-		return 0, 0, false, false, false, false
+		return 0, 0, false, false, false, false, false
 	}
 
 	rl := data[:idx]
 	sp1 := bytes.IndexByte(rl, ' ')
 	if sp1 < 0 {
-		return 0, 0, false, false, false, false
+		return 0, 0, false, false, false, false, false
 	}
 	sp2 := bytes.IndexByte(rl[sp1+1:], ' ')
 	if sp2 >= 0 {
@@ -249,11 +250,11 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		remaining := data[pos:]
 		lineEndOff := bytes.Index(remaining, crlfSlice)
 		if lineEndOff < 0 {
-			return 0, 0, false, false, false, false
+			return 0, 0, false, false, false, false, false
 		}
 		nl := pos + lineEndOff
 		if nl == pos {
-			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, true
+			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true
 		}
 
 		line := data[pos:nl]
@@ -267,7 +268,7 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 			valStr := UnsafeString(val)
 			req.Headers = append(req.Headers, [2]string{name, valStr})
 			if len(req.Headers) > maxHeaders {
-				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, true
+				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true
 			}
 
 			switch colon {
@@ -333,7 +334,11 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 				if (name[0] == 'T' || name[0] == 't') && EqualFoldASCII(name, "Transfer-Encoding") {
 					req.cachedTE = valStr
 					req.headerCacheMask |= headerCacheTransferEncoding
-					badTransferEncoding = valStr != ""
+					if EqualFoldASCII(valStr, "chunked") {
+						chunkedEncoding = true
+					} else if valStr != "" {
+						badTransferEncoding = true
+					}
 				} else if (name[0] == 'S' || name[0] == 's') && EqualFoldASCII(name, "Sec-WebSocket-Key") {
 					req.cachedWSKey = valStr
 					req.headerCacheMask |= headerCacheWSKey
@@ -349,7 +354,7 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		pos = nl + 2
 	}
 
-	return 0, 0, false, false, false, false
+	return 0, 0, false, false, false, false, false
 }
 
 func appendPlainResponse(resp *Response, dst []byte) []byte {
@@ -459,6 +464,12 @@ func (hc *H2Conn) readAndValidatePrefacePlain() bool {
 }
 
 func (hc *H2Conn) writerLoopPlain() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[H2] writer panic: %v", r)
+			hc.conn.Close()
+		}
+	}()
 	var batch [writeRequestBatchSize]WriteRequest
 	batchBuf := make([]byte, 0, 16384)
 	for req := range hc.writeCh {

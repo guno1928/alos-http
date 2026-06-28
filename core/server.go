@@ -205,8 +205,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Addr:              ":8443",
-		ReadTimeout:       0,
-		WriteTimeout:      0,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		HandshakeTimeout:  30 * time.Second,
 		MaxBodySize:       0,
@@ -226,27 +226,46 @@ func DefaultConfig() Config {
 }
 
 func newPerIPRequestLimiter() *perIPRequestLimiter {
-	l := &perIPRequestLimiter{m: alosmap.NewTyped[string, *ipReqCounter]().Prealloc(256)}
+	l := &perIPRequestLimiter{
+		m:    alosmap.NewTyped[string, *ipReqCounter]().Prealloc(256),
+		done: make(chan struct{}),
+	}
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						Dbg("[iplimiter sweep] recovered panic: %v", r)
-					}
+		for {
+			select {
+			case <-ticker.C:
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							Dbg("[iplimiter sweep] recovered panic: %v", r)
+						}
+					}()
+					l.m.Range(func(key string, c *ipReqCounter) bool {
+						if c.n.Load() <= 0 {
+							l.m.Delete(key)
+						}
+						return true
+					})
 				}()
-				l.m.Range(func(key string, c *ipReqCounter) bool {
-					if c.n.Load() <= 0 {
-						l.m.Delete(key)
-					}
-					return true
-				})
-			}()
+			case <-l.done:
+				return
+			}
 		}
 	}()
 	return l
+}
+
+func (l *perIPRequestLimiter) Stop() {
+	if l == nil {
+		return
+	}
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
 }
 
 func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
@@ -336,7 +355,8 @@ type ipReqCounter struct {
 }
 
 type perIPRequestLimiter struct {
-	m *alosmap.TypedMap[string, *ipReqCounter]
+	m    *alosmap.TypedMap[string, *ipReqCounter]
+	done chan struct{}
 }
 
 type plainRootFastResponse struct {
@@ -835,6 +855,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 		if s.RateLimit != nil {
 			s.RateLimit.Stop()
+		}
+		if s.perIPLimiter != nil {
+			s.perIPLimiter.Stop()
 		}
 		for _, ln := range s.listeners {
 			ln.Close()

@@ -72,7 +72,7 @@ func (r *h3FrameReader) next() (frameType uint64, payload []byte, ok bool) {
 		return 0, nil, false
 	}
 	r.off += n
-	if r.off+int(fLen) > len(r.data) {
+	if fLen > uint64(len(r.data)-r.off) {
 		return 0, nil, false
 	}
 	payload = r.data[r.off : r.off+int(fLen)]

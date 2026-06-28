@@ -158,8 +158,11 @@ func quicBuildLongHeader(dst []byte, pktType byte, version uint32, dcid, scid, t
 	return dst
 }
 
-func quicBuildShortHeader(dst []byte, dcid []byte, pn uint64, pnLen int) []byte {
+func quicBuildShortHeader(dst []byte, dcid []byte, pn uint64, pnLen int, keyPhase uint32) []byte {
 	first := quicFixedBit | byte(pnLen-1)
+	if keyPhase == 1 {
+		first |= 0x04
+	}
 	dst = append(dst, first)
 	dst = append(dst, dcid...)
 	pnOff := len(dst)
@@ -231,11 +234,11 @@ func quicBuildHandshakePacket(dst []byte, dcid, scid, payload []byte, pn uint64,
 	return dst
 }
 
-func quicBuildShortPacket(dst []byte, dcid, payload []byte, pn uint64, largestAcked int64, keys *quicKeys) []byte {
+func quicBuildShortPacket(dst []byte, dcid, payload []byte, pn uint64, largestAcked int64, keys *quicKeys, keyPhase uint32) []byte {
 	truncatedPN, pnLen := quicEncodePacketNumber(pn, largestAcked)
 
 	headerStart := len(dst)
-	dst = quicBuildShortHeader(dst, dcid, truncatedPN, pnLen)
+	dst = quicBuildShortHeader(dst, dcid, truncatedPN, pnLen, keyPhase)
 
 	pnOffset := headerStart + 1 + len(dcid)
 

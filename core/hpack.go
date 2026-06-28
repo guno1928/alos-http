@@ -475,7 +475,7 @@ const (
 type hpackHuffmanDecodeCacheEntry struct {
 	used   bool
 	hash   uint64
-	size   uint16
+	size   uint32
 	value  string
 	heap   []byte
 	inline [hpackHuffmanDecodeInlineMax]byte
@@ -511,7 +511,7 @@ func (e *hpackHuffmanDecodeCacheEntry) match(hash uint64, data []byte) bool {
 func (e *hpackHuffmanDecodeCacheEntry) store(hash uint64, data []byte, value string) {
 	e.used = true
 	e.hash = hash
-	e.size = uint16(len(data))
+	e.size = uint32(len(data))
 	e.value = value
 	if len(data) <= len(e.inline) {
 		copy(e.inline[:], data)

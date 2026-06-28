@@ -136,6 +136,20 @@ func validateJWT(token string, secret []byte) (map[string]any, bool) {
 		return nil, false
 	}
 
+	headerBytes, err := base64.RawURLEncoding.DecodeString(headerPart)
+	if err != nil {
+		return nil, false
+	}
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	if err := sonic.Unmarshal(headerBytes, &header); err != nil {
+		return nil, false
+	}
+	if header.Alg != "HS256" {
+		return nil, false
+	}
+
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(token[:secondDot]))
 	expectedSig := mac.Sum(nil)

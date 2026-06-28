@@ -433,7 +433,7 @@ func (p *quicFrameParser) parseACK(ecn bool) (quicAckFrame, error) {
 		return f, ErrTruncated
 	}
 	if rangeCount > 0 {
-		if rangeCount > uint64(p.remaining()) {
+		if rangeCount > 256 || rangeCount > uint64(p.remaining()) {
 			return f, ErrTruncated
 		}
 		f.ranges = make([]quicAckRange, rangeCount)

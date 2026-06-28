@@ -653,7 +653,7 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		}
 
 		conn.req.resetFastH1()
-		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, ok := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req)
+		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, ok := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req)
 		if !ok {
 			return worker.queueRead(conn)
 		}
@@ -661,6 +661,11 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		if badTransferEncoding {
 			conn.resp.Reset()
 			conn.resp.Status(400).String("Bad Request")
+			return worker.queueResponse(conn, false, consumed)
+		}
+		if chunkedEncoding {
+			conn.resp.Reset()
+			conn.resp.Status(501).String("Not Implemented")
 			return worker.queueResponse(conn, false, consumed)
 		}
 		if hasContentLength {

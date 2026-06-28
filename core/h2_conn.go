@@ -46,13 +46,21 @@ type H2Conn struct {
 	pendingConnWindow atomic.Uint32
 	activeStreams     atomic.Int32
 	rstStreamCount    atomic.Uint32
+	rstWindowStart    atomic.Int64
+	pingCount         atomic.Uint32
+	settingsCount     atomic.Uint32
 	flowMu            sync.Mutex
 	flowCond          *sync.Cond
 
 	recvConnWindow atomic.Int64
 }
 
-const h2MaxResetStreams uint32 = 200
+const (
+	h2MaxResetStreams    uint32 = 50
+	h2RstWindowDuration int64  = 10_000_000_000
+	h2MaxPingCount      uint32 = 100
+	h2MaxSettingsCount  uint32 = 200
+)
 
 func appendWriteBatch(dst []byte, batch [writeRequestBatchSize]WriteRequest, n int) []byte {
 	totalLen := 0
@@ -156,6 +164,12 @@ func (hc *H2Conn) writerLoop() {
 		hc.writerLoopPlain()
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[H2] writer panic: %v", r)
+			hc.conn.Close()
+		}
+	}()
 	var batch [writeRequestBatchSize]WriteRequest
 	batchBuf := make([]byte, 0, 16384)
 	for req := range hc.writeCh {
@@ -401,7 +415,12 @@ func (hc *H2Conn) consumeFrame() (*H2Frame, error) {
 }
 
 func (hc *H2Conn) serveLoop() {
+	idleTimeout := hc.server.config.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 120 * time.Second
+	}
 	for {
+		hc.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		frame, err := hc.consumeFrame()
 		if err != nil {
 			Dbg("[H2] %s serve loop exit: %v (streams=%d)", hc.remoteAddr, err, hc.activeStreams.Load())
@@ -449,6 +468,10 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 		}
 		if len(f.Payload)%6 != 0 {
 			hc.sendGoAway(H2ErrFrameSize)
+			return
+		}
+		if hc.settingsCount.Add(1) > h2MaxSettingsCount {
+			hc.conn.Close()
 			return
 		}
 		hc.processSettings(f.Payload)
@@ -503,6 +526,10 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 			return
 		}
 		if f.Flags&H2FlagAck == 0 {
+			if hc.pingCount.Add(1) > h2MaxPingCount {
+				hc.conn.Close()
+				return
+			}
 			var pingData [8]byte
 			copy(pingData[:], f.Payload[:8])
 			pong := H2WritePing(nil, true, pingData)
@@ -525,7 +552,12 @@ func (hc *H2Conn) handleFrame(f *H2Frame) {
 				stream.Reset()
 				StreamPool.Put(stream)
 			}
-			if hc.rstStreamCount.Add(1) > h2MaxResetStreams {
+			now := CoarseNanotime()
+			windowStart := hc.rstWindowStart.Load()
+			if now-windowStart > h2RstWindowDuration {
+				hc.rstStreamCount.Store(1)
+				hc.rstWindowStart.Store(now)
+			} else if hc.rstStreamCount.Add(1) > h2MaxResetStreams {
 				hc.sendGoAway(H2ErrEnhanceYourCalm)
 				return
 			}
@@ -848,7 +880,9 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 			hc.sendWindowUpdate(0, connUpdate)
 		}
 	}
-	hc.sendWindowUpdate(f.StreamID, connConsumed)
+	if maxBody <= 0 || int64(len(stream.Body)) < maxBody {
+		hc.sendWindowUpdate(f.StreamID, connConsumed)
+	}
 
 	if f.Flags&H2FlagEndStream != 0 {
 		stream.State.Store(StreamHalfClosed)
@@ -863,6 +897,17 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 
 func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	defer hc.dispatchWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[H2] panic on stream %d: %v", stream.ID, r)
+			hc.enqueueWrite(H2WriteRSTStream(nil, stream.ID, H2ErrInternal))
+			stream.State.Store(StreamClosed)
+			hc.streams.Delete(int64(stream.ID))
+			hc.activeStreams.Add(-1)
+			stream.Reset()
+			StreamPool.Put(stream)
+		}
+	}()
 	Stats.TotalReqs.Add(1)
 	if hc.server.logRequests.Load() {
 		log.Printf("[H2] stream %d: %s %s", stream.ID, stream.Method, stream.Path)

@@ -221,6 +221,20 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 	qc.keys[quicSpaceAppData] = clientAppKeys
 	qc.sendKeys[quicSpaceAppData] = serverAppKeys
 
+	qc.recvSecret = make([]byte, len(clientAppSecret))
+	copy(qc.recvSecret, clientAppSecret)
+	qc.sendSecret = make([]byte, len(serverAppSecret))
+	copy(qc.sendSecret, serverAppSecret)
+	qc.appSuite = suite
+	qc.origHP = clientAppKeys.hp
+
+	nextRecvSecret := quicDeriveNextTrafficSecret(suite.HashFn, clientAppSecret, suite.HashLen)
+	nextRecvKeys, _ := quicDeriveKeys(suite.HashFn, nextRecvSecret, suite)
+	if nextRecvKeys != nil {
+		nextRecvKeys.hp = clientAppKeys.hp
+		qc.nextRecvKeys = nextRecvKeys
+	}
+
 	ts.stage = quicTLSStageWaitFinished
 
 	if debugFlag.Load() { log.Printf("[QUIC-TLS] server handshake flight sent, waiting for client Finished") }
@@ -315,6 +329,7 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 	ts.transcript.Write(data[:4+msgLen])
 	ts.stage = quicTLSStageDone
 	qc.handshakeDone.Store(true)
+	qc.addressValidated.Store(true)
 	qc.keys[quicSpaceHandshake] = nil
 
 	var frames []byte

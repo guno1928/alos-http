@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -85,12 +86,19 @@ const (
 const wsStatusProtocolError uint16 = 1002
 const wsStatusInvalidPayload uint16 = 1007
 const wsDefaultReadTimeout = 120 * time.Second
+const wsDefaultWriteTimeout = 30 * time.Second
+const wsDefaultMaxMessageSize = 4 * 1024 * 1024
 
 // WSConn is a server-side WebSocket connection (RFC 6455). Obtain one with ServeWebSocket (or UpgradeWebSocket) inside a route handler, then exchange data with ReadMessage and WriteMessage (or WriteText / WriteBinary).
 type WSConn struct {
-	conn        net.Conn
-	closed      atomic.Bool
-	readTimeout time.Duration
+	conn           net.Conn
+	closed         atomic.Bool
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	writeMu        sync.Mutex
+	lastPing       atomic.Int64
+	pingCount      atomic.Uint32
+	MaxMessageSize int
 }
 
 func wsAcceptKey(clientKey string) string {
@@ -175,7 +183,7 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		resp.SetStreamer(sw)
 	}
 
-	return &WSConn{conn: conn, readTimeout: wsDefaultReadTimeout}
+	return &WSConn{conn: conn, readTimeout: wsDefaultReadTimeout, writeTimeout: wsDefaultWriteTimeout, MaxMessageSize: wsDefaultMaxMessageSize}
 }
 
 // ServeWebSocket upgrades the request and runs fn on a new goroutine, returning immediately so the dispatching worker is released; the connection is closed when fn returns. It reports false if the upgrade failed (an error response has already been written). This is the safe way to host a WebSocket — see the UpgradeWebSocket note about handlers that block on the socket.
@@ -256,6 +264,18 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 				return opcode, payload, io.EOF
 			}
 			if opcode == wsOpPing {
+				now := time.Now().UnixNano()
+				last := ws.lastPing.Swap(now)
+				if last != 0 && now-last < int64(100*time.Millisecond) {
+					ws.closeWithStatus(wsStatusProtocolError)
+					return 0, nil, ErrWebSocketProtocol
+				}
+				if last == 0 || now-last > int64(10*time.Second) {
+					ws.pingCount.Store(1)
+				} else if ws.pingCount.Add(1) > 100 {
+					ws.closeWithStatus(wsStatusProtocolError)
+					return 0, nil, ErrWebSocketProtocol
+				}
 				ws.WriteMessage(wsOpPong, payload)
 			}
 			continue
@@ -280,7 +300,7 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 		}
 		assembled = append(assembled, payload...)
 
-		if int64(len(assembled)) > 16*1024*1024 {
+		if int64(len(assembled)) > ws.maxMessageSize() {
 			ws.Close()
 			return 0, nil, ErrBodyTooLarge
 		}
@@ -337,7 +357,7 @@ func (ws *WSConn) readFramePayload(secondByte byte, masked bool) ([]byte, error)
 		}
 	}
 
-	if payloadLen > 16*1024*1024 {
+	if payloadLen > ws.maxMessageSize() {
 		ws.Close()
 		return nil, ErrBodyTooLarge
 	}
@@ -368,6 +388,9 @@ func (ws *WSConn) readFramePayload(secondByte byte, masked bool) ([]byte, error)
 // Example: ws.WriteMessage(0x1, []byte("hi"))
 // Example: ws.WriteMessage(0x2, payload)
 func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
 	payloadLen := len(data)
 	var header [10]byte
 	header[0] = 0x80 | opcode
@@ -398,7 +421,11 @@ func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
 	buf := (*bp)[:0]
 	buf = append(buf, header[:n]...)
 	buf = append(buf, data...)
+	if ws.writeTimeout > 0 {
+		ws.conn.SetWriteDeadline(time.Now().Add(ws.writeTimeout))
+	}
 	err := writeFull(ws.conn, buf)
+	ws.conn.SetWriteDeadline(time.Time{})
 	*bp = buf[:0]
 	MediumBufPool.Put(bp)
 	return err
@@ -448,6 +475,17 @@ func (ws *WSConn) SetDeadline(t time.Time) error {
 // Example: ws.SetReadTimeout(0)
 func (ws *WSConn) SetReadTimeout(d time.Duration) {
 	ws.readTimeout = d
+}
+
+func (ws *WSConn) SetWriteTimeout(d time.Duration) {
+	ws.writeTimeout = d
+}
+
+func (ws *WSConn) maxMessageSize() int64 {
+	if ws.MaxMessageSize <= 0 {
+		return int64(wsDefaultMaxMessageSize)
+	}
+	return int64(ws.MaxMessageSize)
 }
 
 func containsTokenFold(header, token string) bool {

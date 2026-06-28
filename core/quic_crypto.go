@@ -140,6 +140,10 @@ func quicDeriveInitialKeys(dcid []byte) (client, server *quicKeys, err error) {
 	return client, server, nil
 }
 
+func quicDeriveNextTrafficSecret(h func() hash.Hash, currentSecret []byte, hashLen int) []byte {
+	return TLSExpandLabel(h, currentSecret, "quic ku", nil, hashLen)
+}
+
 func quicDeriveHandshakeKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*quicKeys, error) {
 	return quicDeriveKeys(h, secret, cs)
 }
@@ -204,8 +208,8 @@ func (qk *quicKeys) removeHeaderProtection(packet []byte, pnOffset int) (pnLen i
 	return pnLen
 }
 
-func quicDecodePacketNumber(truncated uint64, truncatedLen int, largestAcked int64) uint64 {
-	expectedPN := uint64(largestAcked + 1)
+func quicDecodePacketNumber(truncated uint64, truncatedLen int, largestRecvPN int64) uint64 {
+	expectedPN := uint64(largestRecvPN + 1)
 	pnWin := uint64(1) << (uint(truncatedLen) * 8)
 	pnHalf := pnWin / 2
 	pnMask := pnWin - 1
