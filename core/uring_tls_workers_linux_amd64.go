@@ -1345,10 +1345,6 @@ func (worker *tlsUringWorker) fillAccepts(now int64) error {
 	if worker.server.doneClosed() || worker.listenerFD < 0 {
 		return nil
 	}
-	retryAt := atomic.LoadInt64(&worker.nextAcceptRetry)
-	if retryAt != 0 && now < retryAt {
-		return nil
-	}
 	if worker.useMultishotAccept {
 		if worker.acceptArmed {
 			return nil
@@ -1357,6 +1353,10 @@ func (worker *tlsUringWorker) fillAccepts(now int64) error {
 			return err
 		}
 		worker.acceptArmed = true
+		return nil
+	}
+	retryAt := atomic.LoadInt64(&worker.nextAcceptRetry)
+	if retryAt != 0 && now < retryAt {
 		return nil
 	}
 	target := worker.acceptDepthTarget()
