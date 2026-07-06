@@ -293,10 +293,8 @@ func (worker *plainUringWorker) initConnectionSlot(index int, nextFree int32) {
 	conn.index = int32(index)
 	conn.fd = -1
 	conn.req.Headers = make([][2]string, 0, 16)
-	conn.req.Body = make([]byte, 0, 1024)
 	conn.req.Proto = "HTTP/1.1"
 	conn.resp.Headers = make([][2]string, 0, 8)
-	conn.resp.body = make([]byte, 0, 4096)
 	conn.nextFree = nextFree
 }
 
@@ -597,6 +595,9 @@ func (worker *plainUringWorker) handleBufferedRead(conn *plainWorkerConn, result
 	conn.lastActive = now
 	conn.readPollFirst = flags&ioUringCqeSockNonEmpty == 0
 	n := int(result)
+	if conn.readBuf == nil {
+		conn.readBuf = acquirePooledBuf(&connReadBufPool)
+	}
 	maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
 	if !worker.ensureReadCapacity(conn, n, maxRead) {
 		return worker.closeConnection(conn)
@@ -952,8 +953,17 @@ func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32,
 	}
 	if conn.protocol != plainConnProtoH2 {
 		worker.releaseIdleWriteBuf(conn)
+		worker.releaseIdleReadBuf(conn)
 	}
 	return worker.queueRead(conn)
+}
+
+func (worker *plainUringWorker) releaseIdleReadBuf(conn *plainWorkerConn) {
+	if worker.recvBufs == nil || conn.readN != 0 {
+		return
+	}
+	releasePooledBuf(&connReadBufPool, conn.readBuf, connBufPoolMaxCap)
+	conn.readBuf = nil
 }
 
 func (worker *plainUringWorker) releaseIdleWriteBuf(conn *plainWorkerConn) {
@@ -1038,11 +1048,8 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	conn.readArmed = false
 	conn.readPollFirst = false
 	conn.h2.reset()
-	if conn.readBuf == nil {
+	if worker.recvBufs == nil && conn.readBuf == nil {
 		conn.readBuf = acquirePooledBuf(&connReadBufPool)
-	}
-	if conn.writeBuf == nil {
-		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
 	}
 	if !worker.server.tryTrackConn() {
 		_ = syscall.Close(fd)

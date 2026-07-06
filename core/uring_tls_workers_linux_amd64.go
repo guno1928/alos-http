@@ -376,10 +376,8 @@ func (worker *tlsUringWorker) initConnectionSlot(index int, nextFree int32) {
 	conn.index = int32(index)
 	conn.fd = -1
 	conn.req.Headers = make([][2]string, 0, 16)
-	conn.req.Body = make([]byte, 0, 1024)
 	conn.req.Proto = "HTTP/1.1"
 	conn.resp.Headers = make([][2]string, 0, 8)
-	conn.resp.body = make([]byte, 0, 4096)
 	conn.nextFree = nextFree
 }
 
