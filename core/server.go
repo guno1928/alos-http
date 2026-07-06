@@ -172,6 +172,7 @@ type Config struct {
 	MaxHeaderSize     int
 	MaxRequestsPerIP  int64
 	MaxConcurrentReqs int64
+	MaxConns          int64
 
 	TLSCertFile   string
 	TLSKeyFile    string
@@ -658,8 +659,12 @@ func (s *Server) tryTrackConn() bool {
 	if s.shuttingDown.Load() {
 		return false
 	}
-	s.activeConns.Add(1)
+	n := s.activeConns.Add(1)
 	if s.shuttingDown.Load() {
+		s.releaseTrackedConn()
+		return false
+	}
+	if limit := s.config.MaxConns; limit > 0 && n > limit {
 		s.releaseTrackedConn()
 		return false
 	}

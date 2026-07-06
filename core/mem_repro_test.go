@@ -4,9 +4,35 @@ package core
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 	"unsafe"
 )
+
+// TestSplitSendAvoidsBodyCopy proves the per-connection write buffer no longer
+// holds the response body: appendPlainResponseHeaders emits only the header block
+// (a few hundred bytes) regardless of body size, and the body is referenced
+// zero-copy from the response's own bytes (no per-connection duplication).
+func TestSplitSendAvoidsBodyCopy(t *testing.T) {
+	const bodyLen = 130 << 10
+	body := strings.Repeat("A", bodyLen)
+	resp := &Response{}
+	resp.HTML(body)
+
+	hdr := appendPlainResponseHeaders(resp, nil)
+	if len(hdr) > 512 {
+		t.Fatalf("header buffer is %d bytes — body leaked into the per-connection writeBuf", len(hdr))
+	}
+	bb := resp.transmittedBodyBytes()
+	if len(bb) != bodyLen {
+		t.Fatalf("transmitted body len = %d, want %d", len(bb), bodyLen)
+	}
+	if unsafe.Pointer(&bb[0]) != unsafe.Pointer(unsafe.StringData(body)) {
+		t.Fatalf("body was COPIED, not referenced zero-copy")
+	}
+	t.Logf("header buffer = %d bytes (was headers+%d KB body); body sent zero-copy from resp", len(hdr), bodyLen>>10)
+	t.Logf("=> per-connection write memory for a %d KB response: %d B instead of ~%d KB", bodyLen>>10, len(hdr), (len(hdr)+bodyLen)>>10)
+}
 
 func retainedHeapInuse() uint64 {
 	for i := 0; i < 3; i++ {

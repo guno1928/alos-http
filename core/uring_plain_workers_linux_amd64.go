@@ -38,6 +38,8 @@ const (
 	plainReadMinFree       = 4096
 	plainRecvBufRingSize   = 512
 	plainRecvBufSize       = 4096
+
+	splitSendMinBody = 16 << 10
 )
 
 var errPlainWorkerPark = errors.New("plain worker park")
@@ -70,6 +72,9 @@ type plainWorkerConn struct {
 	protocol      uint8
 	readBuf       []byte
 	writeBuf      []byte
+	bodyBuf       []byte
+	bodySent      int
+	writingBody   bool
 	req           Request
 	resp          Response
 	consumed      int
@@ -837,20 +842,29 @@ func (worker *plainUringWorker) queueResponse(conn *plainWorkerConn, keepAlive b
 	conn.keepAlive = keepAlive
 	conn.closeAfter = !keepAlive
 	conn.consumed = consumed
-	base := conn.writeBuf[:0]
 	if conn.writeBorrowed {
-		base = nil
 		conn.writeBorrowed = false
+		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
+	} else if conn.writeBuf == nil {
+		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
 	}
-	buf := appendPlainResponse(&conn.resp, base)
-	conn.writeBuf = buf
-	conn.writeN = len(buf)
+	base := conn.writeBuf[:0]
+	if conn.resp.transmittedBodyLen() <= splitSendMinBody {
+		conn.writeBuf = appendPlainResponse(&conn.resp, base)
+		conn.bodyBuf = nil
+	} else {
+		conn.writeBuf = appendPlainResponseHeaders(&conn.resp, base)
+		conn.bodyBuf = conn.resp.transmittedBodyBytes()
+	}
+	conn.writeN = len(conn.writeBuf)
 	conn.writeSent = 0
+	conn.bodySent = 0
+	conn.writingBody = false
 	worker.compactReadBuffer(conn, consumed)
 	if conn.writeN == 0 {
 		return worker.closeConnection(conn)
 	}
-	conn.writeZeroCopy = worker.shouldUseZeroCopySend(conn)
+	conn.writeZeroCopy = false
 	conn.state = plainConnStateWriting
 	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN]); err != nil {
 		return worker.closeConnection(conn)
@@ -866,6 +880,9 @@ func (worker *plainUringWorker) queuePrebuiltResponse(conn *plainWorkerConn, pay
 	conn.writeBuf = payload
 	conn.writeN = len(payload)
 	conn.writeSent = 0
+	conn.bodyBuf = nil
+	conn.bodySent = 0
+	conn.writingBody = false
 	worker.compactReadBuffer(conn, consumed)
 	if conn.writeN == 0 {
 		return worker.closeConnection(conn)
@@ -878,18 +895,23 @@ func (worker *plainUringWorker) queuePrebuiltResponse(conn *plainWorkerConn, pay
 	return nil
 }
 
+func (worker *plainUringWorker) currentWriteChunk(conn *plainWorkerConn) []byte {
+	if conn.writingBody {
+		return conn.bodyBuf[conn.bodySent:]
+	}
+	return conn.writeBuf[conn.writeSent:conn.writeN]
+}
+
 func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32, flags uint32, now int64) error {
 	if result < 0 {
 		err := syscall.Errno(-result)
 		if conn.writeZeroCopy && (errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EOPNOTSUPP)) {
 			worker.ring.markSendZCUnsupported()
 			conn.writeZeroCopy = false
-			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-			return worker.queueWrite(conn, remaining)
+			return worker.queueWrite(conn, worker.currentWriteChunk(conn))
 		}
 		if isIOUringTransient(err) {
-			remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-			return worker.queueWrite(conn, remaining)
+			return worker.queueWrite(conn, worker.currentWriteChunk(conn))
 		}
 		return worker.closeConnection(conn)
 	}
@@ -898,13 +920,26 @@ func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32,
 		worker.ring.markSendZCSupported()
 	}
 	conn.lastActive = now
-	conn.writeSent += int(result)
-	if conn.writeSent < conn.writeN {
-		remaining := conn.writeBuf[conn.writeSent:conn.writeN]
-		return worker.queueWrite(conn, remaining)
-	}
-	if conn.protocol == plainConnProtoH2 {
-		conn.writeBuf = conn.writeBuf[:0]
+	if conn.writingBody {
+		conn.bodySent += int(result)
+		if conn.bodySent < len(conn.bodyBuf) {
+			return worker.queueWrite(conn, conn.bodyBuf[conn.bodySent:])
+		}
+		conn.writingBody = false
+		conn.bodyBuf = nil
+	} else {
+		conn.writeSent += int(result)
+		if conn.writeSent < conn.writeN {
+			return worker.queueWrite(conn, conn.writeBuf[conn.writeSent:conn.writeN])
+		}
+		if conn.protocol == plainConnProtoH2 {
+			conn.writeBuf = conn.writeBuf[:0]
+		}
+		if len(conn.bodyBuf) > 0 {
+			conn.writingBody = true
+			conn.bodySent = 0
+			return worker.queueWrite(conn, conn.bodyBuf)
+		}
 	}
 	if conn.closeAfter {
 		return worker.closeConnection(conn)
@@ -915,7 +950,20 @@ func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32,
 		}
 		return worker.processRequests(conn)
 	}
+	if conn.protocol != plainConnProtoH2 {
+		worker.releaseIdleWriteBuf(conn)
+	}
 	return worker.queueRead(conn)
+}
+
+func (worker *plainUringWorker) releaseIdleWriteBuf(conn *plainWorkerConn) {
+	if conn.writeBorrowed {
+		conn.writeBorrowed = false
+		conn.writeBuf = nil
+		return
+	}
+	releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
+	conn.writeBuf = nil
 }
 
 func (worker *plainUringWorker) handleWriteNotification(conn *plainWorkerConn) error {
@@ -1113,6 +1161,9 @@ func (worker *plainUringWorker) recycleConnection(conn *plainWorkerConn) {
 	releasePooledBuf(&connBodyBufPool, conn.resp.body, connBufPoolMaxCap)
 	conn.resp.body = nil
 	conn.req.Body = nil
+	conn.bodyBuf = nil
+	conn.bodySent = 0
+	conn.writingBody = false
 }
 
 func (worker *plainUringWorker) shouldUseZeroCopySend(conn *plainWorkerConn) bool {

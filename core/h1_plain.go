@@ -361,6 +361,10 @@ func appendPlainResponse(resp *Response, dst []byte) []byte {
 	return appendPlainResponseMode(resp, dst, true, true)
 }
 
+func appendPlainResponseHeaders(resp *Response, dst []byte) []byte {
+	return appendPlainResponseMode(resp, dst, true, false)
+}
+
 var crlfcrlf = [4]byte{13, 10, 13, 10}
 
 func findRequestEnd(data []byte) int {
