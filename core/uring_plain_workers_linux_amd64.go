@@ -991,10 +991,10 @@ func (worker *plainUringWorker) attachAccepted(fd int, now int64) error {
 	conn.readPollFirst = false
 	conn.h2.reset()
 	if conn.readBuf == nil {
-		conn.readBuf = make([]byte, 0, 8192)
+		conn.readBuf = acquirePooledBuf(&connReadBufPool)
 	}
 	if conn.writeBuf == nil {
-		conn.writeBuf = make([]byte, 0, 16384)
+		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
 	}
 	if !worker.server.tryTrackConn() {
 		_ = syscall.Close(fd)
@@ -1102,13 +1102,17 @@ func (worker *plainUringWorker) recycleConnection(conn *plainWorkerConn) {
 	conn.h2.reset()
 	conn.req.resetFastH1()
 	conn.resp.resetFastH1()
-	conn.readBuf = shrinkBuffer(conn.readBuf, 8192)
+	releasePooledBuf(&connReadBufPool, conn.readBuf, connBufPoolMaxCap)
+	conn.readBuf = nil
 	if conn.writeBorrowed {
 		conn.writeBorrowed = false
-		conn.writeBuf = nil
 	} else {
-		conn.writeBuf = shrinkBuffer(conn.writeBuf, 16384)
+		releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
 	}
+	conn.writeBuf = nil
+	releasePooledBuf(&connBodyBufPool, conn.resp.body, connBufPoolMaxCap)
+	conn.resp.body = nil
+	conn.req.Body = nil
 }
 
 func (worker *plainUringWorker) shouldUseZeroCopySend(conn *plainWorkerConn) bool {

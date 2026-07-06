@@ -1479,16 +1479,16 @@ func (worker *tlsUringWorker) tryAttachAccepted(fd int, now int64) (bool, error)
 	conn.expectedFinN = 0
 	conn.bridge = nil
 	if conn.readBuf == nil {
-		conn.readBuf = make([]byte, 0, 8192)
+		conn.readBuf = acquirePooledBuf(&connReadBufPool)
 	}
 	if conn.appBuf == nil {
-		conn.appBuf = make([]byte, 0, 8192)
+		conn.appBuf = acquirePooledBuf(&connReadBufPool)
 	}
 	if conn.plainBuf == nil {
-		conn.plainBuf = make([]byte, 0, 16384)
+		conn.plainBuf = acquirePooledBuf(&connWriteBufPool)
 	}
 	if conn.writeBuf == nil {
-		conn.writeBuf = make([]byte, 0, 16384)
+		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
 	}
 	if conn.innerScratch == nil {
 		conn.innerScratch = make([]byte, 0, MaxRecordPayload)
@@ -1647,11 +1647,18 @@ func (worker *tlsUringWorker) recycleConnection(conn *tlsWorkerConn) {
 	conn.h2.reset()
 	conn.req.Reset()
 	conn.resp.Reset()
-	conn.readBuf = shrinkBuffer(conn.readBuf, 8192)
-	conn.appBuf = shrinkBuffer(conn.appBuf, 8192)
-	conn.plainBuf = shrinkBuffer(conn.plainBuf, 16384)
-	conn.writeBuf = shrinkBuffer(conn.writeBuf, 16384)
-	conn.innerScratch = conn.innerScratch[:0]
+	conn.req.Body = nil
+	releasePooledBuf(&connReadBufPool, conn.readBuf, connBufPoolMaxCap)
+	conn.readBuf = nil
+	releasePooledBuf(&connReadBufPool, conn.appBuf, connBufPoolMaxCap)
+	conn.appBuf = nil
+	releasePooledBuf(&connWriteBufPool, conn.plainBuf, connBufPoolMaxCap)
+	conn.plainBuf = nil
+	releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
+	conn.writeBuf = nil
+	releasePooledBuf(&connBodyBufPool, conn.resp.body, connBufPoolMaxCap)
+	conn.resp.body = nil
+	conn.innerScratch = nil
 }
 
 func (worker *tlsUringWorker) shouldUseZeroCopySend(conn *tlsWorkerConn) bool {

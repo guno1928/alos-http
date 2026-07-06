@@ -91,3 +91,35 @@ var H2FramePool = sync.Pool{
 var BufReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 65536) },
 }
+
+const (
+	connReadBufDefaultCap  = 8192
+	connWriteBufDefaultCap = 16384
+	connBodyBufDefaultCap  = 4096
+	connBufPoolMaxCap      = 256 << 10
+)
+
+var connReadBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, connReadBufDefaultCap); return &b },
+}
+
+var connWriteBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, connWriteBufDefaultCap); return &b },
+}
+
+var connBodyBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, connBodyBufDefaultCap); return &b },
+}
+
+func acquirePooledBuf(pool *sync.Pool) []byte {
+	bp := pool.Get().(*[]byte)
+	return (*bp)[:0]
+}
+
+func releasePooledBuf(pool *sync.Pool, buf []byte, maxCap int) {
+	if cap(buf) == 0 || cap(buf) > maxCap {
+		return
+	}
+	b := buf[:0]
+	pool.Put(&b)
+}
