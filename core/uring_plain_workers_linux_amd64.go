@@ -939,6 +939,8 @@ func (worker *plainUringWorker) handleWrite(conn *plainWorkerConn, result int32,
 		if len(conn.bodyBuf) > 0 {
 			conn.writingBody = true
 			conn.bodySent = 0
+			worker.releaseIdleWriteBuf(conn)
+			worker.releaseIdleReadBuf(conn)
 			return worker.queueWrite(conn, conn.bodyBuf)
 		}
 	}
