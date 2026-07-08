@@ -125,7 +125,7 @@ type tlsUringWorker struct {
 	connections        []tlsWorkerConn
 	freeHead           int32
 	completions        [ioUringCompletionBatchSize]ioUringCqe
-	timeoutCursor      int
+	sweepIntervalNs    int64
 	acceptBackfill     int64
 	nextAcceptRetry    int64
 	localReqs          uint64
@@ -416,6 +416,10 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer worker.flushReqStats()
+	worker.sweepIntervalNs = sweepIntervalNsFor(worker.server.config.IdleTimeout, worker.server.config.ReadTimeout, worker.server.config.WriteTimeout, worker.server.config.HandshakeTimeout)
+	stopSweeper := make(chan struct{})
+	defer close(stopSweeper)
+	go worker.runIdleSweeper(stopSweeper)
 	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
 		return fmt.Errorf("tls worker %d initial fillAccepts: %w", worker.id, err)
 	}
@@ -451,6 +455,9 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 			lastSweep = MonotonicNanotime()
 			continue
 		}
+		if err := worker.armWake(); err != nil {
+			return fmt.Errorf("tls worker %d arm wake: %w", worker.id, err)
+		}
 		count := worker.ring.peekBatch(worker.completions[:])
 		if count == 0 {
 			cqe, err := worker.ring.waitCqe()
@@ -480,7 +487,7 @@ func (worker *tlsUringWorker) run(backend *tlsUringBackend) error {
 		if count == 0 {
 			continue
 		}
-		if nowTime-lastSweep >= int64(time.Second) {
+		if nowTime-lastSweep >= worker.sweepIntervalNs {
 			worker.sweepIdle(nowTime)
 			lastSweep = nowTime
 		}
@@ -1711,31 +1718,44 @@ func (worker *tlsUringWorker) compactAppBuffer(conn *tlsWorkerConn, consumed int
 }
 
 func (worker *tlsUringWorker) sweepIdle(now int64) {
-	if len(worker.connections) == 0 {
-		return
-	}
 	idleTimeout := worker.server.config.IdleTimeout
 	handshakeTimeout := worker.server.config.HandshakeTimeout
 	if idleTimeout <= 0 && handshakeTimeout <= 0 {
 		return
 	}
-	for budget := 64; budget > 0; budget-- {
-		conn := &worker.connections[worker.timeoutCursor]
-		if conn.fd >= 0 && conn.state != tlsConnStateClosing {
-			timeout := idleTimeout
-			switch conn.phase {
-			case tlsConnPhaseClientHello, tlsConnPhaseClientFinished, tlsConnPhase12CKE:
-				if handshakeTimeout > 0 {
-					timeout = handshakeTimeout
-				}
-			}
-			if timeout > 0 && now-conn.lastActive > timeout.Nanoseconds() {
-				_ = worker.closeConnection(conn)
+	for i := range worker.connections {
+		conn := &worker.connections[i]
+		if conn.fd < 0 || conn.state == tlsConnStateClosing {
+			continue
+		}
+		timeout := idleTimeout
+		switch conn.phase {
+		case tlsConnPhaseClientHello, tlsConnPhaseClientFinished, tlsConnPhase12CKE:
+			if handshakeTimeout > 0 {
+				timeout = handshakeTimeout
 			}
 		}
-		worker.timeoutCursor++
-		if worker.timeoutCursor >= len(worker.connections) {
-			worker.timeoutCursor = 0
+		if timeout > 0 && now-conn.lastActive > timeout.Nanoseconds() {
+			_ = worker.closeConnection(conn)
+		}
+	}
+}
+
+func (worker *tlsUringWorker) runIdleSweeper(stop <-chan struct{}) {
+	interval := time.Duration(worker.sweepIntervalNs)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if worker.active.Load() > 0 {
+				worker.signalWake()
+			}
 		}
 	}
 }

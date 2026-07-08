@@ -94,7 +94,7 @@ type plainUringWorker struct {
 	connections     []plainWorkerConn
 	freeHead        int32
 	completions     [ioUringCompletionBatchSize]ioUringCqe
-	timeoutCursor   int
+	sweepIntervalNs int64
 	acceptBackfill  int64
 	nextAcceptRetry int64
 	localReqs       uint64
@@ -347,6 +347,10 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			worker.recvBufs = nil
 		}
 	}
+	worker.sweepIntervalNs = sweepIntervalNsFor(worker.server.config.IdleTimeout, worker.server.config.ReadTimeout, worker.server.config.WriteTimeout)
+	stopSweeper := make(chan struct{})
+	defer close(stopSweeper)
+	go worker.runIdleSweeper(stopSweeper)
 	if err := worker.fillAccepts(MonotonicNanotime()); err != nil {
 		return fmt.Errorf("plain initial fill accepts: %w", err)
 	}
@@ -381,6 +385,9 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			lastSweep = MonotonicNanotime()
 			continue
 		}
+		if err := worker.armWake(); err != nil {
+			return fmt.Errorf("plain arm wake: %w", err)
+		}
 		count := worker.ring.peekBatch(worker.completions[:])
 		if count == 0 {
 			cqe, err := worker.ring.waitCqe()
@@ -410,7 +417,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 		if count == 0 {
 			continue
 		}
-		if nowTime-lastSweep >= int64(time.Second) {
+		if nowTime-lastSweep >= worker.sweepIntervalNs {
 			worker.sweepIdle(nowTime)
 			lastSweep = nowTime
 		}
@@ -1242,21 +1249,68 @@ func (worker *plainUringWorker) compactReadBuffer(conn *plainWorkerConn, consume
 }
 
 func (worker *plainUringWorker) sweepIdle(now int64) {
-	idleTimeout := worker.server.config.IdleTimeout
-	if idleTimeout <= 0 || len(worker.connections) == 0 {
-		return
-	}
-	deadline := idleTimeout.Nanoseconds()
-	for budget := 64; budget > 0; budget-- {
-		conn := &worker.connections[worker.timeoutCursor]
-		if conn.fd >= 0 && conn.state != plainConnStateClosing && now-conn.lastActive > deadline {
+	idleTO := worker.server.config.IdleTimeout
+	readTO := worker.server.config.ReadTimeout
+	writeTO := worker.server.config.WriteTimeout
+	for i := range worker.connections {
+		conn := &worker.connections[i]
+		if conn.fd < 0 || conn.state == plainConnStateClosing {
+			continue
+		}
+		timeout := idleTO
+		switch conn.state {
+		case plainConnStateWriting:
+			if writeTO > 0 {
+				timeout = writeTO
+			}
+		case plainConnStateReading:
+			if conn.readN > 0 && readTO > 0 {
+				timeout = readTO
+			}
+		}
+		if timeout > 0 && now-conn.lastActive > timeout.Nanoseconds() {
 			_ = worker.closeConnection(conn)
 		}
-		worker.timeoutCursor++
-		if worker.timeoutCursor >= len(worker.connections) {
-			worker.timeoutCursor = 0
+	}
+}
+
+func (worker *plainUringWorker) runIdleSweeper(stop <-chan struct{}) {
+	interval := time.Duration(worker.sweepIntervalNs)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if worker.active.Load() > 0 {
+				worker.signalWake()
+			}
 		}
 	}
+}
+
+func sweepIntervalNsFor(durs ...time.Duration) int64 {
+	smallest := int64(0)
+	for _, d := range durs {
+		if d > 0 && (smallest == 0 || d.Nanoseconds() < smallest) {
+			smallest = d.Nanoseconds()
+		}
+	}
+	if smallest == 0 {
+		return int64(time.Second)
+	}
+	interval := smallest / 4
+	if interval > int64(time.Second) {
+		interval = int64(time.Second)
+	}
+	if interval < int64(50*time.Millisecond) {
+		interval = int64(50 * time.Millisecond)
+	}
+	return interval
 }
 
 func (backend *plainUringBackend) dispatchAccepted(source *plainUringWorker, fd int, now int64) {
