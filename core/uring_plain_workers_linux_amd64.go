@@ -605,7 +605,7 @@ func (worker *plainUringWorker) handleBufferedRead(conn *plainWorkerConn, result
 	if conn.readBuf == nil {
 		conn.readBuf = acquirePooledBuf(&connReadBufPool)
 	}
-	maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+	maxRead := resolveReadCap(worker.server.config.MaxReadSize)
 	if !worker.ensureReadCapacity(conn, n, maxRead) {
 		return worker.closeConnection(conn)
 	}
@@ -666,7 +666,12 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		}
 
 		conn.req.resetFastH1()
-		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, ok := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req)
+		headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, tooLarge, ok := ParseH1RequestHead(conn.readBuf[:conn.readN], &conn.req, worker.server.config.MaxHeaderSize, worker.server.config.MaxHeaderCount)
+		if tooLarge {
+			conn.resp.Reset()
+			conn.resp.Status(431).String("Request Header Fields Too Large")
+			return worker.queueResponse(conn, false, conn.readN)
+		}
 		if !ok {
 			return worker.queueRead(conn)
 		}
@@ -1089,7 +1094,7 @@ func (worker *plainUringWorker) queueRead(conn *plainWorkerConn) error {
 		}
 		return nil
 	}
-	if !worker.ensureReadCapacity(conn, plainReadMinFree, int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))) {
+	if !worker.ensureReadCapacity(conn, plainReadMinFree, resolveReadCap(worker.server.config.MaxReadSize)) {
 		return worker.closeConnection(conn)
 	}
 	return worker.ring.prepRecvUser(conn.fd, conn.readBuf[conn.readN:cap(conn.readBuf)], plainEncodeUserData(plainUringOpRead, int(conn.index), conn.generation))
@@ -1212,7 +1217,7 @@ func (worker *plainUringWorker) maybeInitHTTP2(conn *plainWorkerConn) bool {
 	}
 	conn.protocol = plainConnProtoH2
 	conn.h2.init()
-	conn.writeBuf = appendH2ServerSettingsFlight(conn.writeBuf[:0])
+	conn.writeBuf = appendH2ServerSettingsFlight(conn.writeBuf[:0], worker.server)
 	Stats.H2Conns.Add(1)
 	if worker.server.IsDebug() {
 		Dbg("[%s] plain worker entering native h2c", conn.remoteAddr)
@@ -1252,6 +1257,7 @@ func (worker *plainUringWorker) sweepIdle(now int64) {
 	idleTO := worker.server.config.IdleTimeout
 	readTO := worker.server.config.ReadTimeout
 	writeTO := worker.server.config.WriteTimeout
+	readHeaderTO := worker.server.config.ReadHeaderTimeout
 	for i := range worker.connections {
 		conn := &worker.connections[i]
 		if conn.fd < 0 || conn.state == plainConnStateClosing {
@@ -1264,8 +1270,14 @@ func (worker *plainUringWorker) sweepIdle(now int64) {
 				timeout = writeTO
 			}
 		case plainConnStateReading:
-			if conn.readN > 0 && readTO > 0 {
-				timeout = readTO
+			if conn.readN > 0 {
+				rt := readTO
+				if readHeaderTO > 0 {
+					rt = readHeaderTO
+				}
+				if rt > 0 {
+					timeout = rt
+				}
 			}
 		}
 		if timeout > 0 && now-conn.lastActive > timeout.Nanoseconds() {
@@ -1479,13 +1491,6 @@ func plainDecodeGeneration(userData uint64) uint16 {
 
 func plainDecodeConn(userData uint64) int {
 	return int(uint32(userData))
-}
-
-func defaultInt64(value int64, fallback int64) int64 {
-	if value > 0 {
-		return value
-	}
-	return fallback
 }
 
 func (ring *ioUring) prepAcceptUser(fd int, userData uint64, flags uint32) error {

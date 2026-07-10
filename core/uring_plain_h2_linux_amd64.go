@@ -53,7 +53,7 @@ func (worker *plainUringWorker) processHTTP2Frames(conn *plainWorkerConn) (int, 
 		frameType := conn.readBuf[base+3]
 		frameFlags := conn.readBuf[base+4]
 		streamID := (uint32(conn.readBuf[base+5])<<24 | uint32(conn.readBuf[base+6])<<16 | uint32(conn.readBuf[base+7])<<8 | uint32(conn.readBuf[base+8])) & 0x7fffffff
-		if frameLen > H2DefaultMaxFrameSize {
+		if frameLen > int(worker.server.h2MaxFrameSize()) {
 			conn.writeBuf = appendH2GoAwayFrame(conn.writeBuf[:0], st.lastStreamID, H2ErrFrameSize)
 			return worker.flushHTTP2Frames(conn, true)
 		}
@@ -317,7 +317,7 @@ func (worker *plainUringWorker) processHTTP2DecodedHeaders(conn *plainWorkerConn
 		conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrEnhanceYourCalm)
 		return tlsWorkerActionWrote, false
 	}
-	if len(st.streams) >= H2MaxConcurrentStream {
+	if len(st.streams) >= int(worker.server.h2MaxStreams()) {
 		conn.writeBuf = appendH2RSTStreamFrame(conn.writeBuf, streamID, H2ErrRefusedStream)
 		return tlsWorkerActionWrote, false
 	}

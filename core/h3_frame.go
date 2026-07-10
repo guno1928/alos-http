@@ -8,9 +8,9 @@ const (
 	h3FrameSettings uint64 = 0x04
 	h3FrameGoaway   uint64 = 0x07
 
-	h3StreamControl    uint64 = 0x00
-	h3StreamQPACKEnc   uint64 = 0x02
-	h3StreamQPACKDec   uint64 = 0x03
+	h3StreamControl  uint64 = 0x00
+	h3StreamQPACKEnc uint64 = 0x02
+	h3StreamQPACKDec uint64 = 0x03
 
 	h3SettingMaxHeaderListSize uint64 = 0x06
 	h3SettingQPACKMaxTableCap  uint64 = 0x01

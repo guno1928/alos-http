@@ -147,11 +147,11 @@ func BenchmarkPools(b *testing.B) {
 // ===== E. request head parsing =====
 func BenchmarkParseRequest(b *testing.B) {
 	reqs := map[string]string{
-		"simple-get":  "GET / HTTP/1.1\r\nHost: alos.gg\r\n\r\n",
-		"typical-get": "GET /dashboard HTTP/1.1\r\nHost: alos.gg\r\nUser-Agent: Mozilla/5.0\r\nAccept: text/html\r\nAccept-Encoding: gzip\r\nCookie: session=abcdef123456\r\nConnection: keep-alive\r\n\r\n",
-		"post-cl":     "POST /api/login HTTP/1.1\r\nHost: alos.gg\r\nContent-Length: 27\r\nContent-Type: application/json\r\n\r\n",
+		"simple-get":   "GET / HTTP/1.1\r\nHost: alos.gg\r\n\r\n",
+		"typical-get":  "GET /dashboard HTTP/1.1\r\nHost: alos.gg\r\nUser-Agent: Mozilla/5.0\r\nAccept: text/html\r\nAccept-Encoding: gzip\r\nCookie: session=abcdef123456\r\nConnection: keep-alive\r\n\r\n",
+		"post-cl":      "POST /api/login HTTP/1.1\r\nHost: alos.gg\r\nContent-Length: 27\r\nContent-Type: application/json\r\n\r\n",
 		"many-headers": "GET /shop HTTP/1.1\r\nHost: alos.gg\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\nE: 5\r\nF: 6\r\nG: 7\r\nH: 8\r\nX-Forwarded-For: 1.2.3.4\r\nX-Real-IP: 1.2.3.4\r\n\r\n",
-		"keepalive":   "GET /api/wallet/transfer HTTP/1.1\r\nHost: alos.gg\r\nConnection: keep-alive\r\nAuthorization: Bearer xyz\r\n\r\n",
+		"keepalive":    "GET /api/wallet/transfer HTTP/1.1\r\nHost: alos.gg\r\nConnection: keep-alive\r\nAuthorization: Bearer xyz\r\n\r\n",
 	}
 	req := &Request{Headers: make([][2]string, 0, 16)}
 	for name, s := range reqs {
@@ -160,7 +160,7 @@ func BenchmarkParseRequest(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				req.resetFastH1()
-				ParseH1RequestHead(data, req)
+				ParseH1RequestHead(data, req, 0, 0)
 			}
 		})
 	}
@@ -199,7 +199,7 @@ func BenchmarkFullPipeline(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				req.resetFastH1()
-				ParseH1RequestHead(data, req)
+				ParseH1RequestHead(data, req, 0, 0)
 				benchH = router.Lookup("GET", req.Path, req)
 				resp.resetFastH1()
 				resp.HTML(body)
@@ -227,7 +227,7 @@ func BenchmarkParallelThroughput(b *testing.B) {
 			buf := make([]byte, 0, 8192)
 			for pb.Next() {
 				req.resetFastH1()
-				ParseH1RequestHead(data, req)
+				ParseH1RequestHead(data, req, 0, 0)
 				_ = router.Lookup("GET", req.Path, req)
 				resp.resetFastH1()
 				resp.HTML(body)
@@ -285,7 +285,7 @@ func BenchmarkExtra(b *testing.B) {
 	})
 	b.Run("resetFastH1-request", func(b *testing.B) {
 		req := &Request{Headers: make([][2]string, 0, 16)}
-		ParseH1RequestHead([]byte("GET /x HTTP/1.1\r\nHost: a\r\nCookie: s=1\r\n\r\n"), req)
+		ParseH1RequestHead([]byte("GET /x HTTP/1.1\r\nHost: a\r\nCookie: s=1\r\n\r\n"), req, 0, 0)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			req.resetFastH1()
@@ -344,7 +344,7 @@ func BenchmarkExtra(b *testing.B) {
 			req := &Request{Headers: make([][2]string, 0, 16)}
 			for pb.Next() {
 				req.resetFastH1()
-				ParseH1RequestHead(data, req)
+				ParseH1RequestHead(data, req, 0, 0)
 			}
 		})
 	})

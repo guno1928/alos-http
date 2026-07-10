@@ -16,9 +16,9 @@ import (
 var udpDeadlineZero time.Time
 
 const (
-	ioUringOpRecvmsg   = 5
-	ioUringOpSendmsg   = 9
-	soReusePort        = 15
+	ioUringOpRecvmsg = 5
+	ioUringOpSendmsg = 9
+	soReusePort      = 15
 )
 
 type iovec struct {

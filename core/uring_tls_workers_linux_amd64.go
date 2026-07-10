@@ -809,7 +809,7 @@ func (worker *tlsUringWorker) handleBufferedRead(conn *tlsWorkerConn, result int
 		}
 		return nil
 	}
-	maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+	maxRead := resolveReadCap(worker.server.config.MaxReadSize)
 	if !worker.ensureReadCapacity(conn, n, maxRead) {
 		return worker.closeConnection(conn)
 	}
@@ -1126,7 +1126,7 @@ func (worker *tlsUringWorker) processApplication(conn *tlsWorkerConn) (int, erro
 			case 0x15:
 				return tlsWorkerActionClose, nil
 			case 0x17:
-				maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+				maxRead := resolveReadCap(worker.server.config.MaxReadSize)
 				if !worker.ensureAppCapacity(conn, len(appContent), maxRead) {
 					return tlsWorkerActionClose, nil
 				}
@@ -1179,7 +1179,12 @@ func (worker *tlsUringWorker) processHTTPRequests(conn *tlsWorkerConn) (int, err
 	}
 
 	conn.req.resetFastH1()
-	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, ok := ParseH1RequestHead(conn.appBuf, &conn.req)
+	headerEnd, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, tooLarge, ok := ParseH1RequestHead(conn.appBuf, &conn.req, worker.server.config.MaxHeaderSize, worker.server.config.MaxHeaderCount)
+	if tooLarge {
+		conn.resp.Reset()
+		conn.resp.Status(431).String("Request Header Fields Too Large")
+		return worker.queueTLSResponse(conn, false, len(conn.appBuf))
+	}
 	if !ok {
 		return tlsWorkerActionContinue, nil
 	}
@@ -1537,7 +1542,7 @@ func (worker *tlsUringWorker) queueRead(conn *tlsWorkerConn) error {
 		}
 		return nil
 	}
-	if !worker.ensureReadCapacity(conn, tlsReadMinFree, int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))) {
+	if !worker.ensureReadCapacity(conn, tlsReadMinFree, resolveReadCap(worker.server.config.MaxReadSize)) {
 		return worker.closeConnection(conn)
 	}
 	return worker.ring.prepRecvUserWithFlags(conn.fd, conn.readBuf[conn.readN:cap(conn.readBuf)], tlsEncodeUserData(tlsUringOpRead, int(conn.index), conn.generation), conn.readPollFirst)
@@ -1720,7 +1725,10 @@ func (worker *tlsUringWorker) compactAppBuffer(conn *tlsWorkerConn, consumed int
 func (worker *tlsUringWorker) sweepIdle(now int64) {
 	idleTimeout := worker.server.config.IdleTimeout
 	handshakeTimeout := worker.server.config.HandshakeTimeout
-	if idleTimeout <= 0 && handshakeTimeout <= 0 {
+	readTO := worker.server.config.ReadTimeout
+	writeTO := worker.server.config.WriteTimeout
+	readHeaderTO := worker.server.config.ReadHeaderTimeout
+	if idleTimeout <= 0 && handshakeTimeout <= 0 && readTO <= 0 && writeTO <= 0 {
 		return
 	}
 	for i := range worker.connections {
@@ -1733,6 +1741,21 @@ func (worker *tlsUringWorker) sweepIdle(now int64) {
 		case tlsConnPhaseClientHello, tlsConnPhaseClientFinished, tlsConnPhase12CKE:
 			if handshakeTimeout > 0 {
 				timeout = handshakeTimeout
+			}
+		default:
+			switch conn.state {
+			case tlsConnStateWriting:
+				if writeTO > 0 {
+					timeout = writeTO
+				}
+			case tlsConnStateReading:
+				rt := readTO
+				if readHeaderTO > 0 {
+					rt = readHeaderTO
+				}
+				if rt > 0 {
+					timeout = rt
+				}
 			}
 		}
 		if timeout > 0 && now-conn.lastActive > timeout.Nanoseconds() {
@@ -2181,7 +2204,7 @@ func (worker *tlsUringWorker) processApplication12(conn *tlsWorkerConn) (int, er
 		case 0x15:
 			return tlsWorkerActionClose, nil
 		case 0x17:
-			maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+			maxRead := resolveReadCap(worker.server.config.MaxReadSize)
 			if !worker.ensureAppCapacity(conn, len(pt), maxRead) {
 				return tlsWorkerActionClose, nil
 			}

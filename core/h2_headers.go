@@ -1,6 +1,6 @@
 package core
 
-func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string) {
+func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
 	enc.EncodeStatus(statusCode)
 
 	wroteContentType := false
@@ -74,6 +74,6 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	}
 
 	if !wroteServer {
-		enc.EncodeHeaderFold("server", "ALOS")
+		enc.EncodeHeaderFold("server", serverName)
 	}
 }

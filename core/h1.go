@@ -14,7 +14,7 @@ func init() {
 		301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect",
 		400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
 		405: "Method Not Allowed", 408: "Request Timeout", 413: "Payload Too Large",
-		416: "Range Not Satisfiable", 426: "Upgrade Required", 429: "Too Many Requests",
+		416: "Range Not Satisfiable", 426: "Upgrade Required", 429: "Too Many Requests", 431: "Request Header Fields Too Large",
 		500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
 	}
 	for code, text := range codes {
@@ -107,7 +107,8 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 		buf = append(buf, '\r', '\n')
 	}
 
-	buf = append(buf, connKeepAlive...)
+	ka, _ := serverConnHeaders(resp)
+	buf = append(buf, ka...)
 	buf = append(buf, '\r', '\n')
 	buf = resp.appendTransmittedBody(buf)
 
@@ -150,7 +151,8 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 		inner = append(inner, resp.Headers[i][1]...)
 		inner = append(inner, '\r', '\n')
 	}
-	inner = append(inner, connKeepAlive...)
+	ka, _ := serverConnHeaders(resp)
+	inner = append(inner, ka...)
 	inner = append(inner, '\r', '\n')
 	inner = append(inner, body...)
 	if len(inner) > maxInner {

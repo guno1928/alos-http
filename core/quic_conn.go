@@ -18,30 +18,30 @@ const (
 	quicSpaceHandshake = 1
 	quicSpaceAppData   = 2
 
-	quicDefaultIdleTimeout   = 30 * time.Second
-	quicMaxPacketSize        = 1200
-	quicConnIDLen            = 8
-	quicInitialMaxData       = 10 << 20
-	quicInitialMaxStreamData = 1 << 20
-	quicMaxCryptoBuf         = 64 << 10
+	quicDefaultIdleTimeout      = 30 * time.Second
+	quicMaxPacketSize           = 1200
+	quicConnIDLen               = 8
+	quicInitialMaxData          = 10 << 20
+	quicInitialMaxStreamData    = 1 << 20
+	quicMaxCryptoBuf            = 64 << 10
 	quicMaxConcurrentReqStreams = 256
-	quicKeyUpdateThreshold     = 1 << 20
-	quicMaxBidiStreams       = 1024
-	quicMaxUniStreams        = 128
-	quicMaxTrackedStreams    = 2048
-	quicMaxConns             = 1 << 16
+	quicKeyUpdateThreshold      = 1 << 20
+	quicMaxBidiStreams          = 1024
+	quicMaxUniStreams           = 128
+	quicMaxTrackedStreams       = 2048
+	quicMaxConns                = 1 << 16
 )
 
 var quicActiveConns atomic.Int64
 
 type QUICConn struct {
-	srcConnID  [20]byte
-	srcCIDLen  int
-	dstConnID  [20]byte
-	dstCIDLen  int
+	srcConnID     [20]byte
+	srcCIDLen     int
+	dstConnID     [20]byte
+	dstCIDLen     int
 	origDstConnID [20]byte
 	origDstLen    int
-	version    uint32
+	version       uint32
 
 	keys        [3]*quicKeys
 	sendKeys    [3]*quicKeys
@@ -65,22 +65,22 @@ type QUICConn struct {
 	tlsState      *quicTLSState
 	handshakeDone atomic.Bool
 	firstFlight   struct {
-		serverHello []byte
+		serverHello       []byte
 		ee, cert, cv, fin []byte
-		sent bool
+		sent              bool
 	}
 
-	streams      map[uint64]*QUICStream
-	streamsMu    sync.Mutex
+	streams        map[uint64]*QUICStream
+	streamsMu      sync.Mutex
 	nextBidiRemote uint64
 	nextUniRemote  uint64
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal   uint64
-	maxDataRemote  uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal  uint64
+	maxDataRemote uint64
+	dataSent      uint64
+	dataRecv      uint64
 
 	bytesSent        atomic.Uint64
 	bytesReceived    atomic.Uint64
@@ -106,6 +106,10 @@ type QUICConn struct {
 }
 
 func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dcid, scid []byte) *QUICConn {
+	maxData := uint64(quicInitialMaxData)
+	if server.config.QUICMaxData > 0 {
+		maxData = uint64(server.config.QUICMaxData)
+	}
 	qc := &QUICConn{
 		version:        quicVersion1,
 		server:         server,
@@ -114,9 +118,9 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		done:           make(chan struct{}),
 		streams:        make(map[uint64]*QUICStream),
 		loss:           newQuicLossState(),
-		idleTimeout:    quicDefaultIdleTimeout,
-		maxDataLocal:   quicInitialMaxData,
-		maxDataRemote:  quicInitialMaxData,
+		idleTimeout:    defaultDuration(server.config.IdleTimeout, quicDefaultIdleTimeout),
+		maxDataLocal:   maxData,
+		maxDataRemote:  maxData,
 		nextBidiRemote: 0,
 		nextUniRemote:  2,
 		nextBidiLocal:  1,

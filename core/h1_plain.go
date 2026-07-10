@@ -53,10 +53,11 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		dst = append(dst, '\r', '\n')
 	}
 
+	ka, cl := serverConnHeaders(resp)
 	if keepAlive {
-		dst = append(dst, connKeepAlive...)
+		dst = append(dst, ka...)
 	} else {
-		dst = append(dst, connClose...)
+		dst = append(dst, cl...)
 	}
 	dst = append(dst, '\r', '\n')
 	if includeBody && !suppressBody {
@@ -198,18 +199,28 @@ func findCRLFBytes(buf []byte, start int) int {
 	return start + idx
 }
 
-func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, ok bool) {
-	const maxHeaders = 128
+func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCount int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, tooLarge bool, ok bool) {
+	maxBytes := maxHeaderBytes
+	if maxBytes <= 0 {
+		maxBytes = 8192
+	}
+	maxCount := maxHeaderCount
+	if maxCount <= 0 {
+		maxCount = 128
+	}
 
 	idx := bytes.Index(data, crlfSlice)
 	if idx < 0 {
-		return 0, 0, false, false, false, false, false
+		if len(data) > maxBytes {
+			return 0, 0, false, false, false, false, true, false
+		}
+		return 0, 0, false, false, false, false, false, false
 	}
 
 	rl := data[:idx]
 	sp1 := bytes.IndexByte(rl, ' ')
 	if sp1 < 0 {
-		return 0, 0, false, false, false, false, false
+		return 0, 0, false, false, false, false, false, false
 	}
 	sp2 := bytes.IndexByte(rl[sp1+1:], ' ')
 	if sp2 >= 0 {
@@ -247,14 +258,20 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 	req.RawPath = rawURI
 
 	for pos := idx + 2; pos < len(data); {
+		if pos > maxBytes {
+			return 0, 0, false, false, false, false, true, false
+		}
 		remaining := data[pos:]
 		lineEndOff := bytes.Index(remaining, crlfSlice)
 		if lineEndOff < 0 {
-			return 0, 0, false, false, false, false, false
+			if len(data) > maxBytes {
+				return 0, 0, false, false, false, false, true, false
+			}
+			return 0, 0, false, false, false, false, false, false
 		}
 		nl := pos + lineEndOff
 		if nl == pos {
-			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true
+			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
 		}
 
 		line := data[pos:nl]
@@ -267,8 +284,8 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 			}
 			valStr := UnsafeString(val)
 			req.Headers = append(req.Headers, [2]string{name, valStr})
-			if len(req.Headers) > maxHeaders {
-				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true
+			if len(req.Headers) > maxCount {
+				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true, false
 			}
 
 			switch colon {
@@ -354,7 +371,7 @@ func ParseH1RequestHead(data []byte, req *Request) (headerEnd int, contentLength
 		pos = nl + 2
 	}
 
-	return 0, 0, false, false, false, false, false
+	return 0, 0, false, false, false, false, false, false
 }
 
 func appendPlainResponse(resp *Response, dst []byte) []byte {

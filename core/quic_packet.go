@@ -3,13 +3,13 @@ package core
 import "encoding/binary"
 
 const (
-	quicVersion1       uint32 = 0x00000001
-	quicLongHeaderBit  byte   = 0x80
-	quicFixedBit       byte   = 0x40
-	quicInitialType    byte   = 0x00
-	quicZeroRTTType    byte   = 0x01
-	quicHandshakeType  byte   = 0x02
-	quicRetryType      byte   = 0x03
+	quicVersion1      uint32 = 0x00000001
+	quicLongHeaderBit byte   = 0x80
+	quicFixedBit      byte   = 0x40
+	quicInitialType   byte   = 0x00
+	quicZeroRTTType   byte   = 0x01
+	quicHandshakeType byte   = 0x02
+	quicRetryType     byte   = 0x03
 )
 
 const (

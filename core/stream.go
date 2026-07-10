@@ -47,6 +47,9 @@ type H2StreamWriter struct {
 	limiter      *ConnectionLimiter
 	global       *GlobalLimiter
 	method       string
+	serverName   string
+	written      int64
+	maxWrite     int64
 	headersSent  bool
 	suppressBody bool
 	flowCond     *sync.Cond
@@ -83,7 +86,7 @@ func (w *H2StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 	bp := MediumBufPool.Get().(*[]byte)
 	enc := HpackEncoder{}
 	enc.Reset((*bp)[:0])
-	encodeH2ResponseHeaders(&enc, statusCode, contentType, -1, headers)
+	encodeH2ResponseHeaders(&enc, statusCode, contentType, -1, headers, w.serverName)
 
 	fbp := H2FrameBufPool.Get().(*[]byte)
 	headerFrame := H2WriteFrame((*fbp)[:0], H2FrameHeaders, H2FlagEndHeaders, w.streamID, enc.Buf)
@@ -102,6 +105,12 @@ func (w *H2StreamWriter) WriteChunk(data []byte) error {
 	}
 	if w.suppressBody {
 		return nil
+	}
+	if w.maxWrite > 0 {
+		w.written += int64(len(data))
+		if w.written > w.maxWrite {
+			return ErrBodyTooLarge
+		}
 	}
 
 	maxFrame := int(w.maxFrame.Load())
@@ -198,6 +207,9 @@ type H1StreamWriter struct {
 	limiter      *ConnectionLimiter
 	global       *GlobalLimiter
 	method       string
+	serverName   string
+	written      int64
+	maxWrite     int64
 	headersSent  bool
 	chunked      bool
 	suppressBody bool
@@ -229,9 +241,13 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
 	}
 	hasConnection := false
+	hasServer := false
 	for i := range headers {
 		if EqualFoldASCII(headers[i][0], "connection") {
 			hasConnection = true
+		}
+		if EqualFoldASCII(headers[i][0], "server") {
+			hasServer = true
 		}
 		buf = append(buf, headers[i][0]...)
 		buf = append(buf, ':', ' ')
@@ -244,6 +260,11 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 		} else {
 			buf = append(buf, "Connection: keep-alive\r\n"...)
 		}
+	}
+	if !hasServer {
+		buf = append(buf, "Server: "...)
+		buf = append(buf, w.serverName...)
+		buf = append(buf, '\r', '\n')
 	}
 	buf = append(buf, '\r', '\n')
 
@@ -259,6 +280,12 @@ func (w *H1StreamWriter) WriteChunk(data []byte) error {
 	}
 	if w.suppressBody {
 		return nil
+	}
+	if w.maxWrite > 0 {
+		w.written += int64(len(data))
+		if w.written > w.maxWrite {
+			return ErrBodyTooLarge
+		}
 	}
 
 	if w.limiter != nil {
@@ -307,6 +334,9 @@ type PlainH1StreamWriter struct {
 	limiter      *ConnectionLimiter
 	global       *GlobalLimiter
 	method       string
+	serverName   string
+	written      int64
+	maxWrite     int64
 	headersSent  bool
 	chunked      bool
 	suppressBody bool
@@ -338,9 +368,13 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
 	}
 	hasConnection := false
+	hasServer := false
 	for i := range headers {
 		if EqualFoldASCII(headers[i][0], "connection") {
 			hasConnection = true
+		}
+		if EqualFoldASCII(headers[i][0], "server") {
+			hasServer = true
 		}
 		buf = append(buf, headers[i][0]...)
 		buf = append(buf, ':', ' ')
@@ -353,6 +387,11 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 		} else {
 			buf = append(buf, "Connection: keep-alive\r\n"...)
 		}
+	}
+	if !hasServer {
+		buf = append(buf, "Server: "...)
+		buf = append(buf, w.serverName...)
+		buf = append(buf, '\r', '\n')
 	}
 	buf = append(buf, '\r', '\n')
 
@@ -368,6 +407,12 @@ func (w *PlainH1StreamWriter) WriteChunk(data []byte) error {
 	}
 	if w.suppressBody {
 		return nil
+	}
+	if w.maxWrite > 0 {
+		w.written += int64(len(data))
+		if w.written > w.maxWrite {
+			return ErrBodyTooLarge
+		}
 	}
 
 	if w.limiter != nil {

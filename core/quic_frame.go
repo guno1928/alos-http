@@ -76,7 +76,7 @@ type quicMaxStreamDataFrame struct {
 
 type quicMaxStreamsFrame struct {
 	maxStreams uint64
-	bidi      bool
+	bidi       bool
 }
 
 type quicNewConnIDFrame struct {
@@ -222,7 +222,7 @@ type quicFrameVisitor struct {
 	onStream        func(f quicStreamFrame)
 	onMaxData       func(f quicMaxDataFrame)
 	onMaxStreamData func(f quicMaxStreamDataFrame)
-	onMaxStreams     func(f quicMaxStreamsFrame)
+	onMaxStreams    func(f quicMaxStreamsFrame)
 	onConnClose     func(f quicConnCloseFrame)
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)

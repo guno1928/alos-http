@@ -132,7 +132,7 @@ func (worker *tlsUringWorker) initHTTP2(conn *tlsWorkerConn) (int, error) {
 	conn.h2.init()
 	conn.phase = tlsConnPhaseH2Native
 	Stats.H2Conns.Add(1)
-	conn.plainBuf = appendH2ServerSettingsFlight(conn.plainBuf[:0])
+	conn.plainBuf = appendH2ServerSettingsFlight(conn.plainBuf[:0], worker.server)
 	if worker.server.IsDebug() {
 		Dbg("[%s] worker init native HTTP/2 readN=%d appBuf=%d settings-bytes=%d", conn.remoteAddr, conn.readN, len(conn.appBuf), len(conn.plainBuf))
 	}
@@ -149,12 +149,12 @@ func (worker *tlsUringWorker) initHTTP2(conn *tlsWorkerConn) (int, error) {
 	return action, nil
 }
 
-func appendH2ServerSettingsFlight(dst []byte) []byte {
+func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	settings := [5][2]uint32{
 		{uint32(H2SettingHeaderTableSize), 0},
-		{uint32(H2SettingMaxConcurrentStreams), H2MaxConcurrentStream},
-		{uint32(H2SettingInitialWindowSize), H2StreamWindowSize},
-		{uint32(H2SettingMaxFrameSize), H2DefaultMaxFrameSize},
+		{uint32(H2SettingMaxConcurrentStreams), s.h2MaxStreams()},
+		{uint32(H2SettingInitialWindowSize), s.h2InitialWindow()},
+		{uint32(H2SettingMaxFrameSize), s.h2MaxFrameSize()},
 		{uint32(H2SettingMaxHeaderListSize), H2MaxHeaderListSize},
 	}
 	settingsFrame := H2WriteSettings(nil, settings[:])
@@ -270,7 +270,7 @@ func (worker *tlsUringWorker) processHTTP2Frames(conn *tlsWorkerConn) (int, erro
 		frameType := conn.appBuf[base+3]
 		frameFlags := conn.appBuf[base+4]
 		streamID := (uint32(conn.appBuf[base+5])<<24 | uint32(conn.appBuf[base+6])<<16 | uint32(conn.appBuf[base+7])<<8 | uint32(conn.appBuf[base+8])) & 0x7fffffff
-		if frameLen > H2DefaultMaxFrameSize {
+		if frameLen > int(worker.server.h2MaxFrameSize()) {
 			if worker.server.IsDebug() {
 				Dbg("[%s] worker HTTP/2 frame too large len=%d", conn.remoteAddr, frameLen)
 			}
@@ -615,7 +615,7 @@ func (worker *tlsUringWorker) processHTTP2DecodedHeaders(conn *tlsWorkerConn, st
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrEnhanceYourCalm)
 		return tlsWorkerActionWrote, false
 	}
-	if len(st.streams) >= H2MaxConcurrentStream {
+	if len(st.streams) >= int(worker.server.h2MaxStreams()) {
 		conn.plainBuf = appendH2RSTStreamFrame(conn.plainBuf, streamID, H2ErrRefusedStream)
 		return tlsWorkerActionWrote, false
 	}
@@ -956,7 +956,7 @@ func (worker *tlsUringWorker) primeHTTP2FromBufferedCipher(conn *tlsWorkerConn) 
 }
 
 func (worker *tlsUringWorker) appendHTTP2AppData(conn *tlsWorkerConn, appContent []byte) bool {
-	maxRead := int(defaultInt64(worker.server.config.MaxReadSize, 2<<20))
+	maxRead := resolveReadCap(worker.server.config.MaxReadSize)
 	worker.compactHTTP2AppBuffer(conn, false)
 	if !worker.ensureAppCapacity(conn, len(appContent), maxRead) {
 		worker.compactHTTP2AppBuffer(conn, true)
@@ -1050,7 +1050,7 @@ func appendH2ResponseFrames(dst []byte, streamID uint32, resp *Response, maxFram
 	bp := MediumBufPool.Get().(*[]byte)
 	enc := HpackEncoder{}
 	enc.Reset((*bp)[:0])
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers)
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
 
 	body := resp.transmittedBodyBytes()
 	if len(body) == 0 {

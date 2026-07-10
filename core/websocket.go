@@ -183,7 +183,12 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 		resp.SetStreamer(sw)
 	}
 
-	return &WSConn{conn: conn, readTimeout: wsDefaultReadTimeout, writeTimeout: wsDefaultWriteTimeout, MaxMessageSize: wsDefaultMaxMessageSize}
+	rt, wt := wsDefaultReadTimeout, wsDefaultWriteTimeout
+	if req.server != nil {
+		rt = defaultDuration(req.server.config.WSReadTimeout, wsDefaultReadTimeout)
+		wt = defaultDuration(req.server.config.WSWriteTimeout, wsDefaultWriteTimeout)
+	}
+	return &WSConn{conn: conn, readTimeout: rt, writeTimeout: wt, MaxMessageSize: wsDefaultMaxMessageSize}
 }
 
 // ServeWebSocket upgrades the request and runs fn on a new goroutine, returning immediately so the dispatching worker is released; the connection is closed when fn returns. It reports false if the upgrade failed (an error response has already been written). This is the safe way to host a WebSocket — see the UpgradeWebSocket note about handlers that block on the socket.

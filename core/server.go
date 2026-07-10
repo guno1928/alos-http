@@ -50,7 +50,7 @@ var timeNow = time.Now
 //	Example: MaxBodySize: 10 << 20 caps bodies at 10 MiB.
 //	Example: MaxBodySize: 0 allows unlimited bodies.
 //
-// MaxReadSize caps total bytes read per connection; 0 means unlimited.
+// MaxReadSize caps the per-connection read buffer in bytes; 0 applies a 2 MiB default cap, -1 disables the cap (unsafe).
 //
 //	Example: MaxReadSize: 1 << 20.
 //
@@ -159,20 +159,30 @@ var timeNow = time.Now
 //
 //	Example: WebSocketAllowedOrigins: []string{"https://example.com"}.
 type Config struct {
-	Addr             string
-	HTTPAddr         string
-	ReadTimeout      time.Duration
-	WriteTimeout     time.Duration
-	IdleTimeout      time.Duration
-	HandshakeTimeout time.Duration
+	Addr              string
+	HTTPAddr          string
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	ReadHeaderTimeout time.Duration
+	IdleTimeout       time.Duration
+	HandshakeTimeout  time.Duration
 
 	MaxBodySize       int64
 	MaxReadSize       int64
 	MaxWriteSize      int64
 	MaxHeaderSize     int
+	MaxHeaderCount    int
 	MaxRequestsPerIP  int64
 	MaxConcurrentReqs int64
 	MaxConns          int64
+
+	H2MaxConcurrentStreams uint32
+	H2InitialWindowSize    uint32
+	H2MaxFrameSize         uint32
+	H2HeaderTableSize      uint32
+
+	QUICMaxData       int64
+	QUICMaxStreamData int64
 
 	TLSCertFile   string
 	TLSKeyFile    string
@@ -198,6 +208,8 @@ type Config struct {
 	DisableHTTP2    bool
 	ProxyMode       bool
 
+	WSReadTimeout           time.Duration
+	WSWriteTimeout          time.Duration
 	WebSocketOriginMode     WSOriginMode
 	WebSocketAllowedOrigins []string
 }
@@ -224,6 +236,62 @@ func DefaultConfig() Config {
 		LogRequests:       true,
 		ShutdownTimeout:   30 * time.Second,
 	}
+}
+
+func defaultDuration(value, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func defaultUint32(value, fallback uint32) uint32 {
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+const readCapUnlimited = 1 << 40
+
+func resolveReadCap(v int64) int {
+	switch {
+	case v < 0:
+		return readCapUnlimited
+	case v == 0:
+		return 2 << 20
+	default:
+		return int(v)
+	}
+}
+
+func (s *Server) h2MaxStreams() uint32 {
+	return defaultUint32(s.config.H2MaxConcurrentStreams, H2MaxConcurrentStream)
+}
+
+func (s *Server) h2InitialWindow() uint32 {
+	return defaultUint32(s.config.H2InitialWindowSize, H2StreamWindowSize)
+}
+
+func (s *Server) h2MaxFrameSize() uint32 {
+	return defaultUint32(s.config.H2MaxFrameSize, H2DefaultMaxFrameSize)
+}
+
+func respServerName(resp *Response) string {
+	if resp != nil && resp.lazyReq != nil && resp.lazyReq.server != nil {
+		return resp.lazyReq.server.config.ServerName
+	}
+	return "ALOS"
+}
+
+func serverConnHeaders(resp *Response) (keepAlive, closeHdr []byte) {
+	if resp != nil && resp.lazyReq != nil && resp.lazyReq.server != nil {
+		s := resp.lazyReq.server
+		if s.srvKeepAlive != nil {
+			return s.srvKeepAlive, s.srvClose
+		}
+	}
+	return connKeepAlive, connClose
 }
 
 func newPerIPRequestLimiter() *perIPRequestLimiter {
@@ -343,6 +411,8 @@ type Server struct {
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool
 	onResponseHooks []func(*Request, *Response)
+	srvKeepAlive    []byte
+	srvClose        []byte
 }
 
 type trackedHandoffConn struct {
@@ -394,6 +464,12 @@ func New(configs ...Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":8443"
 	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 30 * time.Second
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 120 * time.Second
 	}
@@ -406,6 +482,7 @@ func New(configs ...Config) *Server {
 	if cfg.MaxHeaderSize == 0 {
 		cfg.MaxHeaderSize = 8192
 	}
+	cfg.ServerName = sanitizeHeaderValue(cfg.ServerName)
 	if cfg.ServerName == "" {
 		cfg.ServerName = "ALOS"
 	}
@@ -431,6 +508,13 @@ func New(configs ...Config) *Server {
 		drainDone: make(chan struct{}),
 	}
 	s.Router.server = s
+	if cfg.ServerName == "ALOS" {
+		s.srvKeepAlive = connKeepAlive
+		s.srvClose = connClose
+	} else {
+		s.srvKeepAlive = []byte("Connection: keep-alive\r\nServer: " + cfg.ServerName + "\r\n")
+		s.srvClose = []byte("Connection: close\r\nServer: " + cfg.ServerName + "\r\n")
+	}
 	if cfg.ProxyMode {
 		s.trustedProxies = newTrustedProxyMatcher(nil, true)
 	} else if len(cfg.TrustedProxies) > 0 {
@@ -903,6 +987,9 @@ func (s *Server) NewH2StreamWriter(streamID uint32, hc *H2Conn, streamWindow *at
 	w.maxFrame = &hc.maxFrameSize
 	w.limiter = s.connLimiter
 	w.global = s.globalLimiter
+	w.serverName = s.config.ServerName
+	w.maxWrite = s.config.MaxWriteSize
+	w.written = 0
 	w.method = ""
 	w.headersSent = false
 	w.suppressBody = false
@@ -916,6 +1003,9 @@ func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1Stream
 	w.writer = writer
 	w.limiter = s.connLimiter
 	w.global = s.globalLimiter
+	w.serverName = s.config.ServerName
+	w.maxWrite = s.config.MaxWriteSize
+	w.written = 0
 	w.method = ""
 	w.headersSent = false
 	w.chunked = true
@@ -929,6 +1019,9 @@ func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	w.conn = conn
 	w.limiter = s.connLimiter
 	w.global = s.globalLimiter
+	w.serverName = s.config.ServerName
+	w.maxWrite = s.config.MaxWriteSize
+	w.written = 0
 	w.method = ""
 	w.headersSent = false
 	w.chunked = true
@@ -942,7 +1035,9 @@ func (s *Server) rootFastEligible() bool {
 		s.CORS != nil ||
 		s.config.EnableCompress ||
 		s.perIPLimiter != nil ||
-		s.trustedProxies.active {
+		s.trustedProxies.active ||
+		len(s.onRequestHooks) != 0 ||
+		len(s.onResponseHooks) != 0 {
 		return false
 	}
 	if pe := s.proxy.Load(); pe != nil {
@@ -986,12 +1081,13 @@ func (s *Server) computePlainRootFastResponse(fast bool) {
 	if handler == nil {
 		return
 	}
-	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1"}
+	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1", server: s}
 	resp := Response{
 		StatusCode: 200,
 		Headers:    make([][2]string, 0, 8),
 		body:       make([]byte, 0, 4096),
 	}
+	resp.lazyReq = &req
 	handler(&req, &resp)
 	if req.hijacked || resp.IsStreamed() {
 		return
@@ -1045,7 +1141,7 @@ func (s *Server) computeH2RootFastResponse(fast bool) {
 	enc := HpackEncoder{}
 	headerPayload := make([]byte, 0, resp.BodyLen()+128)
 	enc.Reset(headerPayload)
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers)
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
 
 	body := append([]byte(nil), resp.transmittedBodyBytes()...)
 	fastResp := h2RootFastResponse{

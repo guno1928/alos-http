@@ -7,20 +7,20 @@ import (
 )
 
 const (
-	quicInitialRTT        = 333 * time.Millisecond
-	quicMaxAckDelay       = 25 * time.Millisecond
-	quicTimerGranularity  = time.Millisecond
-	quicPktThreshold      = 3
-	quicTimeThreshold     = 9.0 / 8.0
+	quicInitialRTT       = 333 * time.Millisecond
+	quicMaxAckDelay      = 25 * time.Millisecond
+	quicTimerGranularity = time.Millisecond
+	quicPktThreshold     = 3
+	quicTimeThreshold    = 9.0 / 8.0
 )
 
 type quicSentPacket struct {
-	pn          uint64
-	sent        time.Time
-	size        int
-	ackElicit   bool
-	frames      []byte
-	inFlight    bool
+	pn        uint64
+	sent      time.Time
+	size      int
+	ackElicit bool
+	frames    []byte
+	inFlight  bool
 }
 
 type quicLossState struct {
@@ -40,9 +40,9 @@ type quicLossState struct {
 	cwnd     uint64
 	ssthresh uint64
 
-	ptoCount     int
-	ptoTimerSet  bool
-	ptoDeadline  time.Time
+	ptoCount    int
+	ptoTimerSet bool
+	ptoDeadline time.Time
 }
 
 func newQuicLossState() *quicLossState {

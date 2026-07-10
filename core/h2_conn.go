@@ -56,7 +56,7 @@ type H2Conn struct {
 }
 
 const (
-	h2MaxResetStreams    uint32 = 50
+	h2MaxResetStreams   uint32 = 50
 	h2RstWindowDuration int64  = 10_000_000_000
 	h2MaxPingCount      uint32 = 100
 	h2MaxSettingsCount  uint32 = 200
@@ -306,9 +306,9 @@ func (hc *H2Conn) readAndValidatePreface() bool {
 func (hc *H2Conn) sendInitialSettingsAndWindowUpdate() {
 	settings := [5][2]uint32{
 		{uint32(H2SettingHeaderTableSize), 0},
-		{uint32(H2SettingMaxConcurrentStreams), H2MaxConcurrentStream},
-		{uint32(H2SettingInitialWindowSize), H2StreamWindowSize},
-		{uint32(H2SettingMaxFrameSize), H2DefaultMaxFrameSize},
+		{uint32(H2SettingMaxConcurrentStreams), hc.server.h2MaxStreams()},
+		{uint32(H2SettingInitialWindowSize), hc.server.h2InitialWindow()},
+		{uint32(H2SettingMaxFrameSize), hc.server.h2MaxFrameSize()},
 		{uint32(H2SettingMaxHeaderListSize), H2MaxHeaderListSize},
 	}
 	settingsFrame := H2WriteSettings(nil, settings[:])
@@ -391,7 +391,7 @@ func (hc *H2Conn) consumeFrame() (*H2Frame, error) {
 		if avail >= 9 {
 			off := hc.appBufOff
 			fLen := int(hc.appBuf[off])<<16 | int(hc.appBuf[off+1])<<8 | int(hc.appBuf[off+2])
-			if fLen > H2DefaultMaxFrameSize {
+			if fLen > int(hc.server.h2MaxFrameSize()) {
 				hc.sendGoAway(H2ErrFrameSize)
 				return nil, ErrH2FrameTooLarge
 			}
@@ -419,8 +419,13 @@ func (hc *H2Conn) serveLoop() {
 	if idleTimeout <= 0 {
 		idleTimeout = 120 * time.Second
 	}
+	readTO := hc.server.config.ReadTimeout
 	for {
-		hc.conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		deadline := idleTimeout
+		if hc.activeStreams.Load() > 0 && readTO > 0 && readTO < deadline {
+			deadline = readTO
+		}
+		hc.conn.SetReadDeadline(time.Now().Add(deadline))
 		frame, err := hc.consumeFrame()
 		if err != nil {
 			Dbg("[H2] %s serve loop exit: %v (streams=%d)", hc.remoteAddr, err, hc.activeStreams.Load())
@@ -741,7 +746,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		}
 	}
 
-	if int(hc.activeStreams.Load()) >= H2MaxConcurrentStream {
+	if int(hc.activeStreams.Load()) >= int(hc.server.h2MaxStreams()) {
 		hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrRefusedStream))
 		return
 	}
@@ -1079,7 +1084,7 @@ func (hc *H2Conn) writeH2Response(streamID uint32, resp *Response) {
 
 	enc := HpackEncoder{}
 	enc.Reset((*bp)[:0])
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers)
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, hc.server.config.ServerName)
 
 	headerPayload := enc.Buf
 

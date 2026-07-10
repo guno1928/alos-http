@@ -169,6 +169,7 @@ func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 		resp.ContentType,
 		int64(resp.headerContentLength()),
 		resp.Headers,
+		h3.server.config.ServerName,
 	)
 
 	var frames []byte

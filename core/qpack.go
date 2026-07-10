@@ -366,7 +366,7 @@ var qpackEncodeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 256); return &b },
 }
 
-func qpackEncodeResponseHeaders(status int, contentType string, contentLength int64, headers [][2]string) []byte {
+func qpackEncodeResponseHeaders(status int, contentType string, contentLength int64, headers [][2]string, serverName string) []byte {
 	bp := qpackEncodeBufPool.Get().(*[]byte)
 	enc := QPACKEncoder{}
 	enc.Reset((*bp)[:0])
@@ -385,7 +385,7 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			enc.encodeLiteral("content-length", UnsafeString(clStr))
 		}
 	}
-	enc.EncodeHeader("server", "ALOS")
+	enc.EncodeHeader("server", serverName)
 	for i := range headers {
 		name := headers[i][0]
 		if name != "" && name[0] != ':' {
