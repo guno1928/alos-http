@@ -4,6 +4,7 @@ package core
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"runtime"
 	"strconv"
@@ -16,9 +17,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// enableProxyFuse turns on the single-syscall send+recv fuse for a pooled
+// backend connection (works below TLS). Only pooled forward connections call
+// this; websocket connections (dialed directly) stay unfused so their
+// bidirectional streaming is not deferred.
+func enableProxyFuse(conn net.Conn) {
+	switch c := conn.(type) {
+	case *proxyUringConn:
+		c.fuseEnabled = true
+	case *tls.Conn:
+		if raw, ok := c.NetConn().(*proxyUringConn); ok {
+			raw.fuseEnabled = true
+		}
+	}
+}
+
 const (
 	proxyRingEntries = 64
 	proxyConnEntries = 16
+	proxyFuseMaxSend = 60000
 )
 
 type proxyRingPool struct {
@@ -141,10 +158,14 @@ func (p *proxyRingPool) doConnect(fd int, sa *unix.RawSockaddrInet4, deadline ti
 }
 
 type proxyUringConn struct {
-	fd         int
-	pool       *proxyRingPool
-	readMu     sync.Mutex
-	writeMu    sync.Mutex
+	fd          int
+	pool        *proxyRingPool
+	readRing    *ioUring
+	writeRing   *ioUring
+	pendingSend []byte
+	fuseEnabled bool
+	readMu      sync.Mutex
+	writeMu     sync.Mutex
 	closeOnce  sync.Once
 	closed     atomic.Bool
 	readDLN    atomic.Int64
@@ -156,10 +177,21 @@ type proxyUringConn struct {
 
 func newProxyUringConn(fd int, pool *proxyRingPool) (*proxyUringConn, error) {
 	prepareAcceptedFD(fd)
+	rr, err := newIOUring(proxyRingEntries)
+	if err != nil {
+		return nil, err
+	}
+	wr, err := newIOUring(proxyRingEntries)
+	if err != nil {
+		rr.close()
+		return nil, err
+	}
 	localAddr, remoteAddr := socketAddrs(fd)
 	return &proxyUringConn{
 		fd:         fd,
 		pool:       pool,
+		readRing:   rr,
+		writeRing:  wr,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 	}, nil
@@ -178,9 +210,31 @@ func (c *proxyUringConn) Read(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 
-	ring, idx := c.pool.acquireReadRing()
-	n, err := ring.recv(c.fd, p, c.readDeadline())
-	c.pool.releaseReadRing(idx)
+	if c.fuseEnabled {
+		c.writeMu.Lock()
+		pend := c.pendingSend
+		c.pendingSend = c.pendingSend[:0]
+		c.writeMu.Unlock()
+		if len(pend) > 0 {
+			if len(pend) <= proxyFuseMaxSend {
+				n, err := c.readRing.sendRecvLinked(c.fd, pend, p, c.readDeadline())
+				err = c.normalizeError(err)
+				c.readMu.Unlock()
+				if err != nil {
+					_ = c.Close()
+				}
+				return n, err
+			}
+			if _, err := c.writeRing.sendAll(c.fd, pend, c.writeDeadline()); err != nil {
+				err = c.normalizeError(err)
+				c.readMu.Unlock()
+				_ = c.Close()
+				return 0, err
+			}
+		}
+	}
+
+	n, err := c.readRing.recv(c.fd, p, c.readDeadline())
 
 	err = c.normalizeError(err)
 	c.readMu.Unlock()
@@ -203,9 +257,13 @@ func (c *proxyUringConn) Write(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 
-	ring, idx := c.pool.acquireWriteRing()
-	n, err := ring.sendAll(c.fd, p, c.writeDeadline())
-	c.pool.releaseWriteRing(idx)
+	if c.fuseEnabled {
+		c.pendingSend = append(c.pendingSend, p...)
+		c.writeMu.Unlock()
+		return len(p), nil
+	}
+
+	n, err := c.writeRing.sendAll(c.fd, p, c.writeDeadline())
 
 	err = c.normalizeError(err)
 	c.writeMu.Unlock()
@@ -227,6 +285,14 @@ func (c *proxyUringConn) Close() error {
 		if c.fd >= 0 {
 			closeErr = syscall.Close(c.fd)
 			c.fd = -1
+		}
+		if c.readRing != nil {
+			c.readRing.close()
+			c.readRing = nil
+		}
+		if c.writeRing != nil {
+			c.writeRing.close()
+			c.writeRing = nil
 		}
 		c.writeMu.Unlock()
 		c.readMu.Unlock()

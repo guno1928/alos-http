@@ -1,6 +1,60 @@
 package core
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
+
+const (
+	qpackBlockCacheMaxEntries = 1024
+	qpackBlockCacheMaxBytes   = 1 << 20
+	qpackPrefixCacheMaxEntries = 512
+)
+
+type qpackBlockCache struct {
+	mu    sync.RWMutex
+	m     map[string][][2]string
+	bytes int
+}
+
+var qpackDecodedBlocks = qpackBlockCache{m: make(map[string][][2]string)}
+
+func (c *qpackBlockCache) get(block []byte) ([][2]string, bool) {
+	c.mu.RLock()
+	h, ok := c.m[string(block)]
+	c.mu.RUnlock()
+	return h, ok
+}
+
+func (c *qpackBlockCache) put(block []byte, headers [][2]string) {
+	cp := make([][2]string, len(headers))
+	total := len(block)
+	for i, h := range headers {
+		n := strings.Clone(h[0])
+		v := strings.Clone(h[1])
+		cp[i] = [2]string{n, v}
+		total += len(n) + len(v)
+	}
+	c.mu.Lock()
+	if len(c.m) < qpackBlockCacheMaxEntries && c.bytes+total <= qpackBlockCacheMaxBytes {
+		if _, exists := c.m[string(block)]; !exists {
+			c.m[strings.Clone(UnsafeString(block))] = cp
+			c.bytes += total
+		}
+	}
+	c.mu.Unlock()
+}
+
+type qpackRespPrefixKey struct {
+	status int
+	ct     string
+	server string
+}
+
+var (
+	qpackRespPrefixMu    sync.RWMutex
+	qpackRespPrefixCache = make(map[qpackRespPrefixKey]string)
+)
 
 var qpackStaticTable = [99][2]string{
 	{":authority", ""},
@@ -256,35 +310,50 @@ func (e *QPACKEncoder) EncodeHeader(name, value string) {
 
 type QPACKDecoder struct{}
 
+var qpackArenaPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 4096); return &b },
+}
+
 func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
+	h, _, err := d.DecodeAppend(data, nil)
+	return h, err
+}
+
+func (d *QPACKDecoder) DecodeAppend(data []byte, headers [][2]string) ([][2]string, *[]byte, error) {
+	ap := qpackArenaPool.Get().(*[]byte)
+	need := len(data)*8/5 + 16
+	if cap(*ap) < need {
+		*ap = make([]byte, 0, need)
+	}
+	arena := (*ap)[:0]
+
 	if len(data) < 2 {
-		return nil, ErrTruncated
+		return headers, ap, ErrTruncated
 	}
 	pos := 0
 	_, n := qpackDecodeInt(data[pos:], 8)
 	if n == 0 {
-		return nil, ErrTruncated
+		return headers, ap, ErrTruncated
 	}
 	pos += n
 	_, sn := qpackDecodeInt(data[pos:], 7)
 	if sn == 0 {
-		return nil, ErrTruncated
+		return headers, ap, ErrTruncated
 	}
 	pos += sn
 
-	var headers [][2]string
 	for pos < len(data) {
 		b := data[pos]
 		if b&0x80 != 0 {
 			static := b&0x40 != 0
 			idx, n := qpackDecodeInt(data[pos:], 6)
 			if n == 0 {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			pos += n
 			if static {
 				if idx >= uint64(len(qpackStaticTable)) {
-					return nil, ErrTruncated
+					return nil, ap, ErrTruncated
 				}
 				headers = append(headers, qpackStaticTable[idx])
 			}
@@ -292,18 +361,20 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			nameIsStatic := b&0x10 != 0
 			nameIdx, n := qpackDecodeInt(data[pos:], 4)
 			if n == 0 {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			pos += n
-			value, vn := qpackDecodeString(data[pos:])
+			var value string
+			var vn int
+			value, vn, arena = qpackDecodeStringArena(data[pos:], arena)
 			if vn == 0 {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			pos += vn
 			var name string
 			if nameIsStatic {
 				if nameIdx >= uint64(len(qpackStaticTable)) {
-					return nil, ErrTruncated
+					return nil, ap, ErrTruncated
 				}
 				name = qpackStaticTable[nameIdx][0]
 			}
@@ -312,23 +383,27 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			huffName := b&0x08 != 0
 			nameLen, n := qpackDecodeInt(data[pos:], 3)
 			if n == 0 {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			pos += n
 			if nameLen > uint64(len(data)) || pos+int(nameLen) > len(data) {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			nameRaw := data[pos : pos+int(nameLen)]
 			pos += int(nameLen)
 			var name string
+			start := len(arena)
 			if huffName {
-				name = hpackHuffmanDecode(nameRaw)
+				arena = hpackHuffmanDecodeInto(arena, nameRaw)
 			} else {
-				name = string(nameRaw)
+				arena = append(arena, nameRaw...)
 			}
-			value, vn := qpackDecodeString(data[pos:])
+			name = UnsafeString(arena[start:])
+			var value string
+			var vn int
+			value, vn, arena = qpackDecodeStringArena(data[pos:], arena)
 			if vn == 0 {
-				return nil, ErrTruncated
+				return nil, ap, ErrTruncated
 			}
 			pos += vn
 			headers = append(headers, [2]string{name, value})
@@ -336,44 +411,65 @@ func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 			pos++
 		}
 		if len(headers) > 128 {
-			return nil, ErrTooManyHeaders
+			return nil, ap, ErrTooManyHeaders
 		}
 	}
-	return headers, nil
+	*ap = arena
+	return headers, ap, nil
+}
+
+func qpackDecodeStringArena(data, arena []byte) (string, int, []byte) {
+	if len(data) == 0 {
+		return "", 0, arena
+	}
+	huffman := data[0]&0x80 != 0
+	sLen, n := qpackDecodeInt(data, 7)
+	if n == 0 || sLen > uint64(len(data)) || n+int(sLen) > len(data) {
+		return "", 0, arena
+	}
+	raw := data[n : n+int(sLen)]
+	start := len(arena)
+	if huffman {
+		arena = hpackHuffmanDecodeInto(arena, raw)
+	} else {
+		arena = append(arena, raw...)
+	}
+	return UnsafeString(arena[start:]), n + int(sLen), arena
 }
 
 func qpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	return HpackDecodeInt(data, prefixBits)
 }
 
-func qpackDecodeString(data []byte) (string, int) {
-	if len(data) == 0 {
-		return "", 0
-	}
-	huffman := data[0]&0x80 != 0
-	sLen, n := qpackDecodeInt(data, 7)
-	if n == 0 || sLen > uint64(len(data)) || n+int(sLen) > len(data) {
-		return "", 0
-	}
-	raw := data[n : n+int(sLen)]
-	if huffman {
-		return hpackHuffmanDecode(raw), n + int(sLen)
-	}
-	return string(raw), n + int(sLen)
-}
 
 var qpackEncodeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 256); return &b },
 }
 
-func qpackEncodeResponseHeaders(status int, contentType string, contentLength int64, headers [][2]string, serverName string) []byte {
+func qpackEncodeResponseHeaders(status int, contentType string, contentLength int64, headers [][2]string, serverName string) *[]byte {
 	bp := qpackEncodeBufPool.Get().(*[]byte)
 	enc := QPACKEncoder{}
 	enc.Reset((*bp)[:0])
-	enc.encodeRequiredInsertCount()
-	enc.EncodeStatus(status)
-	if contentType != "" {
-		enc.EncodeHeader("content-type", contentType)
+	key := qpackRespPrefixKey{status: status, ct: contentType, server: serverName}
+	qpackRespPrefixMu.RLock()
+	prefix, ok := qpackRespPrefixCache[key]
+	qpackRespPrefixMu.RUnlock()
+	if ok {
+		enc.buf = append(enc.buf, prefix...)
+	} else {
+		enc.encodeRequiredInsertCount()
+		enc.EncodeStatus(status)
+		if contentType != "" {
+			enc.EncodeHeader("content-type", contentType)
+		}
+		enc.EncodeHeader("server", serverName)
+		p := string(enc.buf)
+		qpackRespPrefixMu.Lock()
+		if len(qpackRespPrefixCache) < qpackPrefixCacheMaxEntries {
+			ck := qpackRespPrefixKey{status: status, ct: strings.Clone(contentType), server: strings.Clone(serverName)}
+			qpackRespPrefixCache[ck] = p
+		}
+		qpackRespPrefixMu.Unlock()
 	}
 	if contentLength >= 0 {
 		var clBuf [20]byte
@@ -385,7 +481,6 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			enc.encodeLiteral("content-length", UnsafeString(clStr))
 		}
 	}
-	enc.EncodeHeader("server", serverName)
 	for i := range headers {
 		name := headers[i][0]
 		if name != "" && name[0] != ':' {
@@ -396,9 +491,6 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			}
 		}
 	}
-	result := make([]byte, len(enc.buf))
-	copy(result, enc.buf)
-	*bp = enc.buf[:0]
-	qpackEncodeBufPool.Put(bp)
-	return result
+	*bp = enc.buf
+	return bp
 }

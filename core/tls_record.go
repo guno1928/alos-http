@@ -38,6 +38,32 @@ func (bc *BufConn) Read(p []byte) (int, error) {
 	return bc.br.Read(p)
 }
 
+func releaseOwnedWriteBuf(data []byte, releaseBuf *[]byte, releasePool uint8) {
+	if releaseBuf == nil {
+		return
+	}
+	switch releasePool {
+	case writeOwnedReleaseSmallBuf:
+		*releaseBuf = data[:0]
+		SmallBufPool.Put(releaseBuf)
+	case writeOwnedReleaseMediumBuf:
+		*releaseBuf = data[:0]
+		MediumBufPool.Put(releaseBuf)
+	case writeOwnedReleaseLargeBuf:
+		*releaseBuf = data[:0]
+		LargeBufPool.Put(releaseBuf)
+	}
+}
+
+func (bc *BufConn) WriteOwned(p []byte, releaseBuf *[]byte, releasePool uint8) (int, error) {
+	if owned, ok := bc.Conn.(ownedWriteConn); ok {
+		return owned.WriteOwned(p, releaseBuf, releasePool)
+	}
+	n, err := bc.Conn.Write(p)
+	releaseOwnedWriteBuf(p, releaseBuf, releasePool)
+	return n, err
+}
+
 type TLSConn struct {
 	Raw     net.Conn
 	ReadBuf []byte

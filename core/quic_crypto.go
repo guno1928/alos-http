@@ -20,6 +20,7 @@ type quicKeys struct {
 	aead      cipher.AEAD
 	hp        headerProtector
 	iv        [16]byte
+	nonce     [16]byte
 	valid     bool
 	suiteID   uint16
 	nonceSize int
@@ -32,12 +33,12 @@ type headerProtector interface {
 
 type aesHeaderProtector struct {
 	block cipher.Block
+	buf   [16]byte
 }
 
 func (a *aesHeaderProtector) mask(sample []byte) [5]byte {
-	var encrypted [16]byte
-	a.block.Encrypt(encrypted[:], sample[:16])
-	return [5]byte{encrypted[0], encrypted[1], encrypted[2], encrypted[3], encrypted[4]}
+	a.block.Encrypt(a.buf[:], sample[:16])
+	return [5]byte{a.buf[0], a.buf[1], a.buf[2], a.buf[3], a.buf[4]}
 }
 
 type chachaHeaderProtector struct {
@@ -153,22 +154,20 @@ func quicDeriveAppKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig)
 }
 
 func (qk *quicKeys) encrypt(dst, header, payload []byte, pn uint64, pnOffset int) []byte {
-	var nonce [16]byte
 	sl := qk.staticLen
-	copy(nonce[:sl], qk.iv[:sl])
-	binary.BigEndian.PutUint64(nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
+	copy(qk.nonce[:sl], qk.iv[:sl])
+	binary.BigEndian.PutUint64(qk.nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
 
-	dst = qk.aead.Seal(dst, nonce[:qk.nonceSize], payload, header)
+	dst = qk.aead.Seal(dst, qk.nonce[:qk.nonceSize], payload, header)
 	return dst
 }
 
 func (qk *quicKeys) decrypt(dst, header, payload []byte, pn uint64) ([]byte, error) {
-	var nonce [16]byte
 	sl := qk.staticLen
-	copy(nonce[:sl], qk.iv[:sl])
-	binary.BigEndian.PutUint64(nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
+	copy(qk.nonce[:sl], qk.iv[:sl])
+	binary.BigEndian.PutUint64(qk.nonce[sl:], binary.BigEndian.Uint64(qk.iv[sl:])^pn)
 
-	return qk.aead.Open(dst, nonce[:qk.nonceSize], payload, header)
+	return qk.aead.Open(dst, qk.nonce[:qk.nonceSize], payload, header)
 }
 
 func (qk *quicKeys) applyHeaderProtection(packet []byte, pnOffset int, pnLen int) {

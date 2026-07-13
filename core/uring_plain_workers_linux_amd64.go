@@ -24,10 +24,11 @@ const (
 	plainUringOpClose  = 4
 	plainUringOpWake   = 5
 
-	plainConnStateFree    = 0
-	plainConnStateReading = 1
-	plainConnStateWriting = 2
-	plainConnStateClosing = 3
+	plainConnStateFree       = 0
+	plainConnStateReading    = 1
+	plainConnStateWriting    = 2
+	plainConnStateClosing    = 3
+	plainConnStateForwarding = 4
 
 	plainConnProtoUnknown = 0
 	plainConnProtoH1      = 1
@@ -80,6 +81,8 @@ type plainWorkerConn struct {
 	consumed      int
 	closeAfter    bool
 	h2            tlsWorkerH2State
+	fwdIndex      int32
+	fwdGen        uint16
 }
 
 type plainUringWorker struct {
@@ -103,6 +106,7 @@ type plainUringWorker struct {
 	wakeArmed       bool
 	parking         bool
 	active          atomic.Int64
+	asyncFwd        *asyncForwardPool
 }
 
 type plainUringBackend struct {
@@ -136,6 +140,13 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 	shards, _ := ioUringShardLayout()
 	workerCount := plainUringWorkerCount(s.config, shards)
 	acceptShards := minInt(len(listeners), workerCount)
+	if len(listeners) > acceptShards {
+		log.Printf("[WARN] plain io_uring: %d listeners but only %d accept workers; closing %d excess listeners", len(listeners), acceptShards, len(listeners)-acceptShards)
+		for i := acceptShards; i < len(listeners); i++ {
+			_ = listeners[i].Close()
+		}
+		listeners = listeners[:acceptShards]
+	}
 	recvMultishotSupported, _ := probeIOUringRecvMultishot()
 	backend := &plainUringBackend{
 		server:  s,
@@ -419,6 +430,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 		}
 		if nowTime-lastSweep >= worker.sweepIntervalNs {
 			worker.sweepIdle(nowTime)
+			worker.sweepForwards(nowTime)
 			lastSweep = nowTime
 		}
 		if err := worker.drainHandoffs(nowTime); err != nil {
@@ -473,6 +485,8 @@ func (worker *plainUringWorker) handleCompletion(backend *plainUringBackend, cqe
 		return worker.handleAccept(backend, cqe.Res, now)
 	case plainUringOpWake:
 		return worker.handleWake(now, cqe.Res)
+	case plainUringOpBackendConnect, plainUringOpBackendSend, plainUringOpBackendRecv, plainUringOpBackendClose:
+		return worker.handleBackendCompletion(op, cqe.UserData, cqe.Res)
 	case plainUringOpRead, plainUringOpWrite, plainUringOpClose:
 		if connIndex < 0 || connIndex >= len(worker.connections) {
 			if op == plainUringOpRead {
@@ -541,7 +555,6 @@ func (worker *plainUringWorker) handleAccept(backend *plainUringBackend, result 
 			return nil
 		}
 		if result == -int32(syscall.EAGAIN) || result == -int32(syscall.EINTR) || result == -int32(syscall.ECONNABORTED) {
-			atomic.StoreInt64(&worker.nextAcceptRetry, now+int64(5*time.Millisecond))
 			return nil
 		}
 		return fmt.Errorf("plain io_uring accept failed: %w", syscall.Errno(-result))
@@ -572,6 +585,9 @@ func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, 
 	conn.readN += int(result)
 	if len(conn.readBuf) < conn.readN {
 		conn.readBuf = conn.readBuf[:conn.readN]
+	}
+	if conn.state == plainConnStateForwarding {
+		return nil
 	}
 	if conn.protocol == plainConnProtoH2 {
 		return worker.processHTTP2(conn)
@@ -614,7 +630,7 @@ func (worker *plainUringWorker) handleBufferedRead(conn *plainWorkerConn, result
 	}
 	worker.appendBufferedRead(&conn.readBuf, bufferID, n)
 	conn.readN = len(conn.readBuf)
-	if conn.state == plainConnStateWriting {
+	if conn.state == plainConnStateWriting || conn.state == plainConnStateForwarding {
 		return nil
 	}
 	if conn.protocol == plainConnProtoH2 {
@@ -661,6 +677,26 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 				conn.requestCount++
 				worker.bumpReqStats()
 				worker.server.releaseRequestSlot()
+				batched := 0
+				for !closeConn && consumed < conn.readN {
+					nextResp, nextConsumed, nextClose, nextOK := worker.server.matchPlainRootFastRequest(conn.readBuf[consumed:conn.readN])
+					if !nextOK || !worker.server.tryAcquireRequestSlot() {
+						break
+					}
+					conn.requestCount++
+					worker.bumpReqStats()
+					worker.server.releaseRequestSlot()
+					if batched == 0 {
+						worker.beginBatchedWrite(conn, fastResp)
+					}
+					conn.writeBuf = append(conn.writeBuf, nextResp...)
+					consumed += nextConsumed
+					closeConn = nextClose
+					batched++
+				}
+				if batched > 0 {
+					return worker.queueBatchedResponses(conn, !closeConn, consumed)
+				}
 				return worker.queuePrebuiltResponse(conn, fastResp, !closeConn, consumed)
 			}
 		}
@@ -729,6 +765,9 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		conn.req.RemoteAddr = conn.remoteAddr
 		conn.resp.SetSW(nil)
 		conn.resp.lazyReq = &conn.req
+		if worker.tryAsyncForward(conn, consumed, closeConn) {
+			return nil
+		}
 		if worker.server.fastDispatch.Load() {
 			handler := worker.server.Router.Lookup(conn.req.Method, conn.req.Path, &conn.req)
 			handler(&conn.req, &conn.resp)
@@ -885,6 +924,35 @@ func (worker *plainUringWorker) queueResponse(conn *plainWorkerConn, keepAlive b
 	return nil
 }
 
+func (worker *plainUringWorker) beginBatchedWrite(conn *plainWorkerConn, first []byte) {
+	if conn.writeBorrowed || conn.writeBuf == nil {
+		conn.writeBorrowed = false
+		conn.writeBuf = acquirePooledBuf(&connWriteBufPool)
+	}
+	conn.writeBuf = append(conn.writeBuf[:0], first...)
+}
+
+func (worker *plainUringWorker) queueBatchedResponses(conn *plainWorkerConn, keepAlive bool, consumed int) error {
+	conn.keepAlive = keepAlive
+	conn.closeAfter = !keepAlive
+	conn.consumed = consumed
+	conn.writeN = len(conn.writeBuf)
+	conn.writeSent = 0
+	conn.bodyBuf = nil
+	conn.bodySent = 0
+	conn.writingBody = false
+	worker.compactReadBuffer(conn, consumed)
+	if conn.writeN == 0 {
+		return worker.closeConnection(conn)
+	}
+	conn.writeZeroCopy = false
+	conn.state = plainConnStateWriting
+	if err := worker.queueWrite(conn, conn.writeBuf[:conn.writeN]); err != nil {
+		return worker.closeConnection(conn)
+	}
+	return nil
+}
+
 func (worker *plainUringWorker) queuePrebuiltResponse(conn *plainWorkerConn, payload []byte, keepAlive bool, consumed int) error {
 	conn.keepAlive = keepAlive
 	conn.closeAfter = !keepAlive
@@ -1007,10 +1075,6 @@ func (worker *plainUringWorker) fillAccepts(now int64) error {
 	if atomic.LoadInt64(&worker.acceptBackfill) <= 0 || worker.server.doneClosed() || worker.listenerFD < 0 {
 		return nil
 	}
-	retryAt := atomic.LoadInt64(&worker.nextAcceptRetry)
-	if retryAt != 0 && now < retryAt {
-		return nil
-	}
 	for atomic.LoadInt64(&worker.acceptBackfill) > 0 {
 		if err := worker.ring.prepAcceptUser(worker.listenerFD, plainEncodeUserData(plainUringOpAccept, 0, 0), uint32(sockCloexec|sockNonblock)); err != nil {
 			return err
@@ -1115,6 +1179,9 @@ func (worker *plainUringWorker) ensureReadCapacity(conn *plainWorkerConn, minFre
 func (worker *plainUringWorker) closeConnection(conn *plainWorkerConn) error {
 	if conn.fd < 0 || conn.state == plainConnStateClosing {
 		return nil
+	}
+	if conn.state == plainConnStateForwarding {
+		worker.forwardClientGone(conn)
 	}
 	conn.state = plainConnStateClosing
 	conn.closeDone = false
@@ -1298,9 +1365,7 @@ func (worker *plainUringWorker) runIdleSweeper(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if worker.active.Load() > 0 {
-				worker.signalWake()
-			}
+			worker.signalWake()
 		}
 	}
 }

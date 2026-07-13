@@ -183,6 +183,7 @@ type Config struct {
 
 	QUICMaxData       int64
 	QUICMaxStreamData int64
+	QUICMaxUDPPayload int
 
 	TLSCertFile   string
 	TLSKeyFile    string

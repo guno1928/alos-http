@@ -3,12 +3,22 @@
 package core
 
 import (
+	"encoding/binary"
 	"log"
 	"net"
 	"runtime"
 	"sync"
+	"syscall"
+	"unsafe"
 
 	"github.com/guno1928/alosmap"
+)
+
+const (
+	quicRecvBufRingEntries = 2048
+	quicRecvBufSize        = 2048
+	quicRecvmsgOutSize     = 16
+	quicRecvNameLen        = 16
 )
 
 // ListenAndServeQUIC serves HTTP/3 over QUIC on the server's configured address (Addr, default ":443") using the loaded TLS certificates, blocking until the server stops. It is the QUIC counterpart to ListenAndServe.
@@ -68,44 +78,153 @@ func (s *Server) ListenAndServeQUIC() error {
 }
 
 func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *quicConnMap) {
-	if debugFlag.Load() {
-		log.Printf("[H3-DBG] serveQUICIOUring: recv loop starting, fd=%d", uc.fd)
-	}
-	buf := make([]byte, 65536)
-	pktCount := 0
-	for {
-		n, remoteAddr, err := uc.recvFromSyscall(buf)
-		if err != nil {
-			if s.shuttingDown.Load() || uc.closed.Load() {
-				if debugFlag.Load() {
-					log.Printf("[H3-DBG] serveQUICIOUring: shutting down")
-				}
-				return
-			}
-			if debugFlag.Load() {
-				log.Printf("[H3-DBG] serveQUICIOUring: recv error: %v", err)
-			}
-			continue
-		}
-		pktCount++
-		if debugFlag.Load() {
-			log.Printf("[H3-DBG] serveQUICIOUring: UDP packet #%d: %d bytes from %s first=0x%02x", pktCount, n, remoteAddr, buf[0])
-		}
-		if n < 5 {
-			if debugFlag.Load() {
-				log.Printf("[H3-DBG] serveQUICIOUring: packet too small (%d bytes), skipping", n)
-			}
-			continue
-		}
-
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		s.handleQUICPacketIOUring(uc, remoteAddr, pkt, connMap)
+	startReqStreamWorkers()
+	uc.startSendLoop()
+	if !s.serveQUICMultishot(uc, connMap) {
+		s.serveQUICIOUringSingleShot(uc, connMap)
 	}
 }
 
-func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *quicConnMap) {
+// serveQUICMultishot receives QUIC datagrams via io_uring multishot recvmsg with
+// a provided buffer ring (the same class of fast path used by HTTP/1.1 and
+// HTTP/2). It returns false if multishot setup or arming fails, so the caller can
+// fall back to the single-shot path.
+func (s *Server) serveQUICMultishot(uc *ioUringUDPConn, connMap *quicConnMap) bool {
+	bufRing, err := newIOUringBufferRing(quicRecvBufRingEntries, quicRecvBufSize, 1)
+	if err != nil {
+		return false
+	}
+	if err := bufRing.register(uc.recvRing); err != nil {
+		bufRing.close()
+		return false
+	}
+	defer bufRing.close()
+	defer func() { _ = bufRing.unregister(uc.recvRing) }()
+
+	nameBuf := new([quicRecvNameLen]byte)
+	msg := new(msghdr)
+	msg.Name = &nameBuf[0]
+	msg.Namelen = quicRecvNameLen
+
+	arm := func() bool {
+		return uc.recvRing.prepRecvmsgMultishotUser(uc.fd, bufRing.bgid, msg, 1, false) == nil
+	}
+	if !arm() {
+		return false
+	}
+	if _, err := uc.recvRing.submitIfNeeded(); err != nil {
+		return false
+	}
+
+	completions := make([]ioUringCqe, 256)
+	firstCompletion := true
+	for {
+		if uc.closed.Load() || s.shuttingDown.Load() {
+			return true
+		}
+		count := uc.recvRing.peekBatch(completions)
+		if count == 0 {
+			cqe, err := uc.recvRing.waitCqe()
+			if err != nil {
+				if uc.closed.Load() || s.shuttingDown.Load() {
+					return true
+				}
+				if isIOUringTransient(err) {
+					continue
+				}
+				return true
+			}
+			completions[0] = cqe
+			count = 1
+		}
+		rearm := false
+		for i := 0; i < count; i++ {
+			cqe := completions[i]
+			if firstCompletion {
+				firstCompletion = false
+				if cqe.Res < 0 {
+					e := syscall.Errno(-cqe.Res)
+					if e == syscall.EINVAL || e == syscall.ENOSYS || e == syscall.EOPNOTSUPP {
+						return false
+					}
+				}
+			}
+			flags := cqe.Flags
+			if flags&ioUringCqeBuffer != 0 {
+				bid := cqeBufferID(flags)
+				if cqe.Res > 0 {
+					s.dispatchQUICMultishot(uc, bufRing.buffer(bid), int(cqe.Res), connMap)
+				}
+				bufRing.recycle(bid)
+			}
+			if flags&ioUringCqeMore == 0 {
+				rearm = true
+			}
+		}
+		if rearm && !uc.closed.Load() && !s.shuttingDown.Load() {
+			if !arm() {
+				return true
+			}
+		}
+		if _, err := uc.recvRing.submitIfNeeded(); err != nil {
+			if uc.closed.Load() || s.shuttingDown.Load() {
+				return true
+			}
+		}
+	}
+}
+
+func (s *Server) dispatchQUICMultishot(uc *ioUringUDPConn, buf []byte, res int, connMap *quicConnMap) {
+	payloadOff := quicRecvmsgOutSize + quicRecvNameLen
+	if buf == nil || res <= payloadOff || len(buf) < payloadOff {
+		return
+	}
+	namelen := binary.LittleEndian.Uint32(buf[0:4])
+	payloadlen := binary.LittleEndian.Uint32(buf[8:12])
+	if namelen == 0 {
+		return
+	}
+	pl := int(payloadlen)
+	if pl <= 0 || payloadOff+pl > res {
+		pl = res - payloadOff
+	}
+	if pl < 5 || payloadOff+pl > len(buf) {
+		return
+	}
+	sa := (*syscall.RawSockaddrInet4)(unsafe.Pointer(&buf[quicRecvmsgOutSize]))
+	pbuf := quicRecvBufPool.Get().(*[]byte)
+	*pbuf = append((*pbuf)[:0], buf[payloadOff:payloadOff+pl]...)
+	var addr *net.UDPAddr
+	if quicIsLongHeader(*pbuf) {
+		addr = sockaddrToUDPAddr(sa)
+	}
+	s.handleQUICPacketIOUring(uc, addr, *pbuf, pbuf, connMap)
+}
+
+func (s *Server) serveQUICIOUringSingleShot(uc *ioUringUDPConn, connMap *quicConnMap) {
+	buf := make([]byte, 65536)
+	for {
+		n, remoteAddr, err := uc.recvmsgURing(buf)
+		if err != nil {
+			if s.shuttingDown.Load() || uc.closed.Load() {
+				return
+			}
+			continue
+		}
+		if n < 5 {
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		s.handleQUICPacketIOUring(uc, remoteAddr, pkt, nil, connMap)
+	}
+}
+
+func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, pbuf *[]byte, connMap *quicConnMap) {
 	if len(data) < 5 {
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
+		}
 		return
 	}
 
@@ -115,17 +234,20 @@ func (s *Server) handleQUICPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDP
 	}
 
 	if isLong {
-		s.handleQUICLongPacketIOUring(uc, remoteAddr, data, connMap)
+		s.handleQUICLongPacketIOUring(uc, remoteAddr, data, pbuf, connMap)
 	} else {
-		s.handleQUICShortPacketIOUring(uc, remoteAddr, data, connMap)
+		s.handleQUICShortPacketIOUring(uc, remoteAddr, data, pbuf, connMap)
 	}
 }
 
-func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *quicConnMap) {
+func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, pbuf *[]byte, connMap *quicConnMap) {
 	hdr, _, err := quicParseLongHeader(data)
 	if err != nil {
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] handleLongPacket: parse error: %v (dataLen=%d)", err, len(data))
+		}
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
 		}
 		return
 	}
@@ -138,6 +260,9 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 	if hdr.version != quicVersion1 {
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] handleLongPacket: unsupported version 0x%08x", hdr.version)
+		}
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
 		}
 		return
 	}
@@ -161,10 +286,13 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 				if debugFlag.Load() {
 					log.Printf("[H3-DBG] handleLongPacket: createQUICConnIOUring returned nil!")
 				}
+				if pbuf != nil {
+					quicRecvBufPool.Put(pbuf)
+				}
 				return
 			}
 		}
-		qc.handlePacket(data)
+		qc.handlePacketPooled(data, pbuf)
 		return
 	}
 
@@ -172,16 +300,22 @@ func (s *Server) handleQUICLongPacketIOUring(uc *ioUringUDPConn, remoteAddr *net
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] handleLongPacket: forwarding type=%d to existing conn", hdr.pktType)
 		}
-		qc.handlePacket(data)
+		qc.handlePacketPooled(data, pbuf)
 	} else {
 		if debugFlag.Load() {
 			log.Printf("[H3-DBG] handleLongPacket: no conn found for dcid=%x type=%d", hdr.dcid, hdr.pktType)
 		}
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
+		}
 	}
 }
 
-func (s *Server) handleQUICShortPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, connMap *quicConnMap) {
+func (s *Server) handleQUICShortPacketIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAddr, data []byte, pbuf *[]byte, connMap *quicConnMap) {
 	if len(data) < 1+quicConnIDLen {
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
+		}
 		return
 	}
 	dcid := data[1 : 1+quicConnIDLen]
@@ -189,9 +323,12 @@ func (s *Server) handleQUICShortPacketIOUring(uc *ioUringUDPConn, remoteAddr *ne
 
 	qc, exists := connMap.Load(dcidKey)
 	if !exists {
+		if pbuf != nil {
+			quicRecvBufPool.Put(pbuf)
+		}
 		return
 	}
-	qc.handlePacket(data)
+	qc.handlePacketPooled(data, pbuf)
 }
 
 func newQUICConnIOUring(server *Server, uc *ioUringUDPConn, remoteAddr *net.UDPAddr, dcid, scid []byte) *QUICConn {
@@ -226,6 +363,7 @@ func (s *Server) createQUICConnIOUring(uc *ioUringUDPConn, remoteAddr *net.UDPAd
 
 	go qc.recvLoop()
 	go qc.runIdleTimer()
+	go qc.runLossTimer()
 
 	quicActiveConns.Add(1)
 	Stats.TotalConns.Add(1)

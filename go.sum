@@ -19,6 +19,8 @@ github.com/ericlagergren/subtle v0.0.0-20220507045147-890d697da010 h1:fuGucgPk5d
 github.com/ericlagergren/subtle v0.0.0-20220507045147-890d697da010/go.mod h1:JtBcj7sBuTTRupn7c2bFspMDIObMJsVK8TeUvpShPok=
 github.com/guno1928/alosmap v0.0.0-20260622010136-91db0f96eeae h1:sgxHpHInuAmUvyTkIzosDhu6xikW9bGVMb8JZ+p2W5g=
 github.com/guno1928/alosmap v0.0.0-20260622010136-91db0f96eeae/go.mod h1:8qQvCRDYvZVcmQPeBtloAnPfJU/8xnkpwBstcQszvMc=
+github.com/guno1928/turbo v0.0.0-20260706091412-3b318c1e1ce7 h1:SRYzSiwpEvJQo6g0M/rgNMgGLjzYEfnHi3sdZ4aXmck=
+github.com/guno1928/turbo v0.0.0-20260706091412-3b318c1e1ce7/go.mod h1:8IMRpOPG6HyRJ7VASdbdmGXof4fW9B1xyeqdcJQ9qK4=
 github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
 github.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

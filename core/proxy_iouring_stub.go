@@ -10,3 +10,5 @@ import (
 func dialProxyConn(addr string, timeout time.Duration) (net.Conn, error) {
 	return DialTCP4(addr, timeout)
 }
+
+func enableProxyFuse(conn net.Conn) {}

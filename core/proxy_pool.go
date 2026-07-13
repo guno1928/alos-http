@@ -99,6 +99,7 @@ func (cp *connPool) dial() (*pooledConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	enableProxyFuse(conn)
 	br := brPool.Get().(*bufio.Reader)
 	br.Reset(conn)
 	now := time.Now()
@@ -179,7 +180,7 @@ func (cp *connPool) evictStale() {
 }
 
 func dialBackendConn(addr string, useTLS, tlsSkipVerify bool, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialProxyConn(addr, timeout)
+	conn, err := DialTCP4(addr, timeout)
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,10 @@
 package core
 
-import "github.com/zeebo/xxh3"
+import (
+	"bytes"
+
+	"github.com/zeebo/xxh3"
+)
 
 var HpackStaticTable = [62][2]string{
 	{},
@@ -535,6 +539,11 @@ type HpackDecoder struct {
 	dynSize          int
 	huffmanCache     [hpackHuffmanDecodeCacheSize]hpackHuffmanDecodeCacheEntry
 	huffmanCacheNext uint8
+	tableGen         uint64
+	memoBlock        []byte
+	memoMeta         hpackRequestMeta
+	memoValid        bool
+	memoRoot         bool
 }
 
 func NewHpackDecoder() *HpackDecoder {
@@ -635,6 +644,8 @@ func (d *HpackDecoder) lookupName(idx uint64) (string, bool) {
 }
 
 func (d *HpackDecoder) addEntry(name, value string) {
+	d.tableGen++
+	d.memoValid = false
 	entrySize := 32 + len(name) + len(value)
 	for d.dynSize+entrySize > d.maxTableSize && d.dynLen > 0 {
 		tail := d.dynGet(d.dynLen - 1)
@@ -651,6 +662,8 @@ func (d *HpackDecoder) addEntry(name, value string) {
 }
 
 func (d *HpackDecoder) setMaxSize(maxSize int) {
+	d.tableGen++
+	d.memoValid = false
 	d.maxTableSize = maxSize
 	for d.dynSize > d.maxTableSize && d.dynLen > 0 {
 		tail := d.dynGet(d.dynLen - 1)
@@ -1185,25 +1198,45 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 }
 
 func (d *HpackDecoder) DecodeFastRootRequest(data []byte) (hpackRequestMeta, bool, error) {
+	if d.memoValid && bytes.Equal(data, d.memoBlock) {
+		return d.memoMeta, d.memoRoot, nil
+	}
 	if len(data) >= 4 && data[0] == 0x82 && data[1] == 0x04 && data[len(data)-1] == 0x87 {
+		gen := d.tableGen
 		meta, err := d.DecodeRequestMeta(data)
-		if err == nil && meta.method == "GET" && meta.path == "/" {
-			return meta, true, nil
+		if err == nil {
+			isRoot := meta.method == "GET" && meta.path == "/"
+			if d.tableGen == gen {
+				d.storeMemo(data, meta, isRoot)
+			}
+			return meta, isRoot, nil
 		}
 		return meta, false, err
 	}
 	snap := d.snapshot()
+	gen := d.tableGen
 	meta, err := d.DecodeRequestMeta(data)
 	if err != nil {
 		d.restore(snap)
 		return meta, false, err
 	}
 	if meta.method == "GET" && meta.path == "/" {
+		if d.tableGen == gen {
+			d.storeMemo(data, meta, true)
+		}
 		return meta, true, nil
 	}
 	d.restore(snap)
 	return meta, false, nil
 }
+
+func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot bool) {
+	d.memoBlock = append(d.memoBlock[:0], block...)
+	d.memoMeta = meta
+	d.memoRoot = isRoot
+	d.memoValid = true
+}
+
 
 func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	if len(data) == 0 {
@@ -1246,6 +1279,25 @@ func HpackDecodeString(data []byte) (string, int) {
 		return decoded, n + int(sLen)
 	}
 	return string(raw), n + int(sLen)
+}
+
+func hpackHuffmanDecodeInto(dst, src []byte) []byte {
+	var bits uint64
+	var nbits uint8
+	for _, b := range src {
+		bits = bits<<8 | uint64(b)
+		nbits += 8
+		for nbits >= 5 {
+			decoded, codeLen := huffmanLookup(bits, nbits)
+			if codeLen == 0 {
+				break
+			}
+			dst = append(dst, decoded)
+			nbits -= codeLen
+			bits &= (1 << nbits) - 1
+		}
+	}
+	return dst
 }
 
 func hpackHuffmanDecode(src []byte) string {

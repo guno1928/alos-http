@@ -80,9 +80,10 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 		}
 		return
 	}
+	qc.applyPeerTransportParams(ch)
 	if debugFlag.Load() {
-		log.Printf("[H3-TLS] ClientHello: SNI=%q TLS13=%v suites=%v x25519=%v sessionID_len=%d",
-			ch.ServerName, ch.SupportsTLS13(), ch.CipherSuites, ch.X25519PubKey != nil, len(ch.SessionID))
+		log.Printf("[H3-TLS] ClientHello: SNI=%q TLS13=%v suites=%v x25519=%v sessionID_len=%d maxUDP=%d",
+			ch.ServerName, ch.SupportsTLS13(), ch.CipherSuites, ch.X25519PubKey != nil, len(ch.SessionID), ch.MaxUDPPayload)
 	}
 	if debugFlag.Load() {
 		log.Printf("[H3-TLS] ClientHello first 20 bytes: %x", data[:min(20, len(data))])
@@ -309,6 +310,7 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 	if nextRecvKeys != nil {
 		nextRecvKeys.hp = clientAppKeys.hp
 		qc.nextRecvKeys = nextRecvKeys
+		qc.recvSecret = nextRecvSecret
 	}
 
 	ts.stage = quicTLSStageWaitFinished

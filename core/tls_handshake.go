@@ -251,6 +251,9 @@ type ParsedClientHello struct {
 	SupportedGroups   []uint16
 	SignatureSchemes  []uint16
 	Random            [32]byte
+	MaxUDPPayload     uint64
+	InitialMaxData    uint64
+	InitialMaxStreamDataBidiLocal uint64
 
 	hasUncompressedPoint bool
 
@@ -282,6 +285,9 @@ func (ch *ParsedClientHello) Reset() {
 	ch.SupportedVersions = nil
 	ch.SupportedGroups = nil
 	ch.SignatureSchemes = nil
+	ch.MaxUDPPayload = 0
+	ch.InitialMaxData = 0
+	ch.InitialMaxStreamDataBidiLocal = 0
 	ch.hasUncompressedPoint = false
 	ch.cipherSuitesOverflow = nil
 	ch.supportedVersOverflow = nil
@@ -411,11 +417,47 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 					}
 				}
 			}
+		case 0x0039:
+			parseQUICTransportParams(result, extData)
 		}
 		i += extLen
 	}
 
 	return nil
+}
+
+func parseQUICTransportParams(result *ParsedClientHello, data []byte) {
+	for pos := 0; pos < len(data); {
+		id, n := quicParseVarint(data[pos:])
+		if n == 0 {
+			return
+		}
+		pos += n
+		plen, n2 := quicParseVarint(data[pos:])
+		if n2 == 0 {
+			return
+		}
+		pos += n2
+		if pos+int(plen) > len(data) {
+			return
+		}
+		switch id {
+		case 0x03, 0x04, 0x05:
+			v, n3 := quicParseVarint(data[pos:])
+			if n3 == 0 {
+				return
+			}
+			switch id {
+			case 0x03:
+				result.MaxUDPPayload = v
+			case 0x04:
+				result.InitialMaxData = v
+			case 0x05:
+				result.InitialMaxStreamDataBidiLocal = v
+			}
+		}
+		pos += int(plen)
+	}
 }
 
 func parseU16List(data []byte) []uint16 {

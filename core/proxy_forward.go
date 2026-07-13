@@ -43,7 +43,6 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 	}
 
 	clientIP := extractIP(req.RemoteAddr)
-	baseHeaders := append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 	if len(ds.backends) == 0 {
 		resp.Status(502).String("No healthy backend available")
 		return true
@@ -65,10 +64,10 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 
 		b := ds.backends[idx]
 		attemptReq := *req
-		attemptReq.Headers = append(make([][2]string, 0, len(baseHeaders)), baseHeaders...)
 
 		hostOverride := ds.config.HostHeader
 		if pe.OnRequest != nil {
+			attemptReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 			pr := &ProxyRequest{
 				Domain:     ds.config.Domain,
 				Backend:    b.Addr,
@@ -413,19 +412,27 @@ func streamUntilClose(br io.Reader, sw StreamWriter, buf []byte) error {
 
 func readLine(r io.Reader, buf []byte) ([]byte, error) {
 	if br, ok := r.(*bufio.Reader); ok {
-		for {
-			b, err := br.ReadByte()
-			if err != nil {
-				return buf, err
-			}
-			buf = append(buf, b)
-			if b == '\n' {
-				return buf, nil
-			}
-			if len(buf) > 8192 {
-				return buf, ErrProxyBadResponse
+		line, err := br.ReadSlice('\n')
+		if err == nil {
+			return append(buf, line...), nil
+		}
+		if err == bufio.ErrBufferFull {
+			buf = append(buf, line...)
+			for {
+				b, e := br.ReadByte()
+				if e != nil {
+					return buf, e
+				}
+				buf = append(buf, b)
+				if b == '\n' {
+					return buf, nil
+				}
+				if len(buf) > 8192 {
+					return buf, ErrProxyBadResponse
+				}
 			}
 		}
+		return append(buf, line...), err
 	}
 	var oneByte [1]byte
 	for {
@@ -677,19 +684,25 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 		switch {
 		case EqualFoldASCII(name, "content-type"):
 			contentType = val
+			continue
 		case EqualFoldASCII(name, "content-length"):
 			cl, ok := parseUint(val)
 			if ok {
 				contentLength = int64(cl)
 			}
+			continue
 		case EqualFoldASCII(name, "transfer-encoding"):
 			if EqualFoldASCII(val, "chunked") {
 				isChunked = true
 			}
+			continue
 		case EqualFoldASCII(name, "connection"):
 			if EqualFoldASCII(val, "close") {
 				keepAlive = false
 			}
+			continue
+		case EqualFoldASCII(name, "server"):
+			continue
 		}
 
 		if !isHopByHopFold(name) {

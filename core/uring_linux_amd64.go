@@ -24,7 +24,11 @@ const (
 	ioUringOffCqRing                 = 0x08000000
 	ioUringOffSqes                   = 0x10000000
 	ioUringEnterGetEvents            = 1
+	ioUringEnterExtArg               = 1 << 3
 	ioUringEnterRegistered           = 1 << 4
+	ioUringSqeIoLink                 = 1 << 2
+	proxyFuseSendUD                  = 0xF5E40001
+	proxyFuseRecvUD                  = 0xF5E40002
 	ioUringRegisterSyscall           = 427
 	ioUringOpReadv                   = 1
 	ioUringOpRead                    = 22
@@ -149,6 +153,15 @@ type ioUringKernelTimespec struct {
 	Sec  int64
 	Nsec int64
 }
+
+type ioUringGeteventsArg struct {
+	Sigmask   uint64
+	SigmaskSz uint32
+	Pad       uint32
+	Ts        uint64
+}
+
+var extArgUnsupported atomic.Bool
 
 type ioUringSyncCancelReg struct {
 	Addr    uint64
@@ -1030,6 +1043,97 @@ func (ring *ioUring) connect(fd int, addr unsafe.Pointer, addrLen uint64, deadli
 	return nil
 }
 
+// sendRecvLinked submits a linked send+recv pair in a SINGLE io_uring_enter and
+// waits for both completions, fusing a request/response round-trip into one
+// syscall. On timeout or any partial completion it returns an error; the caller
+// MUST discard the connection (its ring may hold an outstanding op).
+func (ring *ioUring) sendRecvLinked(fd int, sendBuf, recvBuf []byte, deadline time.Time) (int, error) {
+	s, err := ring.getSqe()
+	if err != nil {
+		return 0, err
+	}
+	s.Opcode = ioUringOpSend
+	s.Flags = ioUringSqeIoLink
+	s.Ioprio = 0
+	s.FD = int32(fd)
+	s.Off = 0
+	s.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(sendBuf))))
+	s.Len = uint32(len(sendBuf))
+	s.OpFlags = 0
+	s.BufIndex = 0
+	s.UserData = proxyFuseSendUD
+	r, err := ring.getSqe()
+	if err != nil {
+		return 0, err
+	}
+	r.Opcode = ioUringOpRecv
+	r.Flags = 0
+	r.Ioprio = 0
+	r.FD = int32(fd)
+	r.Off = 0
+	r.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(recvBuf))))
+	r.Len = uint32(len(recvBuf))
+	r.OpFlags = 0
+	r.BufIndex = 0
+	r.UserData = proxyFuseRecvUD
+
+	var waitErr error
+	if deadline.IsZero() {
+		_, waitErr = ring.submitAndWait(2)
+	} else if !extArgUnsupported.Load() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, errIOUringDeadlineExceeded
+		}
+		ts := ioUringKernelTimespec{Sec: int64(remaining / time.Second), Nsec: int64(remaining % time.Second)}
+		waitErr = ring.submitAndWaitTs(2, &ts)
+		if waitErr == syscall.EINVAL {
+			extArgUnsupported.Store(true)
+			_, waitErr = ring.submitAndWait(2)
+		}
+	} else {
+		_, waitErr = ring.submitAndWait(2)
+	}
+
+	var sendRes, recvRes int32
+	var gotSend, gotRecv bool
+	for {
+		cqe, ok := ring.tryCqe()
+		if !ok {
+			break
+		}
+		switch cqe.UserData {
+		case proxyFuseSendUD:
+			sendRes = cqe.Res
+			gotSend = true
+		case proxyFuseRecvUD:
+			recvRes = cqe.Res
+			gotRecv = true
+		}
+	}
+	runtime.KeepAlive(sendBuf)
+	runtime.KeepAlive(recvBuf)
+	if !gotSend || !gotRecv {
+		if waitErr != nil && waitErr != errIOUringDeadlineExceeded {
+			return 0, waitErr
+		}
+		return 0, errIOUringDeadlineExceeded
+	}
+	if sendRes < 0 {
+		return 0, syscall.Errno(-sendRes)
+	}
+	if int(sendRes) != len(sendBuf) {
+		return 0, io.ErrShortWrite
+	}
+	if recvRes < 0 {
+		return 0, syscall.Errno(-recvRes)
+	}
+	if recvRes == 0 {
+		return 0, io.EOF
+	}
+	return int(recvRes), nil
+}
+
 func (ring *ioUring) recv(fd int, buf []byte, deadline time.Time) (int, error) {
 	for {
 		if err := ring.prepRecv(fd, buf); err != nil {
@@ -1461,15 +1565,82 @@ func (ring *ioUring) tryCqe() (ioUringCqe, bool) {
 	return item, true
 }
 
+// submitAndWaitTs submits pending SQEs and waits for minComplete completions or
+// until ts elapses, in a SINGLE io_uring_enter (IORING_ENTER_EXT_ARG). Returns
+// ETIME on timeout. Requires kernel 5.11+; callers fall back on EINVAL.
+func (ring *ioUring) submitAndWaitTs(minComplete uint32, ts *ioUringKernelTimespec) error {
+	if ring == nil || ring.fd < 0 || ring.sqTail == nil {
+		return syscall.EBADF
+	}
+	for {
+		toSubmit := ring.localSqTail - ring.submitted
+		if toSubmit != 0 {
+			atomic.StoreUint32(ring.sqTail, ring.localSqTail)
+		}
+		fd := ring.fd
+		flags := uintptr(ioUringEnterGetEvents | ioUringEnterExtArg)
+		if ring.registeredRing && ring.enterFD >= 0 {
+			fd = ring.enterFD
+			flags |= ioUringEnterRegistered
+		}
+		gea := ioUringGeteventsArg{Ts: uint64(uintptr(unsafe.Pointer(ts)))}
+		_, _, errno := syscall.Syscall6(ioUringEnterSyscall, uintptr(fd), uintptr(toSubmit), uintptr(minComplete), flags, uintptr(unsafe.Pointer(&gea)), unsafe.Sizeof(gea))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno == syscall.EINVAL {
+			return errno
+		}
+		// On success or ETIME the SQEs were consumed by the kernel (submit
+		// precedes the wait). Mark them submitted so they are not resent.
+		ring.submitted = ring.localSqTail
+		runtime.KeepAlive(ts)
+		if errno == syscall.ETIME {
+			return errIOUringDeadlineExceeded
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+}
+
 func (ring *ioUring) submitAndAwait(deadline time.Time) (ioUringCqe, error) {
 	if ring == nil || ring.fd < 0 {
 		return ioUringCqe{}, syscall.EBADF
 	}
+	if deadline.IsZero() {
+		// submit + wait for one completion in a single syscall
+		if _, err := ring.submitAndWait(1); err != nil {
+			return ioUringCqe{}, err
+		}
+		if cqe, ok := ring.tryCqe(); ok {
+			return cqe, nil
+		}
+		return ring.waitCqe()
+	}
+	if !extArgUnsupported.Load() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ioUringCqe{}, errIOUringDeadlineExceeded
+		}
+		ts := ioUringKernelTimespec{Sec: int64(remaining / time.Second), Nsec: int64(remaining % time.Second)}
+		err := ring.submitAndWaitTs(1, &ts)
+		if err == syscall.EINVAL {
+			extArgUnsupported.Store(true)
+		} else {
+			if cqe, ok := ring.tryCqe(); ok {
+				return cqe, nil
+			}
+			if err == nil || err == errIOUringDeadlineExceeded {
+				return ioUringCqe{}, errIOUringDeadlineExceeded
+			}
+			return ioUringCqe{}, err
+		}
+	}
+	// legacy fallback: submit then poll for the deadline
 	if _, err := ring.submitAndWait(0); err != nil {
 		return ioUringCqe{}, err
-	}
-	if deadline.IsZero() {
-		return ring.waitCqe()
 	}
 	for {
 		if cqe, ok := ring.tryCqe(); ok {

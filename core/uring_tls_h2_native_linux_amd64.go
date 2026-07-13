@@ -20,6 +20,7 @@ type tlsWorkerH2State struct {
 	appBufOff          int
 	headerAccum        []byte
 	headersBuf         [][2]string
+	pendingBody        map[uint32][]byte
 }
 
 func h2FrameTypeName(frameType byte) string {
@@ -746,6 +747,9 @@ func (worker *tlsUringWorker) handleHTTP2WindowUpdate(conn *tlsWorkerConn, strea
 			conn.plainBuf = appendH2GoAwayFrame(conn.plainBuf, st.lastStreamID, H2ErrFlowControl)
 			return tlsWorkerActionWrote, true
 		}
+		if worker.resumePendingH2(conn) {
+			return tlsWorkerActionWrote, false
+		}
 		return tlsWorkerActionContinue, false
 	}
 	stream := st.streams[streamID]
@@ -762,6 +766,9 @@ func (worker *tlsUringWorker) handleHTTP2WindowUpdate(conn *tlsWorkerConn, strea
 		return tlsWorkerActionWrote, false
 	}
 	stream.Window.Store(newWindow)
+	if worker.resumePendingH2(conn) {
+		return tlsWorkerActionWrote, false
+	}
 	return tlsWorkerActionContinue, false
 }
 
@@ -822,20 +829,43 @@ func (worker *tlsUringWorker) dispatchHTTP2Stream(conn *tlsWorkerConn, streamID 
 		conn.resp.Status(500).String("Response Too Large")
 	}
 
-	conn.plainBuf = appendH2ResponseFrames(conn.plainBuf, streamID, &conn.resp, st.maxFrameSize)
-	bodyLen := int64(conn.resp.transmittedBodyLen())
-	if bodyLen > 0 {
-		streamWindow := stream.Window.Load()
-		if bodyLen > st.connWindow || bodyLen > streamWindow {
-			conn.resp.Reset()
-			conn.resp.Status(500).String("HTTP/2 flow control window exhausted")
-			conn.plainBuf = appendH2ResponseFrames(conn.plainBuf[:0], streamID, &conn.resp, st.maxFrameSize)
-		} else {
-			st.connWindow -= bodyLen
-			stream.Window.Add(-bodyLen)
-		}
+	body := conn.resp.transmittedBodyBytes()
+	if len(body) == 0 {
+		conn.plainBuf = appendH2ResponseHeadersFrame(conn.plainBuf, streamID, &conn.resp, true)
+		worker.releaseHTTP2Stream(st, streamID)
+		return tlsWorkerActionWrote, false
 	}
-	worker.releaseHTTP2Stream(st, streamID)
+	avail := st.connWindow
+	if sw := stream.Window.Load(); sw < avail {
+		avail = sw
+	}
+	if avail < 0 {
+		avail = 0
+	}
+	sendNow := int64(len(body))
+	if sendNow > avail {
+		sendNow = avail
+	}
+	fullDone := int(sendNow) == len(body)
+	if worker.server.IsDebug() {
+	}
+	conn.plainBuf = appendH2ResponseHeadersFrame(conn.plainBuf, streamID, &conn.resp, false)
+	if sendNow > 0 {
+		conn.plainBuf = appendH2DataFrames(conn.plainBuf, streamID, body[:sendNow], fullDone, st.maxFrameSize)
+		st.connWindow -= sendNow
+		stream.Window.Add(-sendNow)
+	}
+	if fullDone {
+		worker.releaseHTTP2Stream(st, streamID)
+	} else {
+		rem := body[sendNow:]
+		cp := make([]byte, len(rem))
+		copy(cp, rem)
+		if st.pendingBody == nil {
+			st.pendingBody = make(map[uint32][]byte)
+		}
+		st.pendingBody[streamID] = cp
+	}
 	return tlsWorkerActionWrote, false
 }
 
@@ -1081,6 +1111,87 @@ func appendH2ResponseFrames(dst []byte, streamID uint32, resp *Response, maxFram
 	*bp = enc.Buf[:0]
 	MediumBufPool.Put(bp)
 	return dst
+}
+
+func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool) []byte {
+	bp := MediumBufPool.Get().(*[]byte)
+	enc := HpackEncoder{}
+	enc.Reset((*bp)[:0])
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
+	flags := byte(H2FlagEndHeaders)
+	if endStream {
+		flags |= H2FlagEndStream
+	}
+	dst = appendH2Frame(dst, H2FrameHeaders, flags, streamID, enc.Buf)
+	*bp = enc.Buf[:0]
+	MediumBufPool.Put(bp)
+	return dst
+}
+
+func appendH2DataFrames(dst []byte, streamID uint32, body []byte, endStream bool, maxFrame uint32) []byte {
+	if len(body) == 0 {
+		return dst
+	}
+	frameLimit := int(maxFrame)
+	if frameLimit <= 0 {
+		frameLimit = H2DefaultMaxFrameSize
+	}
+	remaining := body
+	for len(remaining) > 0 {
+		chunk := remaining
+		if len(chunk) > frameLimit {
+			chunk = chunk[:frameLimit]
+		}
+		flags := byte(0)
+		if len(chunk) == len(remaining) && endStream {
+			flags = H2FlagEndStream
+		}
+		dst = appendH2Frame(dst, H2FrameData, flags, streamID, chunk)
+		remaining = remaining[len(chunk):]
+	}
+	return dst
+}
+
+// resumePendingH2 sends more of any flow-control-blocked response bodies now that
+// the send window has been replenished. Returns true if any bytes were queued.
+func (worker *tlsUringWorker) resumePendingH2(conn *tlsWorkerConn) bool {
+	st := &conn.h2
+	if len(st.pendingBody) == 0 {
+		return false
+	}
+	wrote := false
+	if worker.server.IsDebug() {
+	}
+	for streamID, rem := range st.pendingBody {
+		stream := st.streams[streamID]
+		if stream == nil {
+			delete(st.pendingBody, streamID)
+			continue
+		}
+		avail := st.connWindow
+		if sw := stream.Window.Load(); sw < avail {
+			avail = sw
+		}
+		if avail <= 0 {
+			continue
+		}
+		sendNow := int64(len(rem))
+		if sendNow > avail {
+			sendNow = avail
+		}
+		fullDone := int(sendNow) == len(rem)
+		conn.plainBuf = appendH2DataFrames(conn.plainBuf, streamID, rem[:sendNow], fullDone, st.maxFrameSize)
+		st.connWindow -= sendNow
+		stream.Window.Add(-sendNow)
+		wrote = true
+		if fullDone {
+			delete(st.pendingBody, streamID)
+			worker.releaseHTTP2Stream(st, streamID)
+		} else {
+			st.pendingBody[streamID] = rem[sendNow:]
+		}
+	}
+	return wrote
 }
 
 func appendH2SettingsAckFrame(dst []byte) []byte {

@@ -88,9 +88,10 @@ type tlsWorkerConn struct {
 	selectedALPN  string
 	readBuf       []byte
 	appBuf        []byte
-	plainBuf      []byte
-	writeBuf      []byte
-	innerScratch  []byte
+	plainBuf         []byte
+	writeBuf         []byte
+	writeBufBorrowed bool
+	innerScratch     []byte
 	req           Request
 	resp          Response
 	clientHello   ParsedClientHello
@@ -159,6 +160,13 @@ func newTLSUringBackend(s *Server, listeners []net.Listener) (*tlsUringBackend, 
 	shards, _ := ioUringShardLayout()
 	workerCount := tlsUringWorkerCount(s.config, shards)
 	acceptShards := minInt(len(listeners), workerCount)
+	if len(listeners) > acceptShards {
+		log.Printf("[WARN] tls io_uring: %d listeners but only %d accept workers; closing %d excess listeners", len(listeners), acceptShards, len(listeners)-acceptShards)
+		for i := acceptShards; i < len(listeners); i++ {
+			_ = listeners[i].Close()
+		}
+		listeners = listeners[:acceptShards]
+	}
 	recvMultishotSupported, err := probeIOUringRecvMultishot()
 	if err != nil {
 		return nil, err
@@ -1449,7 +1457,11 @@ func (worker *tlsUringWorker) processBridge(conn *tlsWorkerConn) error {
 	data := req.data
 	bridge.mu.Unlock()
 
+	if !conn.writeBufBorrowed && conn.writeBuf != nil {
+		releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
+	}
 	conn.writeBuf = data
+	conn.writeBufBorrowed = true
 	conn.writeN = len(conn.writeBuf)
 	conn.writeSent = 0
 	conn.state = tlsConnStateWriting
@@ -1480,6 +1492,7 @@ func (worker *tlsUringWorker) tryAttachAccepted(fd int, now int64) (bool, error)
 	conn.writeN = 0
 	conn.writeSent = 0
 	conn.writeZeroCopy = false
+	conn.writeBufBorrowed = false
 	conn.zcPending = 0
 	conn.requestCount = 0
 	conn.closeAfter = false
@@ -1664,8 +1677,11 @@ func (worker *tlsUringWorker) recycleConnection(conn *tlsWorkerConn) {
 	conn.appBuf = nil
 	releasePooledBuf(&connWriteBufPool, conn.plainBuf, connBufPoolMaxCap)
 	conn.plainBuf = nil
-	releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
+	if !conn.writeBufBorrowed {
+		releasePooledBuf(&connWriteBufPool, conn.writeBuf, connBufPoolMaxCap)
+	}
 	conn.writeBuf = nil
+	conn.writeBufBorrowed = false
 	releasePooledBuf(&connBodyBufPool, conn.resp.body, connBufPoolMaxCap)
 	conn.resp.body = nil
 	conn.innerScratch = nil
@@ -1933,7 +1949,14 @@ func (worker *tlsUringWorker) handleBridgeRead(conn *tlsWorkerConn, result int32
 		conn.readBuf = conn.readBuf[:n]
 	}
 	bridge.mu.Lock()
+	if len(bridge.inbound) == 0 {
+		bridge.inbound = bridge.inboundBuf
+	}
+	before := cap(bridge.inbound)
 	bridge.inbound = append(bridge.inbound, conn.readBuf[:n]...)
+	if cap(bridge.inbound) != before {
+		bridge.inboundBuf = bridge.inbound[:0]
+	}
 	bridge.mu.Unlock()
 	bridge.signalReadReady()
 	conn.readN = 0
@@ -1968,10 +1991,10 @@ func (worker *tlsUringWorker) handleBridgeWrite(conn *tlsWorkerConn, result int3
 	active := bridge.writeActive
 	bridge.writeActive = nil
 	bridge.mu.Unlock()
+	releaseTLSBridgeWriteReq(active)
 	if active != nil && active.resp != nil {
 		active.resp <- nil
 	}
-	releaseTLSBridgeWriteReq(active)
 	return worker.processBridge(conn)
 }
 

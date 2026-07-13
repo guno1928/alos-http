@@ -3,6 +3,7 @@ package core
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -29,12 +30,16 @@ func quicStreamIsBidi(id uint64) bool {
 }
 
 type QUICStream struct {
-	id   uint64
-	conn *QUICConn
+	id          uint64
+	conn        *QUICConn
+	refCount    atomic.Int32
+	dispatched  atomic.Bool
+	cleanupDone atomic.Bool
 
 	mu sync.Mutex
 
 	recvBuf    []byte
+	recvBufP   *[]byte
 	recvOff    uint64
 	recvFin    bool
 	recvFinOff uint64
@@ -42,20 +47,74 @@ type QUICStream struct {
 	maxRecv    uint64
 	recvReady  chan struct{}
 
-	sendBuf    []byte
-	sendOff    uint64
-	sendFin    bool
-	sendClosed bool
-	maxSend    uint64
+	sendBuf         []byte
+	sendOff         uint64
+	sendFin         bool
+	sendClosed      bool
+	maxSend         uint64
+	blockedSent     uint64
+	awaitingCleanup bool
 }
 
 func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 	return &QUICStream{
-		id:        id,
-		conn:      conn,
-		maxRecv:   1 << 20,
-		maxSend:   1 << 20,
-		recvReady: make(chan struct{}, 1),
+		id:      id,
+		conn:    conn,
+		maxRecv: 1 << 20,
+		maxSend: 1 << 20,
+	}
+}
+
+var quicStreamPool = sync.Pool{
+	New: func() any { return &QUICStream{} },
+}
+
+var quicRecvDataPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 2048); return &b },
+}
+
+// getPooledStream returns a reset stream from the pool with refCount 0.
+func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
+	s := quicStreamPool.Get().(*QUICStream)
+	s.id = id
+	s.conn = conn
+	s.recvBuf = nil
+	s.recvBufP = nil
+	s.recvOff = 0
+	s.recvFin = false
+	s.recvFinOff = 0
+	s.recvClosed = false
+	s.maxRecv = 1 << 20
+	s.recvReady = nil
+	s.sendBuf = nil
+	s.sendOff = 0
+	s.sendFin = false
+	s.sendClosed = false
+	s.maxSend = 1 << 20
+	if conn.peerStreamWindow > 0 {
+		s.maxSend = conn.peerStreamWindow
+	}
+	s.blockedSent = 0
+	s.awaitingCleanup = false
+	s.refCount.Store(0)
+	s.dispatched.Store(false)
+	s.cleanupDone.Store(false)
+	return s
+}
+
+// releaseStream drops one reference; when the last reference is gone the stream
+// is returned to the pool. References are always acquired under streamsMu (the
+// same lock as map deletion), so a stream is never pooled while in use.
+func (qc *QUICConn) releaseStream(s *QUICStream) {
+	if s.refCount.Add(-1) == 0 {
+		if s.recvBufP != nil {
+			quicRecvDataPool.Put(s.recvBufP)
+			s.recvBufP = nil
+		}
+		s.conn = nil
+		s.recvBuf = nil
+		s.sendBuf = nil
+		quicStreamPool.Put(s)
 	}
 }
 
@@ -65,6 +124,11 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 
 	if s.recvClosed {
 		return
+	}
+
+	if s.recvBufP == nil {
+		s.recvBufP = quicRecvDataPool.Get().(*[]byte)
+		s.recvBuf = (*s.recvBufP)[:0]
 	}
 
 	if f.offset == s.recvOff {
@@ -91,9 +155,11 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 		s.recvFinOff = f.offset + uint64(len(f.data))
 	}
 
-	select {
-	case s.recvReady <- struct{}{}:
-	default:
+	if s.recvReady != nil {
+		select {
+		case s.recvReady <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -118,26 +184,31 @@ func (s *QUICStream) Read(p []byte) (int, error) {
 			s.mu.Unlock()
 			return 0, io.EOF
 		}
+		if s.recvReady == nil {
+			s.recvReady = make(chan struct{}, 1)
+		}
+		ch := s.recvReady
 		s.mu.Unlock()
 
-		<-s.recvReady
+		<-ch
 	}
 }
 
 func (s *QUICStream) ReadAll() ([]byte, error) {
-	var buf []byte
-	tmp := make([]byte, 4096)
 	for {
-		n, err := s.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+		s.mu.Lock()
+		if s.recvFin || s.recvClosed {
+			buf := s.recvBuf
+			s.recvBuf = nil
+			s.mu.Unlock()
+			return buf, nil
 		}
-		if err != nil {
-			if err == io.EOF {
-				return buf, nil
-			}
-			return buf, err
+		if s.recvReady == nil {
+			s.recvReady = make(chan struct{}, 1)
 		}
+		ch := s.recvReady
+		s.mu.Unlock()
+		<-ch
 	}
 }
 
@@ -153,6 +224,24 @@ func (s *QUICStream) Write(data []byte) error {
 	return nil
 }
 
+// setSendBuf aliases data as the stream's send buffer (no copy) and marks the
+// stream finished. Safe only for a single-shot write on a fresh stream; the
+// data must outlive the drain (the caller keeps it until sendStreamData copies
+// it into the outgoing stream frame).
+func (s *QUICStream) setSendBuf(data []byte) {
+	s.mu.Lock()
+	s.sendBuf = data
+	s.sendFin = true
+	s.mu.Unlock()
+}
+
+func (s *QUICStream) sendBufDrained() bool {
+	s.mu.Lock()
+	empty := len(s.sendBuf) == 0
+	s.mu.Unlock()
+	return empty
+}
+
 func (s *QUICStream) FinishWrite() {
 	s.mu.Lock()
 	s.sendFin = true
@@ -163,12 +252,13 @@ func (s *QUICStream) Close() {
 	s.mu.Lock()
 	s.recvClosed = true
 	s.sendClosed = true
-	s.mu.Unlock()
-
-	select {
-	case s.recvReady <- struct{}{}:
-	default:
+	if s.recvReady != nil {
+		select {
+		case s.recvReady <- struct{}{}:
+		default:
+		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *QUICStream) drainSendBuf(maxBytes int) (data []byte, offset uint64, fin bool) {
@@ -187,8 +277,7 @@ func (s *QUICStream) drainSendBuf(maxBytes int) (data []byte, offset uint64, fin
 		n = maxBytes
 	}
 
-	data = make([]byte, n)
-	copy(data, s.sendBuf[:n])
+	data = s.sendBuf[:n:n]
 	offset = s.sendOff
 	s.sendBuf = s.sendBuf[n:]
 	s.sendOff += uint64(n)

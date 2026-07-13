@@ -1,6 +1,13 @@
 package core
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"sync"
+)
+
+var quicHdrCopyPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 32); return &b },
+}
 
 const (
 	quicVersion1      uint32 = 0x00000001
@@ -201,13 +208,15 @@ func quicBuildInitialPacket(dst []byte, dcid, scid, token, payload []byte, pn ui
 	dst = quicAppendPacketNumber(dst, truncatedPN, pnLen)
 
 	header := dst[headerStart:len(dst)]
-	headerCopy := make([]byte, len(header))
-	copy(headerCopy, header)
+	hcp := quicHdrCopyPool.Get().(*[]byte)
+	headerCopy := append((*hcp)[:0], header...)
 
 	dst = keys.encrypt(dst, headerCopy, payload, pn, pnOffset)
 
 	keys.applyHeaderProtection(dst[headerStart:], pnOffset-headerStart, pnLen)
 
+	*hcp = headerCopy
+	quicHdrCopyPool.Put(hcp)
 	return dst
 }
 
@@ -224,13 +233,15 @@ func quicBuildHandshakePacket(dst []byte, dcid, scid, payload []byte, pn uint64,
 	dst = quicAppendPacketNumber(dst, truncatedPN, pnLen)
 
 	header := dst[headerStart:len(dst)]
-	headerCopy := make([]byte, len(header))
-	copy(headerCopy, header)
+	hcp := quicHdrCopyPool.Get().(*[]byte)
+	headerCopy := append((*hcp)[:0], header...)
 
 	dst = keys.encrypt(dst, headerCopy, payload, pn, pnOffset)
 
 	keys.applyHeaderProtection(dst[headerStart:], pnOffset-headerStart, pnLen)
 
+	*hcp = headerCopy
+	quicHdrCopyPool.Put(hcp)
 	return dst
 }
 
@@ -243,13 +254,15 @@ func quicBuildShortPacket(dst []byte, dcid, payload []byte, pn uint64, largestAc
 	pnOffset := headerStart + 1 + len(dcid)
 
 	header := dst[headerStart:len(dst)]
-	headerCopy := make([]byte, len(header))
-	copy(headerCopy, header)
+	hcp := quicHdrCopyPool.Get().(*[]byte)
+	headerCopy := append((*hcp)[:0], header...)
 
 	dst = keys.encrypt(dst, headerCopy, payload, pn, pnOffset)
 
 	keys.applyHeaderProtection(dst[headerStart:], pnOffset-headerStart, pnLen)
 
+	*hcp = headerCopy
+	quicHdrCopyPool.Put(hcp)
 	return dst
 }
 

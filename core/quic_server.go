@@ -65,6 +65,7 @@ func (s *Server) ListenAndServeQUIC() error {
 }
 
 func (s *Server) serveQUICListener(pc net.PacketConn, connMap *quicConnMap) {
+	startReqStreamWorkers()
 	if udpConn, ok := pc.(*net.UDPConn); ok {
 		udpConn.SetReadBuffer(4 << 20)
 		udpConn.SetWriteBuffer(4 << 20)
@@ -172,6 +173,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 
 	go qc.recvLoop()
 	go qc.runIdleTimer()
+	go qc.runLossTimer()
 
 	quicActiveConns.Add(1)
 	Stats.TotalConns.Add(1)

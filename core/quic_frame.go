@@ -135,6 +135,13 @@ func quicAppendMaxStreamDataFrame(dst []byte, streamID, maxStreamData uint64) []
 	return dst
 }
 
+func quicAppendStreamDataBlockedFrame(dst []byte, streamID, limit uint64) []byte {
+	dst = quicAppendVarint(dst, quicFrameStreamDataBlock)
+	dst = quicAppendVarint(dst, streamID)
+	dst = quicAppendVarint(dst, limit)
+	return dst
+}
+
 func quicAppendMaxStreamsFrame(dst []byte, maxStreams uint64, bidi bool) []byte {
 	if bidi {
 		dst = quicAppendVarint(dst, quicFrameMaxStreamsBidi)

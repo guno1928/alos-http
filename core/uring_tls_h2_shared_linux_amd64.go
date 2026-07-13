@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/turbo"
 )
 
 type tlsBridgeWriteReq struct {
@@ -32,10 +34,13 @@ type tlsWorkerSharedBridge struct {
 
 	mu             sync.Mutex
 	inbound        []byte
+	inboundBuf     []byte
 	writeQueue     []*tlsBridgeWriteReq
 	writeActive    *tlsBridgeWriteReq
 	closeWait      []chan error
 	closeRequested bool
+	readTimer      *time.Timer
+	writeTimer     *time.Timer
 }
 
 type tlsWorkerSharedConn struct {
@@ -44,6 +49,7 @@ type tlsWorkerSharedConn struct {
 
 func newTLSWorkerSharedConn(worker *tlsUringWorker, conn *tlsWorkerConn, prefix []byte) *tlsWorkerSharedConn {
 	localAddr, remoteAddr := socketAddrs(conn.fd)
+	base := make([]byte, 0, len(prefix)+4096)
 	bridge := &tlsWorkerSharedBridge{
 		worker:     worker,
 		conn:       conn,
@@ -51,13 +57,25 @@ func newTLSWorkerSharedConn(worker *tlsUringWorker, conn *tlsWorkerConn, prefix 
 		remoteAddr: remoteAddr,
 		done:       make(chan struct{}),
 		readReady:  make(chan struct{}, 1),
-		inbound:    append(make([]byte, 0, len(prefix)+4096), prefix...),
+		inbound:    append(base, prefix...),
+		inboundBuf: base,
 		writeQueue: make([]*tlsBridgeWriteReq, 0, 8),
 		closeWait:  make([]chan error, 0, 1),
 	}
 	conn.bridge = bridge
 	worker.activeBridgeCount++
 	return &tlsWorkerSharedConn{bridge: bridge}
+}
+
+var tlsBridgeReqPool = sync.Pool{
+	New: func() any { return &tlsBridgeWriteReq{resp: make(chan error, 1)} },
+}
+
+func releaseTLSBridgeReq(req *tlsBridgeWriteReq) {
+	req.data = nil
+	req.releaseBuf = nil
+	req.releasePool = writeOwnedReleaseNone
+	tlsBridgeReqPool.Put(req)
 }
 
 func releaseTLSBridgeWriteReq(req *tlsBridgeWriteReq) {
@@ -89,6 +107,9 @@ func (c *tlsWorkerSharedConn) Read(p []byte) (int, error) {
 		if len(bridge.inbound) > 0 {
 			n := copy(p, bridge.inbound)
 			bridge.inbound = bridge.inbound[n:]
+			if len(bridge.inbound) == 0 {
+				bridge.inbound = bridge.inboundBuf
+			}
 			bridge.mu.Unlock()
 			return n, nil
 		}
@@ -97,12 +118,16 @@ func (c *tlsWorkerSharedConn) Read(p []byte) (int, error) {
 		if closed {
 			return 0, io.EOF
 		}
-		timer, timerCh := deadlineTimer(bridge.readDLN.Load())
+		timerCh := armCachedTimer(&bridge.readTimer, bridge.readDLN.Load())
 		select {
 		case <-bridge.readReady:
-			stopDeadlineTimer(timer)
+			if timerCh != nil {
+				stopDeadlineTimer(bridge.readTimer)
+			}
 		case <-bridge.done:
-			stopDeadlineTimer(timer)
+			if timerCh != nil {
+				stopDeadlineTimer(bridge.readTimer)
+			}
 			return 0, io.EOF
 		case <-timerCh:
 			return 0, os.ErrDeadlineExceeded
@@ -127,12 +152,10 @@ func (c *tlsWorkerSharedConn) WriteOwned(p []byte, releaseBuf *[]byte, releasePo
 		releaseTLSBridgeWriteReq(&tlsBridgeWriteReq{data: p, releaseBuf: releaseBuf, releasePool: releasePool})
 		return 0, net.ErrClosed
 	}
-	req := &tlsBridgeWriteReq{
-		data:        p,
-		resp:        make(chan error, 1),
-		releaseBuf:  releaseBuf,
-		releasePool: releasePool,
-	}
+	req := tlsBridgeReqPool.Get().(*tlsBridgeWriteReq)
+	req.data = p
+	req.releaseBuf = releaseBuf
+	req.releasePool = releasePool
 	bridge.mu.Lock()
 	if bridge.closed.Load() {
 		bridge.mu.Unlock()
@@ -143,16 +166,21 @@ func (c *tlsWorkerSharedConn) WriteOwned(p []byte, releaseBuf *[]byte, releasePo
 	bridge.mu.Unlock()
 	bridge.notify()
 
-	timer, timerCh := deadlineTimer(bridge.writeDLN.Load())
+	timerCh := armCachedTimer(&bridge.writeTimer, bridge.writeDLN.Load())
 	select {
 	case err := <-req.resp:
-		stopDeadlineTimer(timer)
+		if timerCh != nil {
+			stopDeadlineTimer(bridge.writeTimer)
+		}
+		releaseTLSBridgeReq(req)
 		if err != nil {
 			return 0, err
 		}
 		return len(p), nil
 	case <-bridge.done:
-		stopDeadlineTimer(timer)
+		if timerCh != nil {
+			stopDeadlineTimer(bridge.writeTimer)
+		}
 		return 0, net.ErrClosed
 	case <-timerCh:
 		return 0, os.ErrDeadlineExceeded
@@ -245,21 +273,37 @@ func (bridge *tlsWorkerSharedBridge) shutdown() {
 	bridge.closeWait = nil
 	bridge.inbound = nil
 	bridge.mu.Unlock()
+	releaseTLSBridgeWriteReq(active)
 	if active != nil && active.resp != nil {
 		active.resp <- net.ErrClosed
 	}
-	releaseTLSBridgeWriteReq(active)
 	for i := range queued {
+		releaseTLSBridgeWriteReq(queued[i])
 		if queued[i].resp != nil {
 			queued[i].resp <- net.ErrClosed
 		}
-		releaseTLSBridgeWriteReq(queued[i])
 	}
 	for _, waiter := range waiters {
 		waiter <- nil
 	}
 	close(bridge.done)
 	bridge.signalReadReady()
+}
+
+func armCachedTimer(tp **time.Timer, deadlineUnix int64) <-chan time.Time {
+	if deadlineUnix == 0 {
+		return nil
+	}
+	wait := time.Duration(deadlineUnix - turbo.UnixNano())
+	if wait < 0 {
+		wait = 0
+	}
+	if *tp == nil {
+		*tp = time.NewTimer(wait)
+	} else {
+		(*tp).Reset(wait)
+	}
+	return (*tp).C
 }
 
 func deadlineTimer(deadlineUnix int64) (*time.Timer, <-chan time.Time) {
