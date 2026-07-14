@@ -34,6 +34,9 @@ const (
 	plainAcceptRetryBackoffNs = int64(50 * time.Millisecond)
 	plainDispatchQueueSize    = 8192
 
+	maxInFlightDispatchPerWorker = 1024
+	dispatchStuckDeadlineNs      = int64(30 * time.Second)
+
 	plainConnProtoUnknown = 0
 	plainConnProtoH1      = 1
 	plainConnProtoH2      = 2
@@ -82,11 +85,13 @@ type plainWorkerConn struct {
 	writingBody   bool
 	req           Request
 	resp          Response
-	consumed      int
-	closeAfter    bool
-	h2            tlsWorkerH2State
-	fwdIndex      int32
-	fwdGen        uint16
+	consumed       int
+	closeAfter     bool
+	h2             tlsWorkerH2State
+	fwdIndex       int32
+	fwdGen         uint16
+	attacher       func(*Request) net.Conn
+	hijackConsumed int
 }
 
 type plainUringWorker struct {
@@ -98,7 +103,7 @@ type plainUringWorker struct {
 	ring            *ioUring
 	recvBufs        *ioUringBufferRing
 	server          *Server
-	connections     []plainWorkerConn
+	connections     []*plainWorkerConn
 	freeHead        int32
 	completions     [ioUringCompletionBatchSize]ioUringCqe
 	sweepIntervalNs    int64
@@ -114,6 +119,7 @@ type plainUringWorker struct {
 	active             atomic.Int64
 	asyncFwd           *asyncForwardPool
 	dispatchTasks      chan func()
+	dispatchInFlight   int
 }
 
 type plainUringBackend struct {
@@ -180,7 +186,7 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 			wakeupWriteFD: wakeupPair[1],
 			handoffs:      make(chan plainAcceptedConn, ioUringInitialConnsPerShard),
 			server:        s,
-			connections:   make([]plainWorkerConn, ioUringInitialConnsPerShard),
+			connections:   make([]*plainWorkerConn, ioUringInitialConnsPerShard),
 			freeHead:      0,
 			dispatchTasks: make(chan func(), plainDispatchQueueSize),
 		}
@@ -308,7 +314,12 @@ func listenerFD(listener net.Listener) (int, error) {
 }
 
 func (worker *plainUringWorker) initConnectionSlot(index int, nextFree int32) {
-	conn := &worker.connections[index]
+	conn := worker.connections[index]
+	if conn == nil {
+		conn = &plainWorkerConn{}
+		worker.connections[index] = conn
+		conn.attacher = worker.makeAttacher(conn)
+	}
 	conn.index = int32(index)
 	conn.fd = -1
 	conn.req.Headers = make([][2]string, 0, 16)
@@ -337,7 +348,7 @@ func (worker *plainUringWorker) growConnections() {
 		growBy = ioUringInitialConnsPerShard
 	}
 	prevHead := worker.freeHead
-	worker.connections = append(worker.connections, make([]plainWorkerConn, growBy)...)
+	worker.connections = append(worker.connections, make([]*plainWorkerConn, growBy)...)
 	for index := oldLen; index < len(worker.connections); index++ {
 		nextFree := int32(index + 1)
 		if index == len(worker.connections)-1 {
@@ -464,7 +475,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 
 func (worker *plainUringWorker) closeAllConnections() {
 	for i := range worker.connections {
-		conn := &worker.connections[i]
+		conn := worker.connections[i]
 		if conn.fd >= 0 && conn.state != plainConnStateClosing {
 			_ = worker.closeConnection(conn)
 		}
@@ -476,7 +487,7 @@ func (worker *plainUringWorker) reclaimPreviousRun() {
 		return
 	}
 	for i := range worker.connections {
-		conn := &worker.connections[i]
+		conn := worker.connections[i]
 		if conn.fd >= 0 {
 			_ = syscall.Close(conn.fd)
 			conn.fd = -1
@@ -498,6 +509,7 @@ func (worker *plainUringWorker) reclaimPreviousRun() {
 	}
 	worker.ring.close()
 	worker.ring = nil
+	worker.dispatchInFlight = 0
 	for {
 		select {
 		case <-worker.dispatchTasks:
@@ -517,7 +529,7 @@ func (worker *plainUringWorker) handleCompletionGuarded(backend *plainUringBacke
 			if op := plainDecodeOp(cqe.UserData); op != plainUringOpAccept && op != plainUringOpWake {
 				connIndex := plainDecodeConn(cqe.UserData)
 				if connIndex >= 0 && connIndex < len(worker.connections) {
-					_ = worker.closeConnection(&worker.connections[connIndex])
+					_ = worker.closeConnection(worker.connections[connIndex])
 				}
 			}
 			err = nil
@@ -544,7 +556,7 @@ func (worker *plainUringWorker) handleCompletion(backend *plainUringBackend, cqe
 			}
 			return nil
 		}
-		conn := &worker.connections[connIndex]
+		conn := worker.connections[connIndex]
 		if (conn.fd < 0 && !(op == plainUringOpWrite && cqe.Flags&ioUringCqeNotif != 0)) || conn.generation != generation {
 			if op == plainUringOpRead {
 				worker.recycleReadBuffer(cqe.Flags)
@@ -815,7 +827,8 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		conn.resp.resetFastH1()
 		conn.req.StreamWriter = nil
 		conn.req.conn = nil
-		conn.req.attachConn = worker.newH1RequestConnAttacher(conn, consumed)
+		conn.hijackConsumed = consumed
+		conn.req.attachConn = conn.attacher
 		conn.req.connTakenOver = false
 		conn.req.hijackReadBuf = nil
 		conn.req.server = worker.server
@@ -831,7 +844,14 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 }
 
 func (worker *plainUringWorker) startAsyncDispatch(conn *plainWorkerConn, consumed int, closeConn bool) error {
+	if worker.dispatchInFlight >= maxInFlightDispatchPerWorker {
+		conn.resp.resetFastH1()
+		conn.resp.Status(503).String("Service Unavailable")
+		return worker.queueResponse(conn, false, consumed)
+	}
 	conn.state = plainConnStateDispatching
+	conn.lastActive = MonotonicNanotime()
+	worker.dispatchInFlight++
 	idx := conn.index
 	gen := conn.generation
 	req := &conn.req
@@ -858,10 +878,13 @@ func (worker *plainUringWorker) startAsyncDispatch(conn *plainWorkerConn, consum
 }
 
 func (worker *plainUringWorker) finishAsyncDispatch(idx int32, gen uint16, consumed int, closeConn bool) {
+	if worker.dispatchInFlight > 0 {
+		worker.dispatchInFlight--
+	}
 	if idx < 0 || int(idx) >= len(worker.connections) {
 		return
 	}
-	conn := &worker.connections[idx]
+	conn := worker.connections[idx]
 	if conn.generation != gen || conn.state != plainConnStateDispatching {
 		return
 	}
@@ -918,37 +941,38 @@ func (worker *plainUringWorker) flushReqStats() {
 	}
 }
 
-func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, consumed int) func(*Request) net.Conn {
-	prefix := append([]byte(nil), conn.readBuf[consumed:conn.readN]...)
-	var once sync.Once
+func (worker *plainUringWorker) makeAttacher(conn *plainWorkerConn) func(*Request) net.Conn {
 	return func(req *Request) net.Conn {
-		once.Do(func() {
-			done := make(chan struct{})
-			worker.postTask(func() {
-				defer close(done)
-				if conn.fd < 0 {
-					return
-				}
-				_ = worker.ring.cancelFD(conn.fd, ioUringOpRecv)
-				wrapped, err := newIOUringConn(conn.fd)
-				if err != nil {
-					return
-				}
-				conn.fd = -1
-				handed := net.Conn(wrapped)
-				if len(prefix) > 0 {
-					handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
-				}
-				handed = worker.server.trackHandoffConn(handed)
-				if handed == nil {
-					return
-				}
-				req.connTakenOver = true
-				req.attachConn = nil
-				req.conn = handed
-			})
-			<-done
+		if req.connTakenOver {
+			return req.conn
+		}
+		consumed := conn.hijackConsumed
+		done := make(chan struct{})
+		worker.postTask(func() {
+			defer close(done)
+			if conn.fd < 0 {
+				return
+			}
+			_ = worker.ring.cancelFD(conn.fd, ioUringOpRecv)
+			wrapped, err := newIOUringConn(conn.fd)
+			if err != nil {
+				return
+			}
+			conn.fd = -1
+			handed := net.Conn(wrapped)
+			if consumed < conn.readN {
+				prefix := append([]byte(nil), conn.readBuf[consumed:conn.readN]...)
+				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
+			}
+			handed = worker.server.trackHandoffConn(handed)
+			if handed == nil {
+				return
+			}
+			req.connTakenOver = true
+			req.attachConn = nil
+			req.conn = handed
 		})
+		<-done
 		return req.conn
 	}
 }
@@ -1409,7 +1433,7 @@ func (worker *plainUringWorker) acquireConnection() *plainWorkerConn {
 		}
 	}
 	index := worker.freeHead
-	conn := &worker.connections[index]
+	conn := worker.connections[index]
 	worker.freeHead = conn.nextFree
 	if conn.generation == 0 {
 		conn.generation = 1
@@ -1434,9 +1458,18 @@ func (worker *plainUringWorker) sweepIdle(now int64) {
 	readTO := worker.server.config.ReadTimeout
 	writeTO := worker.server.config.WriteTimeout
 	readHeaderTO := worker.server.config.ReadHeaderTimeout
+	if worker.active.Load() == 0 {
+		return
+	}
 	for i := range worker.connections {
-		conn := &worker.connections[i]
-		if conn.fd < 0 || conn.state == plainConnStateClosing || conn.state == plainConnStateDispatching {
+		conn := worker.connections[i]
+		if conn.fd < 0 || conn.state == plainConnStateClosing {
+			continue
+		}
+		if conn.state == plainConnStateDispatching {
+			if now-conn.lastActive > dispatchStuckDeadlineNs {
+				_ = worker.closeConnection(conn)
+			}
 			continue
 		}
 		timeout := idleTO

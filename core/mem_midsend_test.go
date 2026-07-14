@@ -19,10 +19,10 @@ func retainedHeap() uint64 {
 func setupMidSend(n int, release bool) float64 {
 	shared := make([]byte, 130<<10)
 	base := retainedHeap()
-	w := &plainUringWorker{connections: make([]plainWorkerConn, n), recvBufs: &ioUringBufferRing{}}
+	w := &plainUringWorker{connections: make([]*plainWorkerConn, n), recvBufs: &ioUringBufferRing{}}
 	w.initConnections()
 	for i := range w.connections {
-		c := &w.connections[i]
+		c := w.connections[i]
 		c.readBuf = acquirePooledBuf(&connReadBufPool)
 		c.readBuf = append(c.readBuf, make([]byte, 8192)...)
 		c.readN = 0

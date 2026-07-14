@@ -796,11 +796,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 	if endStream {
 		stream.State.Store(StreamHalfClosed)
 		hc.dispatchWg.Add(1)
-		if hc.server.fastDispatch.Load() && hc.activeStreams.Load() == 1 {
-			hc.dispatchRequest(stream, true)
-			return
-		}
-		go hc.dispatchRequest(stream, false)
+		go hc.dispatchRequest(stream)
 	} else {
 		stream.State.Store(StreamOpen)
 	}
@@ -892,15 +888,11 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 	if f.Flags&H2FlagEndStream != 0 {
 		stream.State.Store(StreamHalfClosed)
 		hc.dispatchWg.Add(1)
-		if hc.server.fastDispatch.Load() && hc.activeStreams.Load() == 1 {
-			hc.dispatchRequest(stream, true)
-			return
-		}
-		go hc.dispatchRequest(stream, false)
+		go hc.dispatchRequest(stream)
 	}
 }
 
-func (hc *H2Conn) dispatchRequest(stream *H2Stream, inline bool) {
+func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	defer hc.dispatchWg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -967,41 +959,6 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream, inline bool) {
 		return
 	}
 
-	if inline && hc.responseWouldBlock(stream, resp) {
-		hc.dispatchWg.Add(1)
-		go hc.finishResponseAsync(stream, req, resp)
-		return
-	}
-	hc.finishResponse(stream, req, resp)
-}
-
-func (hc *H2Conn) responseWouldBlock(stream *H2Stream, resp *Response) bool {
-	if hc.server.connLimiter != nil {
-		return true
-	}
-	if hc.server.globalLimiter != nil && hc.server.globalLimiter.Download != nil {
-		return true
-	}
-	bodyLen := resp.transmittedBodyLen()
-	if bodyLen == 0 {
-		return false
-	}
-	avail := hc.connWindow.Load()
-	if stream != nil {
-		if streamAvail := stream.Window.Load(); streamAvail < avail {
-			avail = streamAvail
-		}
-	}
-	return int64(bodyLen) > avail
-}
-
-func (hc *H2Conn) finishResponseAsync(stream *H2Stream, req *Request, resp *Response) {
-	defer hc.dispatchWg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[H2] panic writing stream %d: %v", stream.ID, r)
-		}
-	}()
 	hc.finishResponse(stream, req, resp)
 }
 

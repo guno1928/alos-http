@@ -152,7 +152,10 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 			key := keyFunc(req)
 			now := CoarseNanotime()
 
-			entry, _ := entries.LoadOrStore(key, &rateLimitMWEntry{})
+			entry, ok := entries.Load(key)
+			if !ok {
+				entry, _ = entries.LoadOrStore(key, &rateLimitMWEntry{})
+			}
 
 			blockedUntil := entry.blockedUntil.Load()
 			if blockedUntil != 0 {

@@ -7,7 +7,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/guno1928/alosmap"
 	"github.com/guno1928/turbo"
 	"golang.org/x/sys/unix"
 )
@@ -25,7 +27,7 @@ type fpDNSEntry struct {
 }
 
 var (
-	fpDNSCache      sync.Map
+	fpDNSCache      = alosmap.NewTypedSized[string, *fpDNSEntry](1024, 0, alosmap.WithCleanupInterval(60*time.Second)).Prealloc(128)
 	fpDNSConfigOnce sync.Once
 	fpDNSServers    [][4]byte
 	fpHostsTable    map[string][4]byte
@@ -105,8 +107,7 @@ func fpResolveIPv4(host string) ([4]byte, error) {
 	}
 	fpDNSConfigOnce.Do(fpLoadDNSConfig)
 	lower := strings.ToLower(host)
-	if v, ok := fpDNSCache.Load(lower); ok {
-		e := v.(fpDNSEntry)
+	if e, ok := fpDNSCache.Load(lower); ok {
 		if turbo.UnixNano() < e.expires {
 			return e.ip, nil
 		}
@@ -127,12 +128,12 @@ func fpResolveIPv4(host string) ([4]byte, error) {
 			if ttlNano > dnsMaxTTLNano {
 				ttlNano = dnsMaxTTLNano
 			}
-			fpDNSCache.Store(lower, fpDNSEntry{ip: ip, expires: turbo.UnixNano() + ttlNano})
+			fpDNSCache.StoreWithTTL(lower, &fpDNSEntry{ip: ip, expires: turbo.UnixNano() + ttlNano}, time.Duration(dnsMaxTTLNano))
 			return ip, nil
 		}
 	}
-	if v, ok := fpDNSCache.Load(lower); ok {
-		return v.(fpDNSEntry).ip, nil
+	if e, ok := fpDNSCache.Load(lower); ok {
+		return e.ip, nil
 	}
 	return [4]byte{}, fpErrDNSFailed
 }

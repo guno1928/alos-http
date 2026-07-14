@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync"
@@ -85,6 +86,29 @@ type Request struct {
 	filesCache      map[string][]FileHeader
 	cookiesParsed   bool
 	cookiesCache    []Cookie
+	ctx             context.Context
+}
+
+// Context returns the request's context, or context.Background if none is set.
+// Middleware such as Timeout cancels this context to signal handlers that they
+// should abort; handlers can select on Context().Done() to return early.
+//
+// Example: select { case <-req.Context().Done(): return; default: }
+// Example: if err := req.Context().Err(); err != nil { resp.Status(503); return }
+func (r *Request) Context() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	return context.Background()
+}
+
+// SetContext sets the request context. It is primarily used by middleware to
+// attach deadlines or cancellation to a request.
+//
+// Example: ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second); defer cancel(); req.SetContext(ctx)
+// Example: req.SetContext(context.WithValue(req.Context(), traceKey, traceID))
+func (r *Request) SetContext(ctx context.Context) {
+	r.ctx = ctx
 }
 
 const (
@@ -152,6 +176,7 @@ func (r *Request) Reset() {
 	}
 	r.cookiesParsed = false
 	r.cookiesCache = r.cookiesCache[:0]
+	r.ctx = nil
 	for k := range r.store {
 		delete(r.store, k)
 	}
@@ -220,6 +245,7 @@ func (r *Request) resetFastH1() {
 	}
 	r.cookiesParsed = false
 	r.cookiesCache = r.cookiesCache[:0]
+	r.ctx = nil
 	for k := range r.store {
 		delete(r.store, k)
 	}

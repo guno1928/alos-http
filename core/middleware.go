@@ -3,6 +3,7 @@ package core
 import (
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -671,6 +672,9 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			tmpReq.tlsWriter = nil
 			tmpReq.hdrBuf = nil
 			tmpReq.attachConn = nil
+			ctx, cancel := context.WithTimeout(req.Context(), d)
+			defer cancel()
+			tmpReq.ctx = ctx
 			tmpResp := ResponsePool.Get().(*Response)
 			tmpResp.Reset()
 			tmpResp.lazyReq = &tmpReq

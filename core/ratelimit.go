@@ -78,15 +78,32 @@ func (tb *TokenBucket) Wait(tokens int64) {
 	}
 	if tokens > 0 {
 		for !tb.Allow(tokens) {
-			time.Sleep(time.Millisecond)
+			tb.sleepForDeficit(tokens)
 		}
 	}
 }
 
 func (tb *TokenBucket) waitForChunk(n int64) {
 	for !tb.Allow(n) {
-		time.Sleep(time.Millisecond)
+		tb.sleepForDeficit(n)
 	}
+}
+
+func (tb *TokenBucket) sleepForDeficit(n int64) {
+	tb.refill()
+	deficit := n - tb.tokens.Load()
+	if deficit <= 0 || tb.rate <= 0 {
+		time.Sleep(50 * time.Microsecond)
+		return
+	}
+	waitNs := (deficit * 1_000_000_000) / tb.rate
+	if waitNs < int64(50*time.Microsecond) {
+		waitNs = int64(50 * time.Microsecond)
+	}
+	if waitNs > int64(10*time.Millisecond) {
+		waitNs = int64(10 * time.Millisecond)
+	}
+	time.Sleep(time.Duration(waitNs))
 }
 
 func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
@@ -95,7 +112,7 @@ func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
 			if time.Now().After(deadline) {
 				return false
 			}
-			time.Sleep(time.Millisecond)
+			tb.sleepForDeficit(tb.burst)
 		}
 		tokens -= tb.burst
 	}
@@ -106,7 +123,7 @@ func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
 		if time.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(time.Millisecond)
+		tb.sleepForDeficit(tokens)
 	}
 	return true
 }

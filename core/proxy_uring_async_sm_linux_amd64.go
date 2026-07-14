@@ -276,7 +276,7 @@ func (worker *plainUringWorker) completeForward(fw *asyncForward) {
 		worker.discardForward(fw)
 		return
 	}
-	conn := &worker.connections[idx]
+	conn := worker.connections[idx]
 	if conn.generation != clientGen || conn.state != plainConnStateForwarding {
 		worker.discardForward(fw)
 		return
@@ -328,7 +328,7 @@ func (worker *plainUringWorker) failForward(fw *asyncForward, status int) {
 	if idx < 0 || int(idx) >= len(worker.connections) {
 		return
 	}
-	conn := &worker.connections[idx]
+	conn := worker.connections[idx]
 	if conn.generation != clientGen || conn.state != plainConnStateForwarding {
 		return
 	}
@@ -382,7 +382,7 @@ func (worker *plainUringWorker) sweepForwards(now int64) {
 		}
 		idx := fw.clientIndex
 		if idx >= 0 && int(idx) < len(worker.connections) {
-			conn := &worker.connections[idx]
+			conn := worker.connections[idx]
 			if conn.generation == fw.clientGen && conn.state == plainConnStateForwarding {
 				worker.writeAsyncError(conn, fw.consumed, false, 504)
 			}

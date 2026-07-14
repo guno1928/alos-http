@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -17,11 +18,15 @@ type pooledConn struct {
 	idleDeadline time.Time
 }
 
+var errProxyPoolExhausted = errors.New("proxy backend connection pool exhausted")
+
 type connPool struct {
 	addr          string
 	useTLS        bool
 	tlsSkipVerify bool
 	maxIdle       int
+	maxOpen       int
+	open          atomic.Int64
 	idleTimeout   time.Duration
 	dialTimeout   time.Duration
 	ch            chan *pooledConn
@@ -49,6 +54,7 @@ func newConnPool(addr string, useTLS, tlsSkipVerify bool, maxIdle int, idleTimeo
 		useTLS:        useTLS,
 		tlsSkipVerify: tlsSkipVerify,
 		maxIdle:       maxIdle,
+		maxOpen:       maxIdle * 16,
 		idleTimeout:   idleTimeout,
 		dialTimeout:   dialTimeout,
 		ch:            make(chan *pooledConn, maxIdle),
@@ -95,8 +101,13 @@ func (cp *connPool) put(pc *pooledConn) {
 }
 
 func (cp *connPool) dial() (*pooledConn, error) {
+	if cp.maxOpen > 0 && cp.open.Add(1) > int64(cp.maxOpen) {
+		cp.open.Add(-1)
+		return nil, errProxyPoolExhausted
+	}
 	conn, err := dialBackendConn(cp.addr, cp.useTLS, cp.tlsSkipVerify, cp.dialTimeout)
 	if err != nil {
+		cp.open.Add(-1)
 		return nil, err
 	}
 	enableProxyFuse(conn)
@@ -113,6 +124,7 @@ func (cp *connPool) discard(pc *pooledConn) {
 	if pc.conn != nil {
 		pc.conn.Close()
 		pc.conn = nil
+		cp.open.Add(-1)
 	}
 	if pc.br != nil {
 		pc.br.Reset(pooledConnReaderSink)
