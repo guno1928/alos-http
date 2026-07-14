@@ -264,6 +264,17 @@ func (r *Response) SetBody(b []byte) {
 	r.bodyIsText = false
 }
 
+func (r *Response) prepareBody(n int) []byte {
+	if cap(r.body) >= n {
+		r.body = r.body[:n]
+	} else {
+		r.body = make([]byte, n)
+	}
+	r.bodyString = ""
+	r.bodyIsText = false
+	return r.body
+}
+
 func (r *Response) bodyBytesUnsafe() []byte {
 	if r.bodyIsText {
 		return UnsafeBytes(r.bodyString)

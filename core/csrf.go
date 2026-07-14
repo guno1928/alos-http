@@ -2,9 +2,19 @@ package core
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 )
+
+func constantTimeEqualString(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := 0; i < len(a); i++ {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
+}
 
 // CSRFConfig configures the CSRF middleware returned by CSRF.
 //
@@ -111,7 +121,7 @@ func CSRF(cfg CSRFConfig) MiddlewareFunc {
 					clientToken = extractFormField(req, formField)
 				}
 
-				if subtle.ConstantTimeCompare([]byte(token), []byte(clientToken)) != 1 {
+				if !constantTimeEqualString(token, clientToken) {
 					if errorHandler != nil {
 						errorHandler(req, resp)
 					} else {

@@ -260,13 +260,12 @@ func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, 
 		}
 
 		if contentLength > 0 {
-			bodyBuf := make([]byte, contentLength)
+			bodyBuf := resp.prepareBody(int(contentLength))
 			_, err := io.ReadFull(pc.br, bodyBuf)
 			if err != nil {
 				b.pool.discard(pc)
 				return err
 			}
-			resp.SetBody(bodyBuf)
 		}
 
 		cPath := req.Path

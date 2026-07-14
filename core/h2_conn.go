@@ -917,7 +917,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	req.RawPath = stream.RawPath
 	req.Query = stream.Query
 	req.Proto = "HTTP/2"
-	req.Headers = append(req.Headers[:0], stream.Headers...)
+	req.Headers, stream.Headers = stream.Headers, req.Headers[:0]
 	req.Body = stream.Body
 	req.StreamID = stream.ID
 	req.IsH2 = true

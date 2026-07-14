@@ -258,10 +258,9 @@ func (ce *CORSEngine) Middleware() MiddlewareFunc {
 }
 
 func (ce *CORSEngine) applyCORS(snap *corsSnapshot, req *Request, resp *Response) {
-	origin := req.Header("origin")
 	if snap.wildcard {
 		resp.SetHeaderUnsafe("access-control-allow-origin", "*")
-	} else if origin != "" {
+	} else if origin := req.Header("origin"); origin != "" {
 		if _, ok := snap.originMap[origin]; ok {
 			resp.SetHeaderUnsafe("access-control-allow-origin", cookieStripCTL(origin))
 			resp.SetHeaderUnsafe("vary", "Origin")
@@ -690,8 +689,6 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				}()
 				next(&tmpReq, tmpResp)
 			}()
-			timer := time.NewTimer(d)
-			defer timer.Stop()
 			select {
 			case <-done:
 				if !timedOut.Load() {
@@ -707,7 +704,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					tmpResp.Reset()
 					ResponsePool.Put(tmpResp)
 				}
-			case <-timer.C:
+			case <-ctx.Done():
 				timedOut.Store(true)
 				go func() {
 					<-done
@@ -855,6 +852,11 @@ func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 	realm = sanitizeAuthRealm(realm)
 	challenge := "Basic realm=\"" + realm + "\""
 
+	userHashes := make(map[string][32]byte, len(cfg.Users))
+	for u, p := range cfg.Users {
+		userHashes[u] = sha256.Sum256([]byte(p))
+	}
+
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			auth := req.Header("authorization")
@@ -886,12 +888,11 @@ func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 			}
 			user := decoded[:colon]
 			pass := decoded[colon+1:]
-			expectedPass, ok := cfg.Users[user]
-			if !ok {
-				expectedPass = pass
-			}
-			expectedHash := sha256.Sum256([]byte(expectedPass))
 			passHash := sha256.Sum256([]byte(pass))
+			expectedHash, ok := userHashes[user]
+			if !ok {
+				expectedHash = passHash
+			}
 			if !ok || subtle.ConstantTimeCompare(expectedHash[:], passHash[:]) != 1 {
 				resp.Status(401).
 					SetHeader("WWW-Authenticate", challenge).

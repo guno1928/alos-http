@@ -214,7 +214,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 		copy(inner, data)
 		inner[innerLen-1] = 0x17
 
-		obp := LargeBufPool.Get().(*[]byte)
+		obp := MediumBufPool.Get().(*[]byte)
 		out := (*obp)[:5]
 		out[0] = 0x17
 		out[1] = 0x03
@@ -224,12 +224,12 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 		out = writer.EncryptAppend(out, inner)
 
 		if owned, ok := conn.(ownedWriteConn); ok {
-			_, err := owned.WriteOwned(out, obp, writeOwnedReleaseLargeBuf)
+			_, err := owned.WriteOwned(out, obp, writeOwnedReleaseMediumBuf)
 			return err
 		}
 		err := writeFull(conn, out)
 		*obp = out[:0]
-		LargeBufPool.Put(obp)
+		MediumBufPool.Put(obp)
 		return err
 	}
 
@@ -272,6 +272,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	var err error
 	if len(out) > 0 {
 		if owned, ok := conn.(ownedWriteConn); ok {
+			*obp = out
 			_, err = owned.WriteOwned(out, obp, writeOwnedReleaseLargeBuf)
 			*ibp = (*ibp)[:0]
 			WriteBufPool.Put(ibp)

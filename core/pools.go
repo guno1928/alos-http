@@ -111,15 +111,23 @@ var connBodyBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, connBodyBufDefaultCap); return &b },
 }
 
+var bufBoxPool = sync.Pool{
+	New: func() any { return new([]byte) },
+}
+
 func acquirePooledBuf(pool *sync.Pool) []byte {
 	bp := pool.Get().(*[]byte)
-	return (*bp)[:0]
+	buf := (*bp)[:0]
+	*bp = nil
+	bufBoxPool.Put(bp)
+	return buf
 }
 
 func releasePooledBuf(pool *sync.Pool, buf []byte, maxCap int) {
 	if cap(buf) == 0 || cap(buf) > maxCap {
 		return
 	}
-	b := buf[:0]
-	pool.Put(&b)
+	bp := bufBoxPool.Get().(*[]byte)
+	*bp = buf[:0]
+	pool.Put(bp)
 }
