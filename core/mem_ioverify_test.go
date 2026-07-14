@@ -28,10 +28,6 @@ func ioWaitListening(addr string, d time.Duration) bool {
 	return false
 }
 
-// TestSplitPathKeepAliveVerify drives many sequential keep-alive requests for a
-// LARGE (>16KB, split-send) response, byte-verifying every response body. This
-// exercises split-send + the writingBody transition + the mid-send buffer
-// release/re-acquire cycle repeatedly; any corruption shows up as bad>0.
 func TestSplitPathKeepAliveVerify(t *testing.T) {
 	if os.Getenv("ALOS_RUN_LOADTEST") == "" {
 		t.Skip("io_uring load test; set ALOS_RUN_LOADTEST=1 (needs a real kernel, not WSL2)")

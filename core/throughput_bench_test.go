@@ -36,7 +36,6 @@ func benchRouter() *Router {
 	return r
 }
 
-// ===== A. serialization: old full-copy vs split-send, by body size =====
 func BenchmarkSerializeFullVsSplit(b *testing.B) {
 	for _, sz := range []int{0, 64, 256, 1024, 4096, 16384, 65536, 131072} {
 		r := benchResp(strings.Repeat("x", sz))
@@ -56,7 +55,6 @@ func BenchmarkSerializeFullVsSplit(b *testing.B) {
 	}
 }
 
-// ===== B. header-only serialization (the split-send hot path) =====
 func BenchmarkHeaderSerialize(b *testing.B) {
 	for _, sz := range []int{100, 4096, 65536, 131072} {
 		r := benchResp(strings.Repeat("h", sz))
@@ -69,7 +67,6 @@ func BenchmarkHeaderSerialize(b *testing.B) {
 	}
 }
 
-// ===== C. response builders =====
 func BenchmarkResponseBuilders(b *testing.B) {
 	body := strings.Repeat("y", 4096)
 	bb := []byte(body)
@@ -94,7 +91,6 @@ func BenchmarkResponseBuilders(b *testing.B) {
 	}
 }
 
-// ===== D. buffer pools =====
 func BenchmarkPools(b *testing.B) {
 	b.Run("read-acquire-release", func(b *testing.B) {
 		b.ReportAllocs()
@@ -144,7 +140,6 @@ func BenchmarkPools(b *testing.B) {
 	})
 }
 
-// ===== E. request head parsing =====
 func BenchmarkParseRequest(b *testing.B) {
 	reqs := map[string]string{
 		"simple-get":   "GET / HTTP/1.1\r\nHost: alos.gg\r\n\r\n",
@@ -166,7 +161,6 @@ func BenchmarkParseRequest(b *testing.B) {
 	}
 }
 
-// ===== F. router lookup =====
 func BenchmarkRouterLookup(b *testing.B) {
 	router := benchRouter()
 	req := &Request{Headers: make([][2]string, 0, 16)}
@@ -181,7 +175,6 @@ func BenchmarkRouterLookup(b *testing.B) {
 	}
 }
 
-// ===== G. full per-request pipeline (parse -> lookup -> build -> serialize) =====
 func BenchmarkFullPipeline(b *testing.B) {
 	router := benchRouter()
 	req := &Request{Headers: make([][2]string, 0, 16)}
@@ -214,7 +207,6 @@ func BenchmarkFullPipeline(b *testing.B) {
 	}
 }
 
-// ===== H. parallel throughput (multi-core req/s proxy) =====
 func BenchmarkParallelThroughput(b *testing.B) {
 	router := benchRouter()
 	data := []byte("GET /dashboard HTTP/1.1\r\nHost: alos.gg\r\nCookie: s=1\r\n\r\n")
@@ -257,7 +249,6 @@ func BenchmarkParallelThroughput(b *testing.B) {
 	})
 }
 
-// ===== I. extra hot-path coverage (to complete the battery) =====
 func BenchmarkExtra(b *testing.B) {
 	body := strings.Repeat("z", 8192)
 	textResp := &Response{}

@@ -24,11 +24,15 @@ const (
 	plainUringOpClose  = 4
 	plainUringOpWake   = 5
 
-	plainConnStateFree       = 0
-	plainConnStateReading    = 1
-	plainConnStateWriting    = 2
-	plainConnStateClosing    = 3
-	plainConnStateForwarding = 4
+	plainConnStateFree        = 0
+	plainConnStateReading     = 1
+	plainConnStateWriting     = 2
+	plainConnStateClosing     = 3
+	plainConnStateForwarding  = 4
+	plainConnStateDispatching = 5
+
+	plainAcceptRetryBackoffNs = int64(50 * time.Millisecond)
+	plainDispatchQueueSize    = 8192
 
 	plainConnProtoUnknown = 0
 	plainConnProtoH1      = 1
@@ -97,16 +101,19 @@ type plainUringWorker struct {
 	connections     []plainWorkerConn
 	freeHead        int32
 	completions     [ioUringCompletionBatchSize]ioUringCqe
-	sweepIntervalNs int64
-	acceptBackfill  int64
-	nextAcceptRetry int64
-	localReqs       uint64
-	wakeupBuf       [8]byte
-	wakeupIovec     syscall.Iovec
-	wakeArmed       bool
-	parking         bool
-	active          atomic.Int64
-	asyncFwd        *asyncForwardPool
+	sweepIntervalNs    int64
+	acceptBackfill     int64
+	nextAcceptRetry    int64
+	acceptPausedUntil  int64
+	lastAcceptPauseLog int64
+	localReqs          uint64
+	wakeupBuf          [8]byte
+	wakeupIovec        syscall.Iovec
+	wakeArmed          bool
+	parking            bool
+	active             atomic.Int64
+	asyncFwd           *asyncForwardPool
+	dispatchTasks      chan func()
 }
 
 type plainUringBackend struct {
@@ -175,6 +182,7 @@ func newPlainUringBackend(s *Server, listeners []net.Listener) (*plainUringBacke
 			server:        s,
 			connections:   make([]plainWorkerConn, ioUringInitialConnsPerShard),
 			freeHead:      0,
+			dispatchTasks: make(chan func(), plainDispatchQueueSize),
 		}
 		if recvMultishotSupported {
 			recvBufs, err := newIOUringBufferRing(plainRecvBufRingSize, plainRecvBufSize, uint16(workerID+1))
@@ -344,6 +352,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer worker.flushReqStats()
+	worker.reclaimPreviousRun()
 	ring, err := newOwnedIOUring(plainWorkerRingEntries)
 	if err != nil {
 		return fmt.Errorf("plain worker %d ring create: %w", worker.id, err)
@@ -383,6 +392,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			}
 		}
 		now := MonotonicNanotime()
+		worker.drainDispatchTasks()
 		if err := worker.drainHandoffs(now); err != nil {
 			return fmt.Errorf("plain drain handoffs: %w", err)
 		}
@@ -433,6 +443,7 @@ func (worker *plainUringWorker) run(backend *plainUringBackend) error {
 			worker.sweepForwards(nowTime)
 			lastSweep = nowTime
 		}
+		worker.drainDispatchTasks()
 		if err := worker.drainHandoffs(nowTime); err != nil {
 			return fmt.Errorf("plain drain handoffs after cqe: %w", err)
 		}
@@ -456,6 +467,45 @@ func (worker *plainUringWorker) closeAllConnections() {
 		conn := &worker.connections[i]
 		if conn.fd >= 0 && conn.state != plainConnStateClosing {
 			_ = worker.closeConnection(conn)
+		}
+	}
+}
+
+func (worker *plainUringWorker) reclaimPreviousRun() {
+	if worker.ring == nil {
+		return
+	}
+	for i := range worker.connections {
+		conn := &worker.connections[i]
+		if conn.fd >= 0 {
+			_ = syscall.Close(conn.fd)
+			conn.fd = -1
+		}
+		if conn.tracked {
+			worker.active.Add(-1)
+			worker.server.releaseTrackedConn()
+			Stats.ActiveConns.Add(-1)
+			conn.tracked = false
+		}
+		conn.state = plainConnStateFree
+		conn.generation++
+		if conn.generation == 0 {
+			conn.generation = 1
+		}
+	}
+	if worker.recvBufs != nil {
+		_ = worker.recvBufs.unregister(worker.ring)
+	}
+	worker.ring.close()
+	worker.ring = nil
+	for {
+		select {
+		case <-worker.dispatchTasks:
+		default:
+			worker.initConnections()
+			worker.freeHead = 0
+			worker.acceptPausedUntil = 0
+			return
 		}
 	}
 }
@@ -557,6 +607,14 @@ func (worker *plainUringWorker) handleAccept(backend *plainUringBackend, result 
 		if result == -int32(syscall.EAGAIN) || result == -int32(syscall.EINTR) || result == -int32(syscall.ECONNABORTED) {
 			return nil
 		}
+		if result == -int32(syscall.EMFILE) || result == -int32(syscall.ENFILE) || result == -int32(syscall.ENOMEM) || result == -int32(syscall.ENOBUFS) {
+			worker.acceptPausedUntil = now + plainAcceptRetryBackoffNs
+			if now-worker.lastAcceptPauseLog > int64(time.Second) {
+				worker.lastAcceptPauseLog = now
+				log.Printf("[WARN] io_uring plain worker %d accept backpressure (%v); pausing accepts %v", worker.id, syscall.Errno(-result), time.Duration(plainAcceptRetryBackoffNs))
+			}
+			return nil
+		}
 		return fmt.Errorf("plain io_uring accept failed: %w", syscall.Errno(-result))
 	}
 	atomic.StoreInt64(&worker.nextAcceptRetry, 0)
@@ -586,7 +644,7 @@ func (worker *plainUringWorker) handleRead(conn *plainWorkerConn, result int32, 
 	if len(conn.readBuf) < conn.readN {
 		conn.readBuf = conn.readBuf[:conn.readN]
 	}
-	if conn.state == plainConnStateForwarding {
+	if conn.state == plainConnStateForwarding || conn.state == plainConnStateDispatching {
 		return nil
 	}
 	if conn.protocol == plainConnProtoH2 {
@@ -630,7 +688,7 @@ func (worker *plainUringWorker) handleBufferedRead(conn *plainWorkerConn, result
 	}
 	worker.appendBufferedRead(&conn.readBuf, bufferID, n)
 	conn.readN = len(conn.readBuf)
-	if conn.state == plainConnStateWriting || conn.state == plainConnStateForwarding {
+	if conn.state == plainConnStateWriting || conn.state == plainConnStateForwarding || conn.state == plainConnStateDispatching {
 		return nil
 	}
 	if conn.protocol == plainConnProtoH2 {
@@ -768,32 +826,80 @@ func (worker *plainUringWorker) processRequests(conn *plainWorkerConn) error {
 		if worker.tryAsyncForward(conn, consumed, closeConn) {
 			return nil
 		}
-		if worker.server.fastDispatch.Load() {
-			handler := worker.server.Router.Lookup(conn.req.Method, conn.req.Path, &conn.req)
-			handler(&conn.req, &conn.resp)
+		return worker.startAsyncDispatch(conn, consumed, closeConn)
+	}
+}
+
+func (worker *plainUringWorker) startAsyncDispatch(conn *plainWorkerConn, consumed int, closeConn bool) error {
+	conn.state = plainConnStateDispatching
+	idx := conn.index
+	gen := conn.generation
+	req := &conn.req
+	resp := &conn.resp
+	srv := worker.server
+	go func() {
+		defer func() {
+			if r := recover(); r != nil && !req.connTakenOver {
+				resp.resetFastH1()
+				resp.Status(500).String("Internal Server Error")
+			}
+			worker.postTask(func() {
+				worker.finishAsyncDispatch(idx, gen, consumed, closeConn)
+			})
+		}()
+		if srv.fastDispatch.Load() {
+			handler := srv.Router.Lookup(req.Method, req.Path, req)
+			handler(req, resp)
 		} else {
-			worker.server.dispatch(&conn.req, &conn.resp)
+			srv.dispatch(req, resp)
 		}
-		if conn.req.connTakenOver {
-			if conn.req.hijacked {
-				worker.releaseConnection(conn)
-				return nil
-			}
-			if conn.resp.IsStreamed() {
-				releaseStreamWriter(conn.req.StreamWriter)
-			}
-			if conn.req.conn != nil {
-				_ = conn.req.conn.Close()
-			}
+	}()
+	return nil
+}
+
+func (worker *plainUringWorker) finishAsyncDispatch(idx int32, gen uint16, consumed int, closeConn bool) {
+	if idx < 0 || int(idx) >= len(worker.connections) {
+		return
+	}
+	conn := &worker.connections[idx]
+	if conn.generation != gen || conn.state != plainConnStateDispatching {
+		return
+	}
+	if conn.req.connTakenOver {
+		if conn.req.hijacked {
 			worker.releaseConnection(conn)
-			return nil
+			return
 		}
-		if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
-			conn.resp.resetFastH1()
-			conn.resp.Status(500).String("Response Too Large")
-			closeConn = true
+		if conn.resp.IsStreamed() {
+			releaseStreamWriter(conn.req.StreamWriter)
 		}
-		return worker.queueResponse(conn, !closeConn, consumed)
+		if conn.req.conn != nil {
+			_ = conn.req.conn.Close()
+		}
+		worker.releaseConnection(conn)
+		return
+	}
+	if worker.server.config.MaxWriteSize > 0 && int64(conn.resp.transmittedBodyLen()) > worker.server.config.MaxWriteSize {
+		conn.resp.resetFastH1()
+		conn.resp.Status(500).String("Response Too Large")
+		closeConn = true
+	}
+	_ = worker.queueResponse(conn, !closeConn, consumed)
+}
+
+func (worker *plainUringWorker) postTask(fn func()) {
+	worker.dispatchTasks <- fn
+	worker.signalWake()
+}
+
+func (worker *plainUringWorker) drainDispatchTasks() {
+	for {
+		select {
+		case fn := <-worker.dispatchTasks:
+			fn()
+		default:
+			return
+		}
 	}
 }
 
@@ -817,34 +923,31 @@ func (worker *plainUringWorker) newH1RequestConnAttacher(conn *plainWorkerConn, 
 	var once sync.Once
 	return func(req *Request) net.Conn {
 		once.Do(func() {
-			if conn.fd < 0 {
-				return
-			}
-			// The worker keeps a multishot recv armed on this fd. Without
-			// disarming it first, bytes the peer sends after the handoff (e.g.
-			// the first WebSocket frames right after the 101) race into the
-			// worker's buffer ring and are dropped as stale — lost frames.
-			// Closing the fd would NOT help: pending io_uring ops hold their own
-			// file reference. Sync-cancel the recv before the fd changes hands;
-			// this runs before the protocol-switch response is written, so a
-			// conforming peer cannot have sent post-upgrade bytes yet.
-			_ = worker.ring.cancelFD(conn.fd, ioUringOpRecv)
-			wrapped, err := newIOUringConn(conn.fd)
-			if err != nil {
-				return
-			}
-			conn.fd = -1
-			handed := net.Conn(wrapped)
-			if len(prefix) > 0 {
-				handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
-			}
-			handed = worker.server.trackHandoffConn(handed)
-			if handed == nil {
-				return
-			}
-			req.connTakenOver = true
-			req.attachConn = nil
-			req.conn = handed
+			done := make(chan struct{})
+			worker.postTask(func() {
+				defer close(done)
+				if conn.fd < 0 {
+					return
+				}
+				_ = worker.ring.cancelFD(conn.fd, ioUringOpRecv)
+				wrapped, err := newIOUringConn(conn.fd)
+				if err != nil {
+					return
+				}
+				conn.fd = -1
+				handed := net.Conn(wrapped)
+				if len(prefix) > 0 {
+					handed = &prefixConn{Conn: wrapped, reader: io.MultiReader(bytes.NewReader(prefix), wrapped)}
+				}
+				handed = worker.server.trackHandoffConn(handed)
+				if handed == nil {
+					return
+				}
+				req.connTakenOver = true
+				req.attachConn = nil
+				req.conn = handed
+			})
+			<-done
 		})
 		return req.conn
 	}
@@ -1074,6 +1177,12 @@ func (worker *plainUringWorker) handleWriteNotification(conn *plainWorkerConn) e
 func (worker *plainUringWorker) fillAccepts(now int64) error {
 	if atomic.LoadInt64(&worker.acceptBackfill) <= 0 || worker.server.doneClosed() || worker.listenerFD < 0 {
 		return nil
+	}
+	if worker.acceptPausedUntil != 0 {
+		if now < worker.acceptPausedUntil {
+			return nil
+		}
+		worker.acceptPausedUntil = 0
 	}
 	for atomic.LoadInt64(&worker.acceptBackfill) > 0 {
 		if err := worker.ring.prepAcceptUser(worker.listenerFD, plainEncodeUserData(plainUringOpAccept, 0, 0), uint32(sockCloexec|sockNonblock)); err != nil {
@@ -1327,7 +1436,7 @@ func (worker *plainUringWorker) sweepIdle(now int64) {
 	readHeaderTO := worker.server.config.ReadHeaderTimeout
 	for i := range worker.connections {
 		conn := &worker.connections[i]
-		if conn.fd < 0 || conn.state == plainConnStateClosing {
+		if conn.fd < 0 || conn.state == plainConnStateClosing || conn.state == plainConnStateDispatching {
 			continue
 		}
 		timeout := idleTO

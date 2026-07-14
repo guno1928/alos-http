@@ -177,24 +177,30 @@ func (r *Router) Handle(method, path string, handler HandlerFunc) *Route {
 // GET registers a handler for GET requests at the given path.
 func (r *Router) GET(path string, handler HandlerFunc) *Route { return r.Handle("GET", path, handler) }
 
+// POST registers a handler for POST requests at the given path.
 func (r *Router) POST(path string, handler HandlerFunc) *Route {
 	return r.Handle("POST", path, handler)
 }
 
+// PUT registers a handler for PUT requests at the given path.
 func (r *Router) PUT(path string, handler HandlerFunc) *Route { return r.Handle("PUT", path, handler) }
 
+// DELETE registers a handler for DELETE requests at the given path.
 func (r *Router) DELETE(path string, handler HandlerFunc) *Route {
 	return r.Handle("DELETE", path, handler)
 }
 
+// PATCH registers a handler for PATCH requests at the given path.
 func (r *Router) PATCH(path string, handler HandlerFunc) *Route {
 	return r.Handle("PATCH", path, handler)
 }
 
+// HEAD registers a handler for HEAD requests at the given path.
 func (r *Router) HEAD(path string, handler HandlerFunc) *Route {
 	return r.Handle("HEAD", path, handler)
 }
 
+// OPTIONS registers a handler for OPTIONS requests at the given path.
 func (r *Router) OPTIONS(path string, handler HandlerFunc) *Route {
 	return r.Handle("OPTIONS", path, handler)
 }
@@ -551,11 +557,6 @@ func findBuilt(current *node, path string, req *Request) HandlerFunc {
 		remaining = remaining[rp:]
 	}
 
-	// Nearest ancestor catch-all seen on the way down, with the path suffix and
-	// param count as they were AT that node. When the walk descends into a
-	// static branch that shares a prefix with the lookup path (e.g. /dashboard/shop
-	// vs registered /dashboard/shop-editor) and then diverges, it must fall back
-	// to this catch-all with the correct suffix ("shop"), not the whole path.
 	var pendingCatch *node
 	var pendingRemaining string
 	var pendingParamCount int
@@ -842,26 +843,32 @@ func (g *RouteGroup) handle(method, path string, handler HandlerFunc) *Route {
 	return g.router.Handle(method, g.prefix+path, h)
 }
 
+// GET registers a GET handler on the group at prefix+path.
 func (g *RouteGroup) GET(path string, handler HandlerFunc) *Route {
 	return g.handle("GET", path, handler)
 }
 
+// POST registers a POST handler on the group at prefix+path.
 func (g *RouteGroup) POST(path string, handler HandlerFunc) *Route {
 	return g.handle("POST", path, handler)
 }
 
+// PUT registers a PUT handler on the group at prefix+path.
 func (g *RouteGroup) PUT(path string, handler HandlerFunc) *Route {
 	return g.handle("PUT", path, handler)
 }
 
+// DELETE registers a DELETE handler on the group at prefix+path.
 func (g *RouteGroup) DELETE(path string, handler HandlerFunc) *Route {
 	return g.handle("DELETE", path, handler)
 }
 
+// PATCH registers a PATCH handler on the group at prefix+path.
 func (g *RouteGroup) PATCH(path string, handler HandlerFunc) *Route {
 	return g.handle("PATCH", path, handler)
 }
 
+// HEAD registers a HEAD handler on the group at prefix+path.
 func (g *RouteGroup) HEAD(path string, handler HandlerFunc) *Route {
 	return g.handle("HEAD", path, handler)
 }
@@ -905,11 +912,17 @@ func Chain(handler HandlerFunc, middleware ...MiddlewareFunc) HandlerFunc {
 	return h
 }
 
+// RouteInfo describes a single registered route returned by Routes.
+//
+// Method is the HTTP method (e.g. "GET").
+// Path is the full registered path pattern (e.g. "/users/:id").
 type RouteInfo struct {
 	Method string
 	Path   string
 }
 
+// Routes returns all registered routes across every method, sorted by method
+// then path. Useful for debugging and introspection.
 func (r *Router) Routes() []RouteInfo {
 	var routes []RouteInfo
 	for i, root := range r.trees {
@@ -944,6 +957,7 @@ func collectRoutes(n *node, prefix, method string, out *[]RouteInfo) {
 	}
 }
 
+// Routes returns all registered routes whose path starts with the group prefix.
 func (g *RouteGroup) Routes() []RouteInfo {
 	all := g.router.Routes()
 	var filtered []RouteInfo

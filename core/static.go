@@ -8,6 +8,22 @@ import (
 	"strings"
 )
 
+// StaticConfig configures the file server returned by Static.
+//
+// Root is the filesystem directory whose contents are served; paths are resolved against it and confined to it.
+//
+//	Example: Root: "./public".
+//	Example: Root: "/var/www/site".
+//
+// Index is the file served for directory requests; defaults to "index.html".
+//
+//	Example: Index: "index.html".
+//	Example: Index: "home.html".
+//
+// Browse enables an HTML directory listing when a directory has no index file; defaults to false (such requests get 404).
+//
+//	Example: Browse: true.
+//	Example: Browse: false.
 type StaticConfig struct {
 	Root   string
 	Index  string
@@ -24,6 +40,10 @@ func sanitizeStaticPath(p string) (string, bool) {
 	return p, true
 }
 
+// Static returns a handler that serves files from cfg.Root under urlPrefix, stripping urlPrefix from the request path and rejecting traversal outside the root. Register it on a catch-all route so every path below the prefix reaches the handler.
+//
+// Example: s.Router.GET("/static/*filepath", Static("/static", StaticConfig{Root: "./public"}))
+// Example: s.Router.GET("/files/*filepath", Static("/files", StaticConfig{Root: "/var/www", Browse: true}))
 func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 	if !strings.HasPrefix(urlPrefix, "/") {
 		urlPrefix = "/" + urlPrefix
@@ -147,6 +167,10 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 	}
 }
 
+// StaticDir serves the directory root under urlPrefix using default StaticConfig; it is shorthand for Static(urlPrefix, StaticConfig{Root: root}).
+//
+// Example: s.Router.GET("/assets/*filepath", StaticDir("/assets", "./assets"))
+// Example: s.Router.GET("/dl/*filepath", StaticDir("/dl", "/srv/downloads"))
 func StaticDir(urlPrefix, root string) HandlerFunc {
 	return Static(urlPrefix, StaticConfig{Root: root})
 }

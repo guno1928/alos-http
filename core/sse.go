@@ -2,10 +2,18 @@ package core
 
 import "strings"
 
+// SSEWriter streams Server-Sent Events to the client. Obtain one from
+// Response.SSE and emit events with Send, SendData, or SendID.
 type SSEWriter struct {
 	sw StreamWriter
 }
 
+// SSE switches the response into Server-Sent Events mode, writing the
+// text/event-stream headers, and returns an SSEWriter. Returns nil if the
+// connection does not support streaming.
+//
+// Example: sse := resp.SSE(); if sse == nil { return }
+// Example: sse := resp.SSE(); defer sse.Close()
 func (r *Response) SSE() *SSEWriter {
 	sw := r.EnsureStreamWriter()
 	if sw == nil {
@@ -41,6 +49,10 @@ func sseStripField(s string) string {
 	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
 }
 
+// Send writes a named event with a data payload and flushes it to the client.
+//
+// Example: sse.Send("message", "hello")
+// Example: sse.Send("update", `{"count":5}`)
 func (w *SSEWriter) Send(event, data string) error {
 	var b strings.Builder
 	b.WriteString("event: ")
@@ -54,6 +66,10 @@ func (w *SSEWriter) Send(event, data string) error {
 	return w.sw.Flush()
 }
 
+// SendData writes an unnamed data-only event and flushes it to the client.
+//
+// Example: sse.SendData("tick")
+// Example: sse.SendData("line1\nline2")
 func (w *SSEWriter) SendData(data string) error {
 	var b strings.Builder
 	b.WriteString(formatSSEData(data))
@@ -64,6 +80,11 @@ func (w *SSEWriter) SendData(data string) error {
 	return w.sw.Flush()
 }
 
+// SendID writes an event carrying an id field, allowing clients to resume with
+// Last-Event-ID, and flushes it to the client.
+//
+// Example: sse.SendID("42", "message", "hello")
+// Example: sse.SendID("e1", "update", `{"ok":true}`)
 func (w *SSEWriter) SendID(id, event, data string) error {
 	var b strings.Builder
 	b.WriteString("id: ")
@@ -80,6 +101,7 @@ func (w *SSEWriter) SendID(id, event, data string) error {
 	return w.sw.Flush()
 }
 
+// Close ends the event stream and closes the underlying connection.
 func (w *SSEWriter) Close() error {
 	return w.sw.Close()
 }

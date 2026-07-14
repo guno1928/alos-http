@@ -6,11 +6,6 @@ type pnRange struct {
 	lo, hi uint64
 }
 
-// recordRecvPN adds a received packet number to the ACK range set for the given
-// space, merging it into any adjacent or overlapping range. Ranges are kept
-// sorted in descending order by their high bound so the highest received packet
-// is always first. It is called only from the connection's single recvLoop, so
-// it requires no locking.
 func (qc *QUICConn) recordRecvPN(space int, pn uint64) {
 	rs := qc.ackRanges[space]
 	idx := len(rs)
@@ -44,8 +39,6 @@ func (qc *QUICConn) recordRecvPN(space int, pn uint64) {
 	qc.ackRanges[space] = merged
 }
 
-// quicAppendACKFrameRanges encodes an RFC 9000 ACK frame acknowledging every
-// packet in ranges, which must be sorted in descending order by high bound.
 func quicAppendACKFrameRanges(dst []byte, ackDelay uint64, ranges []pnRange) []byte {
 	if len(ranges) == 0 {
 		return dst

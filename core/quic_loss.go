@@ -279,12 +279,6 @@ func (ls *quicLossState) largestAckedPN(space int) int64 {
 	return v
 }
 
-// ptoExpiredFrames implements RFC 9002 tail-loss recovery. When ack-eliciting
-// packets have been outstanding longer than the probe timeout (no ACK has
-// arrived to advance largestAcked past them), they cannot be recovered by
-// ACK-based loss detection, so they are surfaced here for retransmission. The
-// expired packets are removed from the sent list, their bytes freed from the
-// in-flight count, and the PTO backoff counter is bumped.
 func (ls *quicLossState) ptoExpiredFrames(space int) [][]byte {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()

@@ -16,10 +16,6 @@ func retainedHeap() uint64 {
 	return m.HeapInuse
 }
 
-// setupMidSend builds n connections all sitting in the body-send phase, draining
-// ONE shared large response (as under a bandwidth-capped flood). With release,
-// it applies exactly what the writingBody transition does (drop readBuf+writeBuf,
-// which aren't needed while the shared body drains).
 func setupMidSend(n int, release bool) float64 {
 	shared := make([]byte, 130<<10)
 	base := retainedHeap()

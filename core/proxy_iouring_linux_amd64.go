@@ -17,10 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// enableProxyFuse turns on the single-syscall send+recv fuse for a pooled
-// backend connection (works below TLS). Only pooled forward connections call
-// this; websocket connections (dialed directly) stay unfused so their
-// bidirectional streaming is not deferred.
 func enableProxyFuse(conn net.Conn) {
 	switch c := conn.(type) {
 	case *proxyUringConn:

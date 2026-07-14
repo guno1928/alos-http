@@ -2035,7 +2035,6 @@ func (worker *tlsUringWorker) startTLS12(conn *tlsWorkerConn, certEntry *CertEnt
 	if certEntry.PrivKey == nil {
 		return tlsWorkerActionClose, nil
 	}
-	// The native TLS 1.2 path serves HTTP/1.1 only. Never negotiate h2 over 1.2.
 	alpn = ""
 	for _, p := range conn.clientHello.ALPNProtos {
 		if p == "http/1.1" {

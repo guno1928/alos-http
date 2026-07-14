@@ -482,6 +482,11 @@ func (ws *WSConn) SetReadTimeout(d time.Duration) {
 	ws.readTimeout = d
 }
 
+// SetWriteTimeout sets the timeout applied to each frame write; a value <= 0
+// disables it.
+//
+// Example: ws.SetWriteTimeout(15 * time.Second)
+// Example: ws.SetWriteTimeout(0)
 func (ws *WSConn) SetWriteTimeout(d time.Duration) {
 	ws.writeTimeout = d
 }

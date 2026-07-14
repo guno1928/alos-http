@@ -580,8 +580,6 @@ func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *Domain
 	return buf
 }
 
-// isProxyFilteredHeaderFold checks if a header should be filtered in proxy
-// requests using case-insensitive comparison (zero allocations).
 func isProxyFilteredHeaderFold(name string) bool {
 	if len(name) > 0 && name[0] == ':' {
 		return true
@@ -846,7 +844,6 @@ func isHopByHop(name string) bool {
 	return false
 }
 
-// isHopByHopFold is like isHopByHop but uses case-insensitive comparison.
 func isHopByHopFold(name string) bool {
 	switch len(name) {
 	case 2:

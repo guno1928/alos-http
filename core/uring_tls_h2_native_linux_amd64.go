@@ -1152,8 +1152,6 @@ func appendH2DataFrames(dst []byte, streamID uint32, body []byte, endStream bool
 	return dst
 }
 
-// resumePendingH2 sends more of any flow-control-blocked response bodies now that
-// the send window has been replenished. Returns true if any bytes were queued.
 func (worker *tlsUringWorker) resumePendingH2(conn *tlsWorkerConn) bool {
 	st := &conn.h2
 	if len(st.pendingBody) == 0 {

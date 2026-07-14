@@ -73,7 +73,6 @@ var quicRecvDataPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 2048); return &b },
 }
 
-// getPooledStream returns a reset stream from the pool with refCount 0.
 func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s := quicStreamPool.Get().(*QUICStream)
 	s.id = id
@@ -102,9 +101,6 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	return s
 }
 
-// releaseStream drops one reference; when the last reference is gone the stream
-// is returned to the pool. References are always acquired under streamsMu (the
-// same lock as map deletion), so a stream is never pooled while in use.
 func (qc *QUICConn) releaseStream(s *QUICStream) {
 	if s.refCount.Add(-1) == 0 {
 		if s.recvBufP != nil {
@@ -224,10 +220,6 @@ func (s *QUICStream) Write(data []byte) error {
 	return nil
 }
 
-// setSendBuf aliases data as the stream's send buffer (no copy) and marks the
-// stream finished. Safe only for a single-shot write on a fresh stream; the
-// data must outlive the drain (the caller keeps it until sendStreamData copies
-// it into the outgoing stream frame).
 func (s *QUICStream) setSendBuf(data []byte) {
 	s.mu.Lock()
 	s.sendBuf = data

@@ -26,8 +26,6 @@ func plainResp(s *Server, method string, status int) *Response {
 	return resp
 }
 
-// ===================== #1 rootFastEligible (hooks bypass) =====================
-
 func TestRootFastEligible(t *testing.T) {
 	t.Run("baseline-eligible", func(t *testing.T) {
 		if !New(Config{}).rootFastEligible() {
@@ -76,8 +74,6 @@ func TestRootFastEligible(t *testing.T) {
 	})
 }
 
-// ===================== #11 New() defaults =====================
-
 func TestNewDefaultsComplete(t *testing.T) {
 	s := New(Config{})
 	cases := []struct {
@@ -115,8 +111,6 @@ func TestNewDefaultsComplete(t *testing.T) {
 		}
 	})
 }
-
-// ===================== #2 ServerName sanitize + wiring =====================
 
 func TestServerNameSanitizeTable(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -225,8 +219,6 @@ func TestStreamPlainRespectsHandlerServer(t *testing.T) {
 	}
 }
 
-// ===================== #7 resolveReadCap =====================
-
 func TestResolveReadCapTable(t *testing.T) {
 	cases := []struct {
 		in   int64
@@ -248,8 +240,6 @@ func TestResolveReadCapTable(t *testing.T) {
 	}
 }
 
-// ===================== helpers defaultDuration / defaultUint32 =====================
-
 func TestDefaultDuration(t *testing.T) {
 	if defaultDuration(0, 9) != 9 {
 		t.Fatal("zero should use fallback")
@@ -270,8 +260,6 @@ func TestDefaultUint32(t *testing.T) {
 		t.Fatal("nonzero should be kept")
 	}
 }
-
-// ===================== #9 / extra5 H2 resolvers + SETTINGS =====================
 
 func TestH2ResolversTable(t *testing.T) {
 	def := New(Config{})
@@ -349,8 +337,6 @@ func TestH2SettingsFrameCustom(t *testing.T) {
 		t.Fatalf("frame = %d, want 32768", m[uint16(H2SettingMaxFrameSize)])
 	}
 }
-
-// ===================== #6 / #11 / extra11 header size + count =====================
 
 func mkHeaders(n int) []byte {
 	var b strings.Builder
@@ -456,8 +442,6 @@ func TestParseCorrectnessPreserved(t *testing.T) {
 	})
 }
 
-// ===================== #8 MaxWriteSize streaming =====================
-
 func TestStreamMaxWriteAllWriters(t *testing.T) {
 	t.Run("plain-over-cap", func(t *testing.T) {
 		w := &PlainH1StreamWriter{headersSent: true, maxWrite: 10}
@@ -492,8 +476,6 @@ func TestStreamMaxWriteAllWriters(t *testing.T) {
 		}
 	})
 }
-
-// ===================== #5 / extra6 QUIC idle + flow control =====================
 
 func newTestQUIC(s *Server) *QUICConn {
 	return newQUICConn(s, nil, nil, make([]byte, 8), make([]byte, 8))
@@ -579,8 +561,6 @@ func TestQUICTransportParams(t *testing.T) {
 	})
 }
 
-// ===================== #10 WebSocket timeout resolution =====================
-
 func TestWSTimeoutResolution(t *testing.T) {
 	t.Run("read-default", func(t *testing.T) {
 		if got := defaultDuration(New(Config{}).config.WSReadTimeout, wsDefaultReadTimeout); got != wsDefaultReadTimeout {
@@ -603,8 +583,6 @@ func TestWSTimeoutResolution(t *testing.T) {
 		}
 	})
 }
-
-// ===================== throughput benchmarks (regression guard) =====================
 
 func BenchmarkParseH1Head(b *testing.B) {
 	data := []byte("GET /dashboard HTTP/1.1\r\nHost: alos.gg\r\nUser-Agent: x\r\nAccept-Encoding: gzip\r\nCookie: s=1\r\nConnection: keep-alive\r\n\r\n")

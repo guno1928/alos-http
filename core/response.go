@@ -373,6 +373,11 @@ func (r *Response) IsStreamed() bool {
 	return r.streamed
 }
 
+// Redirect sets a Location header and status code, clearing any body; a code of 0 defaults to 302 Found. It returns r for chaining.
+//
+// Example: resp.Redirect("/login", 302)
+// Example: resp.Redirect("https://example.com/", 301)
+// Example: resp.Redirect("/dashboard", 0)
 func (r *Response) Redirect(url string, code int) *Response {
 	if code == 0 {
 		code = 302
@@ -386,11 +391,19 @@ func (r *Response) Redirect(url string, code int) *Response {
 	return r
 }
 
+// SetCookie appends a Set-Cookie header for the given cookie. It returns r for chaining.
+//
+// Example: resp.SetCookie(Cookie{Name: "session", Value: id, Path: "/", HttpOnly: true, Secure: true, SameSite: SameSiteLax})
+// Example: resp.SetCookie(Cookie{Name: "theme", Value: "dark", MaxAge: 86400})
 func (r *Response) SetCookie(cookie Cookie) *Response {
 	r.SetHeader("Set-Cookie", cookie.String())
 	return r
 }
 
+// DeleteCookie appends a Set-Cookie header that expires the named cookie at path "/" on the client. It returns r for chaining.
+//
+// Example: resp.DeleteCookie("session")
+// Example: resp.DeleteCookie("theme")
 func (r *Response) DeleteCookie(name string) *Response {
 	r.SetHeader("Set-Cookie", deleteCookieString(name, "/", ""))
 	return r

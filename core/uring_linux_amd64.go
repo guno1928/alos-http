@@ -1043,10 +1043,6 @@ func (ring *ioUring) connect(fd int, addr unsafe.Pointer, addrLen uint64, deadli
 	return nil
 }
 
-// sendRecvLinked submits a linked send+recv pair in a SINGLE io_uring_enter and
-// waits for both completions, fusing a request/response round-trip into one
-// syscall. On timeout or any partial completion it returns an error; the caller
-// MUST discard the connection (its ring may hold an outstanding op).
 func (ring *ioUring) sendRecvLinked(fd int, sendBuf, recvBuf []byte, deadline time.Time) (int, error) {
 	s, err := ring.getSqe()
 	if err != nil {
@@ -1383,11 +1379,6 @@ func (ring *ioUring) submitAndWait(minComplete uint32) (uint32, error) {
 	}
 }
 
-// submitIfNeeded flushes pending SQEs only when necessary. It skips the
-// io_uring_enter syscall entirely when there are no SQEs to submit and,
-// for rings created with DEFER_TASKRUN+TASKRUN_FLAG, no pending task work.
-// This eliminates the overhead of a no-op syscall that pprof shows accounts
-// for 58-95% of CPU time on hot paths.
 func (ring *ioUring) submitIfNeeded() (uint32, error) {
 	toSubmit := ring.localSqTail - ring.submitted
 	if toSubmit == 0 {
@@ -1565,9 +1556,6 @@ func (ring *ioUring) tryCqe() (ioUringCqe, bool) {
 	return item, true
 }
 
-// submitAndWaitTs submits pending SQEs and waits for minComplete completions or
-// until ts elapses, in a SINGLE io_uring_enter (IORING_ENTER_EXT_ARG). Returns
-// ETIME on timeout. Requires kernel 5.11+; callers fall back on EINVAL.
 func (ring *ioUring) submitAndWaitTs(minComplete uint32, ts *ioUringKernelTimespec) error {
 	if ring == nil || ring.fd < 0 || ring.sqTail == nil {
 		return syscall.EBADF
@@ -1591,8 +1579,6 @@ func (ring *ioUring) submitAndWaitTs(minComplete uint32, ts *ioUringKernelTimesp
 		if errno == syscall.EINVAL {
 			return errno
 		}
-		// On success or ETIME the SQEs were consumed by the kernel (submit
-		// precedes the wait). Mark them submitted so they are not resent.
 		ring.submitted = ring.localSqTail
 		runtime.KeepAlive(ts)
 		if errno == syscall.ETIME {
@@ -1610,7 +1596,6 @@ func (ring *ioUring) submitAndAwait(deadline time.Time) (ioUringCqe, error) {
 		return ioUringCqe{}, syscall.EBADF
 	}
 	if deadline.IsZero() {
-		// submit + wait for one completion in a single syscall
 		if _, err := ring.submitAndWait(1); err != nil {
 			return ioUringCqe{}, err
 		}
@@ -1638,7 +1623,6 @@ func (ring *ioUring) submitAndAwait(deadline time.Time) (ioUringCqe, error) {
 			return ioUringCqe{}, err
 		}
 	}
-	// legacy fallback: submit then poll for the deadline
 	if _, err := ring.submitAndWait(0); err != nil {
 		return ioUringCqe{}, err
 	}

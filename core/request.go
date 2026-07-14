@@ -471,6 +471,10 @@ func (r *Request) SetParam(key, value string) {
 	}
 }
 
+// Set stores a request-scoped value under key for later retrieval with Get.
+//
+//	req.Set("userID", 42)
+//	req.Set("role", "admin")
 func (r *Request) Set(key string, value any) {
 	if r.store == nil {
 		r.store = make(map[string]any)
@@ -478,6 +482,12 @@ func (r *Request) Set(key string, value any) {
 	r.store[key] = value
 }
 
+// Get returns the request-scoped value stored under key and whether it was present.
+//
+//	if v, ok := req.Get("userID"); ok {
+//	    id := v.(int)
+//	    _ = id
+//	}
 func (r *Request) Get(key string) (any, bool) {
 	if r.store == nil {
 		return nil, false
@@ -486,6 +496,9 @@ func (r *Request) Get(key string) (any, bool) {
 	return v, ok
 }
 
+// GetString returns the request-scoped value stored under key as a string, or "" if absent or not a string.
+//
+//	role := req.GetString("role")
 func (r *Request) GetString(key string) string {
 	if r.store == nil {
 		return ""
@@ -510,6 +523,10 @@ func (r *Request) parseCookiesLazy() {
 	r.cookiesCache = append(r.cookiesCache[:0], parseCookieHeader(hdr)...)
 }
 
+// Cookie returns the value of the named request cookie, or "" if not present.
+//
+//	session := req.Cookie("session")
+//	theme := req.Cookie("theme")
 func (r *Request) Cookie(name string) string {
 	r.parseCookiesLazy()
 	for i := range r.cookiesCache {
@@ -520,6 +537,12 @@ func (r *Request) Cookie(name string) string {
 	return ""
 }
 
+// Cookies returns all cookies parsed from the request Cookie header.
+//
+//	for _, c := range req.Cookies() {
+//	    _ = c.Name
+//	    _ = c.Value
+//	}
 func (r *Request) Cookies() []Cookie {
 	r.parseCookiesLazy()
 	return r.cookiesCache
@@ -536,6 +559,10 @@ func (r *Request) parseQueryLazy() {
 	r.queryCache = parseQueryString(r.Query)
 }
 
+// QueryParam returns the first value of the named URL query parameter, or "" if absent.
+//
+//	page := req.QueryParam("page")
+//	q := req.QueryParam("q")
 func (r *Request) QueryParam(key string) string {
 	r.parseQueryLazy()
 	vals := r.queryCache[key]
@@ -545,11 +572,18 @@ func (r *Request) QueryParam(key string) string {
 	return vals[0]
 }
 
+// QueryParamAll returns all values of the named URL query parameter.
+//
+//	tags := req.QueryParamAll("tag")
 func (r *Request) QueryParamAll(key string) []string {
 	r.parseQueryLazy()
 	return r.queryCache[key]
 }
 
+// QueryParams returns all parsed URL query parameters keyed by name.
+//
+//	params := req.QueryParams()
+//	first := params["id"]
 func (r *Request) QueryParams() map[string][]string {
 	r.parseQueryLazy()
 	return r.queryCache
@@ -587,6 +621,10 @@ func (r *Request) parseFilesLazy() {
 	r.filesCache = files
 }
 
+// FormValue returns the first value of the named field from an application/x-www-form-urlencoded body.
+//
+//	name := req.FormValue("name")
+//	email := req.FormValue("email")
 func (r *Request) FormValue(key string) string {
 	r.parseFormLazy()
 	vals := r.formCache[key]
@@ -596,6 +634,11 @@ func (r *Request) FormValue(key string) string {
 	return vals[0]
 }
 
+// FormFile returns the first uploaded file for the named field of a multipart/form-data body, and whether it was present.
+//
+//	if fh, ok := req.FormFile("avatar"); ok {
+//	    _ = fh.Filename
+//	}
 func (r *Request) FormFile(field string) (FileHeader, bool) {
 	r.parseFilesLazy()
 	files := r.filesCache[field]
@@ -605,6 +648,15 @@ func (r *Request) FormFile(field string) (FileHeader, bool) {
 	return files[0], true
 }
 
+// BindJSON unmarshals the JSON request body into v.
+//
+//	var body struct {
+//	    Name string `json:"name"`
+//	}
+//	if err := req.BindJSON(&body); err != nil {
+//	    resp.Status(400).String("bad json")
+//	    return
+//	}
 func (r *Request) BindJSON(v any) error {
 	return bindJSON(r.Body, v)
 }

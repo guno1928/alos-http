@@ -33,6 +33,10 @@ func AcquireJSON() *JSON {
 	return jsonPool.Get().(*JSON)
 }
 
+// Marshal encodes v to JSON and returns the bytes; on failure it logs the error and returns the literal null.
+//
+// Example: data := j.Marshal(User{Name: "ada"})
+// Example: resp.Status(200).JSON(j.Marshal(map[string]int{"count": 3}))
 func (j *JSON) Marshal(v any) []byte {
 	data, err := sonic.Marshal(v)
 	if err != nil {
@@ -42,6 +46,9 @@ func (j *JSON) Marshal(v any) []byte {
 	return data
 }
 
+// Release returns the encoder to the pool for reuse; do not use it after calling Release.
+//
+// Example: defer j.Release()
 func (j *JSON) Release() {
 	j.Buf = j.Buf[:0]
 	jsonPool.Put(j)

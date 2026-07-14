@@ -85,10 +85,6 @@ func (s *Server) serveQUICIOUring(uc *ioUringUDPConn, connMap *quicConnMap) {
 	}
 }
 
-// serveQUICMultishot receives QUIC datagrams via io_uring multishot recvmsg with
-// a provided buffer ring (the same class of fast path used by HTTP/1.1 and
-// HTTP/2). It returns false if multishot setup or arming fails, so the caller can
-// fall back to the single-shot path.
 func (s *Server) serveQUICMultishot(uc *ioUringUDPConn, connMap *quicConnMap) bool {
 	bufRing, err := newIOUringBufferRing(quicRecvBufRingEntries, quicRecvBufSize, 1)
 	if err != nil {
