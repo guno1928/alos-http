@@ -1,4 +1,4 @@
-# ALOS HTTP - go web framework with io_uring support
+# ALOS HTTP - Go web framework on a custom epoll networking stack
 
 > **Linux x86-64 only.** ALOS HTTP requires **Linux** on **amd64 (x86-64)** CPUs. It does not support Windows, macOS, ARM, or any other OS/architecture combination. If you are on Windows or macOS, use Docker or a Linux VM to run it.
 
@@ -8,13 +8,13 @@
 
 Based on the project's current published benchmark suite, ALOS HTTP is the fastest web framework currently available right now.
 
-ALOS HTTP is a Linux-only Go web framework, Go HTTP server, and application server built around a custom networking stack with full `io_uring` support. It only runs on **Linux amd64 (x86-64)** — the entire I/O layer, including HTTP/1.1, HTTP/2, HTTP/3 (QUIC), TLS, and reverse proxying, is built on `io_uring` syscalls and amd64-specific optimizations.
+ALOS HTTP is a Linux-only Go web framework, Go HTTP server, and application server built around a custom networking stack running on a hand-built, edge-triggered `epoll` event loop. It only runs on **Linux amd64 (x86-64)** — the entire I/O layer, including HTTP/1.1, HTTP/2, HTTP/3 (QUIC), TLS, and reverse proxying, is built on a custom `epoll` backend and amd64-specific optimizations.
 
 It includes first-class TLS handling, HTTP/1.1, HTTP/2, and HTTP/3 support, reverse proxying, load balancing, rate limiting, streaming, ACME automation, and a high-performance radix router.
 
 It is designed for people who want more control than a thin net/http wrapper, while still getting an ergonomic handler API.
 
-If you are looking for a high-performance Go web server or Go reverse proxy for Linux, ALOS HTTP is focused on the Linux fast path and full `io_uring` support rather than maintaining cross-platform behavior.
+If you are looking for a high-performance Go web server or Go reverse proxy for Linux, ALOS HTTP is focused on the Linux fast path and its custom `epoll` networking stack rather than maintaining cross-platform behavior.
 
 Official repository:
 https://github.com/guno1928/alos-http
@@ -25,7 +25,7 @@ ALOS HTTP focuses on a different part of the stack than most Go web frameworks.
 
 - Custom server core instead of delegating everything to net/http.
 - Built-in HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) serving.
-- Linux amd64 runtime with full `io_uring` support.
+- Linux amd64 runtime on a custom `epoll` event-loop backend.
 - Built-in TLS flow with ACME support for HTTPS and TLS automation.
 - High-performance radix router with params, wildcards, groups, and middleware.
 - Reverse proxy with load balancing, health checks, and cache support.
@@ -33,26 +33,26 @@ ALOS HTTP focuses on a different part of the stack than most Go web frameworks.
 - Middleware for recovery, logging, CORS, compression, auth, timeouts, security headers, and more.
 - Rate limiting primitives and rule-driven limiting.
 
-### Full io_uring Coverage
+### Custom epoll networking stack
 
-On Linux amd64 with a supported kernel, the following paths run entirely through `io_uring`:
+On Linux amd64, ALOS HTTP runs its entire I/O layer on a hand-built, edge-triggered `epoll` event loop instead of `net/http`:
 
-- **TCP accept** — all inbound connections are accepted via `io_uring` submission queues.
-- **TLS record I/O** — TLS read and write operations (both plaintext and encrypted record framing) are dispatched through `io_uring`.
-- **Plain HTTP I/O** — non-TLS HTTP/1.1 and HTTP/2 read/write paths use `io_uring` directly.
-- **Reverse proxy egress** — outbound connections to backends (dial, send, receive) go through dedicated proxy `io_uring` rings.
-- **Sendfile** — static file serving uses `io_uring`-backed splice/sendfile operations where the kernel supports it.
-- **HTTP/2 framing** — HTTP/2 frame reads and writes on both the ingress and shared-bridge proxy paths use `io_uring`.
-- **HTTP/3 (QUIC)** — UDP socket I/O for QUIC connections uses `io_uring`-backed recv/send with `SO_REUSEPORT` for multi-listener scaling.
+- **TCP accept** — inbound connections are accepted on per-worker `SO_REUSEPORT` listeners, sharded across cores (listeners default to the machine's hardware thread count).
+- **TLS record I/O** — a hand-rolled TLS 1.3 (and 1.2) record layer handles read, decrypt, encrypt, and write directly on the event loop, using AES-NI.
+- **Plain HTTP I/O** — non-TLS HTTP/1.1 and HTTP/2 read/write paths run directly on the epoll loop, with per-connection response batching.
+- **Reverse proxy egress** — outbound connections to backends (dial, send, receive) run over standard sockets.
+- **Sendfile** — static file serving streams files to the client through the response path.
+- **HTTP/2 framing** — HTTP/2 frame reads and writes on both the ingress and shared-bridge proxy paths run on the event loop.
+- **HTTP/3 (QUIC)** — UDP socket I/O for QUIC uses `epoll` with `recvmmsg`/`sendmmsg` and UDP GSO batching, plus `SO_REUSEPORT` for multi-listener scaling.
 
-In short, every network I/O syscall in the hot path (accept, read, write, connect, sendfile, UDP recv/send) is submitted through `io_uring` rather than the traditional `epoll` + blocking-syscall model.
+The hot path is edge-triggered and allocation-free: requests are parsed, routed, and served without `net/http`, interface dispatch, or reflection. Slow handlers are offloaded to goroutines so they never block the event loop.
 
 Search-friendly summary:
 
 - Go web framework
 - Go HTTP server
 - Linux web server
-- `io_uring` framework
+- custom `epoll` networking stack
 - reverse proxy and load balancer
 - HTTP/1.1, HTTP/2, and HTTP/3 server
 - QUIC server
@@ -65,31 +65,31 @@ Search-friendly summary:
 | **OS** | Linux only |
 | **Architecture** | amd64 (x86-64) only |
 | **Go version** | Go 1.26+ |
-| **Kernel** | 5.11+ (for io_uring), 6.0+ recommended |
+| **Kernel** | Modern Linux; 4.18+ recommended for the HTTP/3 UDP GSO fast path |
 
 - **Linux amd64 is the only supported platform.** ARM, RISC-V, 32-bit, Windows, macOS, and FreeBSD are not supported.
-- The entire I/O stack (TCP accept, TLS, HTTP/1.1, HTTP/2, HTTP/3 QUIC, reverse proxy, sendfile) uses `io_uring`, which is a Linux kernel feature available only on x86-64.
+- The entire I/O stack (TCP accept, TLS, HTTP/1.1, HTTP/2, HTTP/3 QUIC, reverse proxy, sendfile) runs on a custom `epoll` event loop with `SO_REUSEPORT` sharding and amd64-specific optimizations.
 - Hand-written amd64 assembly is used in hot paths (QUIC varint encoding, packet number processing).
-- If you are developing on Windows or macOS, edit code locally and deploy/test on Linux via Docker (`--privileged` required for `io_uring` access) or a Linux VM.
-- For HTTP/3 (QUIC over UDP), the server uses `io_uring`-backed UDP sockets with `SO_REUSEPORT`.
+- If you are developing on Windows or macOS, edit code locally and deploy/test on Linux via Docker or a Linux VM.
+- For HTTP/3 (QUIC over UDP), the server uses `epoll`-driven UDP sockets with `recvmmsg`/`sendmmsg`, UDP GSO batching, and `SO_REUSEPORT`.
 
-## What is io_uring?
+## How ALOS serves requests
 
-`io_uring` is a newer Linux way for programs to ask the kernel to do network and file I/O work with less back-and-forth.
+ALOS HTTP does not use `net/http` for serving. It runs a custom, edge-triggered `epoll` event loop written for Linux amd64.
 
 Very simple version:
 
-- old way: app asks the kernel to do one thing, waits, then asks again
-- `io_uring` way: app puts many I/O jobs into a shared ring, and the kernel finishes them and reports back with less overhead
+- `net/http` gives every connection its own goroutine that blocks on read/write syscalls.
+- ALOS runs a small pool of event-loop workers that watch many connections at once with `epoll` and only touch a connection when it is actually ready.
 
 Why that matters for ALOS HTTP:
 
-- less syscall overhead
-- better batching
-- lower latency on hot paths
-- more efficient handling for lots of active connections
+- less per-connection overhead and memory
+- `SO_REUSEPORT` sharding scales the accept and serve path across all cores
+- per-connection response batching and a short-read fast path cut syscalls
+- lower latency on hot paths, and efficient handling of many active connections
 
-In practice that means ALOS HTTP can lean harder into Linux-native networking paths for plain HTTP, TLS, and HTTP/2.
+Slow handlers are offloaded to goroutines so they never stall the event loop, and the fast path stays allocation-free for plain HTTP, TLS, and HTTP/2.
 
 ## Testing
 
@@ -136,31 +136,28 @@ There are two benchmark views worth looking at:
 
 Published HTTPS HTTP/1.1 framework comparison:
 
-| Framework | 500-conn throughput | 30-conn avg latency | 500-conn transfer/sec |
+| Framework | 500-conn throughput | 500-conn avg latency | 500-conn transfer/sec |
 | --- | --- | --- | --- |
-| ALOS HTTP | `240,707 req/s` | `88.11us` | `31.91 MB/s` |
-| Actix Web (RUST framework) | `165,165 req/s` | `272.33us` | `19.37 MB/s` |
-| Fiber v3 | `144,342 req/s` | `265.23us` | `16.93 MB/s` |
-| Gin | `113,220 req/s` | `440.28us` | `14.90 MB/s` |
-| Iris | `111,138 req/s` | `480.58us` | `14.73 MB/s` |
-| Echo | `108,755 req/s` | `448.37us` | `12.86 MB/s` |
+| ALOS HTTP | `222,353 req/s` | `1.86 ms` | `27.78 MB/s` |
+| xitca-web (RUST framework) | `190,762 req/s` | `2.46 ms` | `23.65 MB/s` |
+| ntex (RUST framework) | `176,532 req/s` | `2.44 ms` | `21.89 MB/s` |
+| Fiber v3 | `174,555 req/s` | `2.76 ms` | `21.64 MB/s` |
 
 Published throughput across connection levels:
 
-| Framework | 30 conn | 500 conn | 5,000 conn | 8,000 conn |
+| Framework | 200 conn | 500 conn | 1,200 conn | 5,000 conn |
 | --- | --- | --- | --- | --- |
-| ALOS HTTP | `165,573` | `240,707` | `220,624` | `194,726` |
-| Actix Web (RUST framework) | `156,699` | `165,165` | `157,741` | `111,811` |
-| Fiber v3 | `133,460` | `144,342` | `124,626` | `109,951` |
-| Gin | `104,843` | `113,220` | `97,740` | `87,691` |
-| Iris | `106,822` | `111,138` | `81,381` | `80,326` |
-| Echo | `109,761` | `108,755` | `81,854` | `39,198` |
+| ALOS HTTP | `222,916` | `222,353` | `192,575` | `120,998` |
+| xitca-web (RUST framework) | `194,479` | `190,762` | `173,086` | `111,625` |
+| ntex (RUST framework) | `172,456` | `176,532` | `159,512` | `105,211` |
+| Fiber v3 | `180,861` | `174,555` | `156,505` | `100,916` |
 
 Published comparison test environment:
 
 - OS: Ubuntu 24
-- CPU: Xeon E3-1270
-- Threads: 8
+- CPU: Xeon E3-1270 v6 (8 threads)
+- Tool: `wrk` (8 threads, 3-second runs)
+- Protocol: TLS 1.3, HTTP/1.1, `Hello, World!` payload, local loopback
 
 ## Install
 
