@@ -49,15 +49,6 @@ func nativeSendFileTarget(conn net.Conn) (int, time.Time, func(), bool, error) {
 	if conn == nil {
 		return 0, time.Time{}, func() {}, true, net.ErrClosed
 	}
-	if uringConn, ok := conn.(*ioUringConn); ok {
-		uringConn.writeMu.Lock()
-		if uringConn.closed.Load() || uringConn.fd < 0 {
-			uringConn.writeMu.Unlock()
-			return 0, time.Time{}, func() {}, true, net.ErrClosed
-		}
-		return uringConn.fd, uringConn.writeDeadline(), uringConn.writeMu.Unlock, true, nil
-	}
-
 	rawProvider, ok := conn.(syscall.Conn)
 	if !ok {
 		return 0, time.Time{}, func() {}, false, nil
@@ -131,7 +122,7 @@ func waitSendFileWritable(fd int, deadline time.Time) error {
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				return errIOUringDeadlineExceeded
+				return errNetDeadlineExceeded
 			}
 			timeout = int((remaining + time.Millisecond - 1) / time.Millisecond)
 			if timeout < 1 {
@@ -147,7 +138,7 @@ func waitSendFileWritable(fd int, deadline time.Time) error {
 			return err
 		}
 		if n == 0 {
-			return errIOUringDeadlineExceeded
+			return errNetDeadlineExceeded
 		}
 		revents := pollFDs[0].Revents
 		if revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {

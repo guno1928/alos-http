@@ -1,12 +1,11 @@
 # Ignore everything by default.
 /*
 
-# Then allow ONLY what should be published to GitHub.
+# Then allow ONLY the production library + module definition.
 !/.gitignore
 !/README.md
 !/go.mod
 !/go.sum
-!/main.go
 !/core/
 
 # Within core/, keep build artifacts and local junk out.

@@ -65,6 +65,10 @@ var (
 	// where the io_uring worker backend is not available.
 	ErrIOUringRequired = &staticError{"io_uring worker backend required"}
 
+	// ErrEpollUnsupported is returned by the epoll-backed ListenAndServe*
+	// methods on platforms other than linux/amd64.
+	ErrEpollUnsupported = &staticError{"epoll backend requires linux/amd64"}
+
 	ErrInternal = &staticError{"internal error"}
 
 	// ErrRateLimit is returned when the server-wide rate limit is exceeded.

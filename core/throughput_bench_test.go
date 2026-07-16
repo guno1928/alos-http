@@ -196,12 +196,7 @@ func BenchmarkFullPipeline(b *testing.B) {
 				benchH = router.Lookup("GET", req.Path, req)
 				resp.resetFastH1()
 				resp.HTML(body)
-				if resp.transmittedBodyLen() <= splitSendMinBody {
-					benchSink = appendPlainResponse(resp, benchBuf[:0])
-				} else {
-					benchSink = appendPlainResponseHeaders(resp, benchBuf[:0])
-					_ = resp.transmittedBodyBytes()
-				}
+				benchSink = appendPlainResponse(resp, benchBuf[:0])
 			}
 		})
 	}

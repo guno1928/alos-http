@@ -89,7 +89,10 @@ var timeNow = time.Now
 //	Example: ACME: &ACMEConfig{Email: "admin@example.com", Domains: []string{"example.com"}}.
 //	Example: ACME: nil disables ACME.
 //
-// WorkerCount sets the number of I/O workers; 0 auto-sizes from GOMAXPROCS.
+// WorkerCount tunes Go runtime parallelism (GOMAXPROCS) and internal pool
+// sizing; 0 auto-sizes from GOMAXPROCS. On the epoll backend the number of
+// SO_REUSEPORT listeners and their event-loop workers is set by Listeners, not
+// this field.
 //
 //	Example: WorkerCount: 8.
 //	Example: WorkerCount: 0 auto-sizes.
@@ -102,10 +105,30 @@ var timeNow = time.Now
 //
 //	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 100 << 20}.
 //
-// Listeners is the number of SO_REUSEPORT listeners (Linux/amd64; 1 elsewhere); 0 auto-sizes.
+// Listeners is the number of SO_REUSEPORT epoll listeners. On the epoll
+// backend each listener runs its own event-loop worker goroutine (not pinned
+// to a fixed core; the OS scheduler spreads them across all cores), and the
+// same count applies to HTTP, TLS, and HTTP/3. 0 defaults to the number of
+// CPU threads (GOMAXPROCS), so all cores are used out of the box; raise it to
+// add more accept parallelism.
 //
-//	Example: Listeners: 4.
-//	Example: Listeners: 0 auto-sizes.
+//	Example: Listeners: 16.
+//	Example: Listeners: 0 uses one event-loop per CPU thread.
+//
+// MinPrealloc sets a floor of preallocated (and page-faulted) connection/request
+// slots kept hot across all epoll workers. The pool prewarms this many slots at
+// startup, grows on demand in PreallocBatch-sized steps, and shrinks fully-idle
+// batches under low load but never below this floor. 0 disables prewarming
+// (grow/shrink on demand from empty).
+//
+//	Example: MinPrealloc: 5000 keeps at least 5000 slots ready for instant reuse.
+//	Example: MinPrealloc: 0 preallocates nothing.
+//
+// PreallocBatch is the number of slots added (or reclaimed) per pool growth step
+// — the slab size. 0 defaults to 128.
+//
+//	Example: PreallocBatch: 256.
+//	Example: PreallocBatch: 0 uses the default of 128.
 //
 // ServerName is the value sent in the Server header; defaults to "ALOS".
 //
@@ -195,6 +218,8 @@ type Config struct {
 	ConnBandwidth   BandwidthConfig
 	GlobalBandwidth BandwidthConfig
 	Listeners       int
+	MinPrealloc     int
+	PreallocBatch   int
 
 	ServerName      string
 	TrustedProxies  []string
@@ -232,7 +257,7 @@ func DefaultConfig() Config {
 		CompressLevel:     6,
 		CompressMinSize:   256,
 		WorkerCount:       0,
-		Listeners:         1,
+		Listeners:         0,
 		Debug:             false,
 		LogRequests:       true,
 		ShutdownTimeout:   30 * time.Second,
@@ -394,6 +419,9 @@ type Server struct {
 	listeners       []net.Listener
 	done            chan struct{}
 	tlsRuntimeOnce  sync.Once
+	routerInitOnce  sync.Once
+	certInitOnce    sync.Once
+	certInitErr     error
 	x25519Pool      *x25519KeyPool
 	activeConns     atomic.Int64
 	shuttingDown    atomic.Bool
@@ -613,23 +641,40 @@ func (s *Server) IsDebug() bool {
 // ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack: it loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
 //
 // Example: log.Fatal(s.ListenAndServeTLS())
+func (s *Server) ensureRouterInit() {
+	s.routerInitOnce.Do(func() {
+		s.Router.Build()
+		s.computeFastDispatch()
+	})
+}
+
+func (s *Server) ensureStartInit() error {
+	s.certInitOnce.Do(func() {
+		if err := s.loadCerts(); err != nil {
+			s.certInitErr = err
+			return
+		}
+		s.rebuildFallbackTLSConfig()
+	})
+	if s.certInitErr != nil {
+		return s.certInitErr
+	}
+	s.ensureRouterInit()
+	return nil
+}
+
 func (s *Server) ListenAndServeTLS() error {
 	s.logCapabilities()
 	maybeRaiseProcessFileLimit()
-	logIOUringStartupProbe()
-	if err := s.loadCerts(); err != nil {
+	if err := s.ensureStartInit(); err != nil {
 		return err
 	}
-	s.rebuildFallbackTLSConfig()
-
-	s.Router.Build()
-	s.computeFastDispatch()
 
 	numListeners := s.config.Listeners
 	if numListeners <= 0 {
 		numListeners = 1
 	}
-	numListeners = ioUringListenerCount(numListeners)
+	numListeners = clampListenerCount(numListeners)
 
 	listeners, err := createListeners(s.config.Addr, numListeners)
 	if err != nil {
@@ -662,11 +707,10 @@ func (s *Server) ListenAndServeTLS() error {
 	if len(certs) == 0 {
 		log.Printf("[WARN] no TLS certificates are loaded; incoming HTTPS handshakes will fail until a certificate becomes available")
 	}
-	backend, err := newTLSUringBackend(s, listeners)
-	if err != nil {
-		return err
+	for _, ln := range listeners {
+		_ = ln.Close()
 	}
-	defer backend.closeResources()
+	s.listeners = nil
 	if err := s.startHTTPRedirect(); err != nil {
 		return err
 	}
@@ -675,9 +719,9 @@ func (s *Server) ListenAndServeTLS() error {
 	if s.acme != nil {
 		s.acme.Start()
 	}
-	log.Printf("[INFO] io_uring TLS worker mode active on Linux amd64: workers=%d accept-shards=%d initial-conn-pool=%d", len(backend.workers), minInt(len(listeners), len(backend.workers)), ioUringInitialConnsPerShard)
-	backend.start()
-	return backend.wait()
+	s.ensureTLSRuntime()
+	log.Printf("[INFO] epoll TLS worker mode active on Linux amd64: listeners=%d", s.config.Listeners)
+	return s.ListenAndServeEpollTLS(s.config.Addr)
 }
 
 func (s *Server) Capabilities() Capabilities { return s.caps }
@@ -705,39 +749,16 @@ func (s *Server) ListenAndServe() error {
 	prevProcs := runtime.GOMAXPROCS(workers)
 	defer runtime.GOMAXPROCS(prevProcs)
 	maybeRaiseProcessFileLimit()
-	logIOUringStartupProbe()
-	s.Router.Build()
-	s.computeFastDispatch()
+	s.ensureRouterInit()
 
 	addr := s.config.Addr
 	if addr == "" {
 		addr = ":80"
 	}
 
-	numListeners := s.config.Listeners
-	if numListeners <= 0 {
-		numListeners = 1
-	}
-	numListeners = ioUringListenerCount(numListeners)
-
-	listeners, err := createListeners(addr, numListeners)
-	if err != nil {
-		return err
-	}
-	s.listeners = listeners
-	defer func() {
-		for _, ln := range s.listeners {
-			ln.Close()
-		}
-	}()
-
-	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge) ===")
-	log.Printf("Listening on http://%s (%d listener(s))", addr, len(listeners))
-
-	if started, err := s.tryServeWithIOUringPlainWorkers(listeners); started || err != nil {
-		return err
-	}
-	return ErrIOUringRequired
+	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge | epoll) ===")
+	log.Printf("Listening on http://%s (epoll listeners=%d)", addr, s.config.Listeners)
+	return s.ListenAndServeEpollH2(addr)
 }
 
 func (s *Server) tryTrackConn() bool {

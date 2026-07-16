@@ -110,7 +110,6 @@ func (cp *connPool) dial() (*pooledConn, error) {
 		cp.open.Add(-1)
 		return nil, err
 	}
-	enableProxyFuse(conn)
 	br := brPool.Get().(*bufio.Reader)
 	br.Reset(conn)
 	now := time.Now()

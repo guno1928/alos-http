@@ -24,6 +24,12 @@ type H2Stream struct {
 
 	headerBuf []byte
 	endStream bool
+
+	req             Request
+	resp            Response
+	asyncBusy       bool
+	respOff         int
+	respHeadersSent bool
 }
 
 func (s *H2Stream) Reset() {
@@ -40,4 +46,6 @@ func (s *H2Stream) Reset() {
 	s.Body = s.Body[:0]
 	s.headerBuf = s.headerBuf[:0]
 	s.endStream = false
+	s.respOff = 0
+	s.respHeadersSent = false
 }

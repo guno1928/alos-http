@@ -12,12 +12,9 @@ import (
 
 // ListenAndServeQUIC serves HTTP/3 over QUIC on the server's configured address (Addr, default ":443") using the loaded TLS certificates, blocking until the server stops. It is the QUIC counterpart to ListenAndServe.
 func (s *Server) ListenAndServeQUIC() error {
-	if err := s.loadCerts(); err != nil {
+	if err := s.ensureStartInit(); err != nil {
 		return err
 	}
-	s.rebuildFallbackTLSConfig()
-	s.Router.Build()
-	s.computeFastDispatch()
 	s.ensureTLSRuntime()
 
 	addr := s.config.Addr

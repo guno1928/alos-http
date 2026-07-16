@@ -1,9 +1,9 @@
 package core
 
 import (
+	"errors"
 	"log"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,13 +147,6 @@ func (s *Server) startHTTPRedirect() error {
 			_ = ln.Close()
 		}
 	}(listeners)
-	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
-		if err := s.tryServeWithIOUringRedirect(listeners); err != nil {
-			return err
-		}
-		log.Printf("[HTTP] %d io_uring redirect listener(s) started on %s", len(listeners), addr)
-		return nil
-	}
 	for _, ln := range listeners {
 		ln := ln
 		go s.serveHTTPRedirectListener(ln)
@@ -166,7 +159,7 @@ func (s *Server) serveHTTPRedirectListener(listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if s.doneClosed() || isIOUringAcceptShutdownError(err) {
+			if s.doneClosed() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {

@@ -3,7 +3,6 @@ package core
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -84,25 +83,12 @@ func DialTCP4(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 func dialTCP4Direct(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialTCP4DirectIOUring(addr, timeout)
-	if err == nil {
-		return conn, nil
-	}
-	if !errors.Is(err, ErrIOUringRequired) {
-		return nil, err
-	}
-
-	conn, err = net.DialTimeout("tcp4", addr, timeout)
+	conn, err := net.DialTimeout("tcp4", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
 	prepareAcceptedConn(conn)
-	wrapped, err := wrapConnectedConnWithIOUring(conn)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return wrapped, nil
+	return conn, nil
 }
 
 var asciiLower [256]byte

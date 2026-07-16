@@ -5,7 +5,6 @@ const (
 	MaxRecordOverhead          = 256
 	MaxRecordSize              = MaxRecordPayload + MaxRecordOverhead
 	CacheLineSize              = 64
-	ioUringCompletionBatchSize = 256
 	writeRequestBatchSize      = 96
 
 	H2PrefaceLen           = 24

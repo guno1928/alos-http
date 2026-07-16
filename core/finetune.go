@@ -346,13 +346,12 @@ func startFineTuneServer(server *Server, bindHost string, listenerCount int) (st
 	if listenerCount < 1 {
 		listenerCount = 1
 	}
-	listenerCount = ioUringListenerCount(listenerCount)
+	listenerCount = clampListenerCount(listenerCount)
 	if workers > listenerCount {
 		workers = listenerCount
 	}
 	runtime.GOMAXPROCS(workers)
 	maybeRaiseProcessFileLimit()
-	logIOUringStartupProbe()
 	server.Router.Build()
 	server.computeFastDispatch()
 
@@ -361,17 +360,15 @@ func startFineTuneServer(server *Server, bindHost string, listenerCount int) (st
 		return "", nil, err
 	}
 	addr := listeners[0].Addr().String()
-	server.listeners = listeners
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
 	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge) ===")
-	log.Printf("Listening on http://%s (%d listener(s))", addr, len(listeners))
+	log.Printf("Listening on http://%s (%d listener(s))", addr, listenerCount)
 
 	errCh := make(chan error, 1)
 	go func() {
-		if started, serveErr := server.tryServeWithIOUringPlainWorkers(listeners); started || serveErr != nil {
-			errCh <- serveErr
-			return
-		}
-		errCh <- ErrIOUringRequired
+		errCh <- server.ListenAndServeEpollH2(addr)
 	}()
 	return addr, errCh, nil
 }
@@ -380,7 +377,7 @@ func allocateFineTuneListeners(bindHost string, listenerCount int) ([]net.Listen
 	if listenerCount < 1 {
 		listenerCount = 1
 	}
-	listenerCount = ioUringListenerCount(listenerCount)
+	listenerCount = clampListenerCount(listenerCount)
 	first, err := createListeners(net.JoinHostPort(bindHost, "0"), 1)
 	if err != nil {
 		return nil, err

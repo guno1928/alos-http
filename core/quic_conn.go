@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"log"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,8 @@ import (
 	"github.com/guno1928/alosmap"
 	"github.com/guno1928/turbo"
 )
+
+var quicAsyncDispatch = os.Getenv("ALOS_H2_ASYNC") != ""
 
 type quicConnMap = alosmap.TypedMap[[20]byte, *QUICConn]
 
@@ -34,7 +37,6 @@ const (
 	quicMaxUniStreams           = 128
 	quicMaxTrackedStreams       = 2048
 	quicMaxConns                = 1 << 16
-	quicReqStreamQueueSize      = 8192
 	quicCoalesceBudget          = 1100
 )
 
@@ -50,7 +52,7 @@ func startReqStreamWorkers() {
 	reqStreamWorkOnce.Do(func() {
 		perShard := runtime.NumCPU()/2 + 1
 		for i := range reqStreamWorkChs {
-			reqStreamWorkChs[i] = make(chan *QUICStream, quicReqStreamQueueSize/reqStreamShards)
+			reqStreamWorkChs[i] = make(chan *QUICStream)
 			for w := 0; w < perShard; w++ {
 				go reqStreamWorker(reqStreamWorkChs[i])
 			}
@@ -608,10 +610,14 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 			qc.activeReqStreams.Add(-1)
 		} else {
 			s.refCount.Add(1)
-			select {
-			case reqStreamWorkChs[qc.workShard] <- s:
-			default:
+			if quicAsyncDispatch {
 				go qc.serveRequestStream(s)
+			} else {
+				select {
+				case reqStreamWorkChs[qc.workShard] <- s:
+				default:
+					go qc.serveRequestStream(s)
+				}
 			}
 		}
 	}

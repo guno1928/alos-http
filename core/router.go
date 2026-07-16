@@ -4,6 +4,7 @@ import (
 	"math/bits"
 	"sort"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -124,6 +125,7 @@ type Router struct {
 	wrappedNotFound         HandlerFunc
 	wrappedMethodNotAllowed HandlerFunc
 	built                   bool
+	buildOnce               sync.Once
 	server                  *Server
 }
 
@@ -366,6 +368,10 @@ func pathQuickHash(s string) uint32 {
 //	r.Use(core.Logger)
 //	r.Build()
 func (r *Router) Build() {
+	r.buildOnce.Do(r.build)
+}
+
+func (r *Router) build() {
 	r.wrappedNotFound = r.applyMiddleware(r.notFound)
 	r.wrappedMethodNotAllowed = r.applyMiddleware(r.methodNotAllowed)
 	for mi, root := range r.trees {
