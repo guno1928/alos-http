@@ -30,6 +30,12 @@ func (c *epollConn) compactApp(consumed int) {
 }
 
 func (c *epollConn) epollProcessTLS(srv *Server) int {
+	if c.plainBuf == nil {
+		c.plainBuf = acquireIOBuf()
+	}
+	if c.appBuf == nil {
+		c.appBuf = acquireIOBuf()
+	}
 	for {
 		var action int
 		switch c.phase {
@@ -65,7 +71,10 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	if !ok {
 		return epollActionNeedRead
 	}
-	if err := ParseClientHello(payload, &c.clientHello); err != nil {
+	if c.clientHello == nil {
+		c.clientHello = clientHelloPool.Get().(*ParsedClientHello)
+	}
+	if err := ParseClientHello(payload, c.clientHello); err != nil {
 		return epollActionCloseAfterFlush
 	}
 	selectedALPN := srv.negotiateALPN(c.clientHello.ALPNProtos)
@@ -183,6 +192,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	c.selectedALPN = selectedALPN
 	c.phase = tlsConnPhaseClientFinished
 	c.compactCipher(totalLen)
+	c.releaseClientHello()
 	return epollActionNeedRead
 }
 
@@ -223,7 +233,7 @@ func (c *epollConn) epollTLSClientFinished(srv *Server) int {
 			c.phase = tlsConnPhaseH2Native
 			c.h2.init()
 			plain := appendH2ServerSettingsFlight(nil, srv)
-			c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain, &c.innerScratch)
+			c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
 			Stats.H2Conns.Add(1)
 			return epollTLSContinue
 		}

@@ -29,7 +29,7 @@ func appendTLSInnerRecord(dst []byte, writer *TrafficAEAD, innerPayload []byte) 
 	return writer.EncryptAppend(dst, innerPayload)
 }
 
-func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte, scratch *[]byte) []byte {
+func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []byte {
 	if writer == nil {
 		return dst
 	}
@@ -37,8 +37,9 @@ func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte, scr
 	if len(payload) == 0 {
 		return dst
 	}
-	if cap(*scratch) < MaxRecordPayload {
-		*scratch = make([]byte, 0, MaxRecordPayload)
+	scratch := acquirePooledBuf(&tlsScratchPool)
+	if cap(scratch) < MaxRecordPayload {
+		scratch = make([]byte, 0, MaxRecordPayload)
 	}
 	for len(payload) > 0 {
 		chunk := payload
@@ -46,10 +47,11 @@ func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte, scr
 			chunk = chunk[:maxContent]
 		}
 		payload = payload[len(chunk):]
-		inner := (*scratch)[:len(chunk)+1]
+		inner := scratch[:len(chunk)+1]
 		copy(inner, chunk)
 		inner[len(chunk)] = 0x17
 		dst = appendTLSInnerRecord(dst, writer, inner)
 	}
+	releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)
 	return dst
 }

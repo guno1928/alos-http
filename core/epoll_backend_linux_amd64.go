@@ -7,19 +7,22 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
+	"github.com/guno1928/turbo"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	epollConnSlabSize     = 128
-	epollEventBatch       = 512
-	epollListenBacklog    = 4096
-	epollReadBufInitial   = 8192
-	epollShrinkSlackSlabs = 3
+	epollConnSlabSize       = 128
+	epollEventBatch         = 512
+	epollListenBacklog      = 4096
+	epollShrinkSlackSlabs   = 3
+	epollBufShrinkThreshold = 32 << 10
 )
 
 const (
@@ -41,13 +44,14 @@ type epollConn struct {
 	readN       int
 	writeSent   int
 	h1Off       int
+	deadline    int64
 	readBuf     []byte
 	writeBuf    []byte
 	remoteAddr  string
 	req         Request
-	resp       Response
-	h2         tlsWorkerH2State
-	slab       *epollSlab
+	resp        Response
+	h2          tlsWorkerH2State
+	slab        *epollSlab
 
 	phase        uint8
 	selectedALPN string
@@ -57,15 +61,12 @@ type epollConn struct {
 	plainBuf     []byte
 	appBuf       []byte
 	appBufOff    int
-	innerScratch []byte
-	clientHello  ParsedClientHello
+	clientHello  *ParsedClientHello
 	expectedFin  [64]byte
 	expectedFinN int
 
 	proxyRoute  *httpRouteEntry
 	proxyRawReq []byte
-	proxyHost   string
-	proxyPath   string
 	reqBodyCopy []byte
 
 	worker *epollWorker
@@ -81,6 +82,7 @@ type epollConnPool struct {
 	free       []*epollConn
 	floorSlabs int
 	batchSize  int
+	server     *Server
 }
 
 func (p *epollConnPool) slabSize() int {
@@ -96,7 +98,6 @@ func (p *epollConnPool) addSlab() {
 	for i := range s.conns {
 		c := &s.conns[i]
 		c.slab = s
-		c.readBuf = make([]byte, epollReadBufInitial)
 		p.free = append(p.free, c)
 	}
 	p.slabs = append(p.slabs, s)
@@ -112,13 +113,8 @@ func (p *epollConnPool) prewarm(minConns int) {
 	for len(p.slabs) < need {
 		p.addSlab()
 	}
-	for _, s := range p.slabs {
-		for i := range s.conns {
-			b := s.conns[i].readBuf
-			for off := 0; off < len(b); off += 4096 {
-				b[off] = 0
-			}
-		}
+	for i := 0; i < minConns; i++ {
+		releaseEpollReadBuf(make([]byte, epollReadBufCap))
 	}
 }
 
@@ -132,7 +128,43 @@ func (p *epollConnPool) get() *epollConn {
 	return c
 }
 
+func shrinkEpollBuf(b []byte) []byte {
+	if cap(b) > epollBufShrinkThreshold {
+		return nil
+	}
+	return b[:0]
+}
+
+func (c *epollConn) releaseClientHello() {
+	if c.clientHello != nil {
+		c.clientHello.Reset()
+		clientHelloPool.Put(c.clientHello)
+		c.clientHello = nil
+	}
+}
+
 func (p *epollConnPool) put(c *epollConn) {
+	if p.server != nil {
+		p.server.activeConns.Add(-1)
+	}
+	releaseEpollReadBuf(c.readBuf)
+	c.readBuf = nil
+	releaseIOBuf(c.writeBuf)
+	c.writeBuf = nil
+	releaseIOBuf(c.appBuf)
+	c.appBuf = nil
+	releaseIOBuf(c.plainBuf)
+	c.plainBuf = nil
+	c.reqBodyCopy = shrinkEpollBuf(c.reqBodyCopy)
+	c.proxyRawReq = shrinkEpollBuf(c.proxyRawReq)
+	c.req.Body = nil
+	c.resp.resetFastH1()
+	if c.h2.decoder != nil {
+		HpackDecoderPool.Put(c.h2.decoder)
+		c.h2.decoder = nil
+	}
+	c.releaseClientHello()
+	c.deadline = 0
 	p.free = append(p.free, c)
 	c.slab.free++
 	if len(p.slabs) > p.floorSlabs && len(p.free) >= p.slabSize()*epollShrinkSlackSlabs {
@@ -167,20 +199,24 @@ func (p *epollConnPool) shrinkOne() {
 }
 
 type epollWorker struct {
-	server      *Server
-	epfd        int
-	listenerFD  int
-	wakeFd      int
-	coreID      int
-	tlsMode     bool
-	conns       []*epollConn
-	pool        epollConnPool
-	events      []unix.EpollEvent
-	taskCh      chan func(*epollWorker)
-	taskPending atomic.Bool
+	server          *Server
+	epfd            int
+	listenerFD      int
+	wakeFd          int
+	coreID          int
+	tlsMode         bool
+	conns           []*epollConn
+	pool            epollConnPool
+	events          []unix.EpollEvent
+	taskCh          chan func(*epollWorker)
+	taskPending     atomic.Bool
 	wakeBuf         [8]byte
 	flushSet        map[*epollConn]struct{}
 	h2FinishScratch []byte
+	readTO          int64
+	writeTO         int64
+	idleTO          int64
+	lastSweep       int64
 }
 
 // ListenAndServeEpollH2 serves plain HTTP/1.1 and HTTP/2 prior-knowledge on
@@ -214,6 +250,7 @@ func (s *Server) serveEpoll(addr string, tlsMode bool) error {
 	if s.config.MinPrealloc > 0 {
 		minPerWorker = (s.config.MinPrealloc + workers - 1) / workers
 	}
+	go s.epollScavenger()
 	errCh := make(chan error, workers)
 	for i := 0; i < workers; i++ {
 		coreID := i % runtime.NumCPU()
@@ -229,6 +266,42 @@ func (s *Server) serveEpoll(addr string, tlsMode bool) error {
 		}()
 	}
 	return <-errCh
+}
+
+func (s *Server) epollScavenger() {
+	const (
+		idleCheckNs    = 30 * int64(time.Second)
+		freeThrottleNs = 15 * int64(time.Second)
+		minPeakConns   = 500
+		dropFactor     = 4
+		minSpikeHeap   = 256 << 20
+		minReturnable  = 256 << 20
+	)
+	var peakConns, lastCheck, lastFree int64
+	var ms runtime.MemStats
+	for {
+		turbo.Sleep(2 * time.Second)
+		now := turbo.UnixNano()
+		cur := s.activeConns.Load()
+		if cur > peakConns {
+			peakConns = cur
+		}
+		connDrop := peakConns >= minPeakConns && cur*dropFactor < peakConns
+		if !connDrop && now-lastCheck < idleCheckNs {
+			continue
+		}
+		lastCheck = now
+		runtime.ReadMemStats(&ms)
+		heldIdle := int64(ms.HeapIdle) - int64(ms.HeapReleased)
+		spikeReceded := connDrop && ms.HeapInuse > minSpikeHeap
+		if (spikeReceded || heldIdle > minReturnable) && now-lastFree > freeThrottleNs {
+			debug.FreeOSMemory()
+			lastFree = now
+		}
+		if connDrop {
+			peakConns = cur
+		}
+	}
 }
 
 func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, error) {
@@ -270,7 +343,11 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 		taskCh:     make(chan func(*epollWorker), epollTaskQueueSize),
 		flushSet:   make(map[*epollConn]struct{}, 64),
 	}
+	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
+	w.readTO = int64(s.config.ReadTimeout)
+	w.writeTO = int64(s.config.WriteTimeout)
+	w.idleTO = int64(s.config.IdleTimeout)
 	w.pool.prewarm(minPrealloc)
 	return w, nil
 }
@@ -342,7 +419,7 @@ func (w *epollWorker) run() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	for {
-		n, err := unix.EpollWait(w.epfd, w.events, -1)
+		n, err := unix.EpollWait(w.epfd, w.events, epollSweepIntervalMs)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -390,7 +467,37 @@ func (w *epollWorker) run() error {
 		if acceptPending {
 			w.acceptLoop()
 		}
+		w.sweepDeadlines()
 	}
+}
+
+const epollSweepIntervalMs = 1000
+
+func (w *epollWorker) sweepDeadlines() {
+	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 {
+		return
+	}
+	now := turbo.UnixNano()
+	if now-w.lastSweep < int64(epollSweepIntervalMs)*1_000_000 {
+		return
+	}
+	w.lastSweep = now
+	for fd := 0; fd < len(w.conns); fd++ {
+		c := w.conns[fd]
+		if c == nil || c.fd < 0 {
+			continue
+		}
+		if c.deadline != 0 && now > c.deadline {
+			w.closeConn(c)
+		}
+	}
+}
+
+func deadlineFrom(to int64) int64 {
+	if to <= 0 {
+		return 0
+	}
+	return turbo.UnixNano() + to
 }
 
 func (w *epollWorker) markFlush(c *epollConn) {
@@ -415,6 +522,12 @@ func (w *epollWorker) acceptLoop() {
 			}
 			return
 		}
+		active := w.server.activeConns.Add(1)
+		if lim := w.server.config.MaxConns; lim > 0 && active > lim {
+			w.server.activeConns.Add(-1)
+			_ = unix.Close(nfd)
+			continue
+		}
 		_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 		_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, 8192)
 		c := w.pool.get()
@@ -427,8 +540,8 @@ func (w *epollWorker) acceptLoop() {
 		c.readN = 0
 		c.writeSent = 0
 		c.h1Off = 0
+		c.deadline = deadlineFrom(w.readTO)
 		c.remoteAddr = epollRemoteAddr(sa)
-		c.readBuf = c.readBuf[:cap(c.readBuf)]
 		c.writeBuf = c.writeBuf[:0]
 		c.h2.appBufOff = 0
 		c.tls = w.tlsMode
@@ -468,7 +581,14 @@ func (w *epollWorker) readable(c *epollConn) {
 	if c.dispatching {
 		return
 	}
+	if c.readBuf == nil {
+		c.readBuf = acquireEpollReadBuf()
+	}
+	if c.writeBuf == nil {
+		c.writeBuf = acquireIOBuf()
+	}
 	maxRead := resolveReadCap(w.server.config.MaxReadSize)
+	prevReadN := c.readN
 	closed := false
 	for {
 		if cap(c.readBuf)-c.readN < plainReadMinFree {
@@ -504,6 +624,9 @@ func (w *epollWorker) readable(c *epollConn) {
 		w.closeConn(c)
 		return
 	}
+	if prevReadN == 0 && c.readN > 0 && w.readTO > 0 {
+		c.deadline = deadlineFrom(w.readTO)
+	}
 	if c.readN > 0 {
 		var action int
 		if c.tls {
@@ -528,6 +651,30 @@ func (w *epollWorker) readable(c *epollConn) {
 	}
 	if closed {
 		w.closeConn(c)
+		return
+	}
+	if c.fd < 0 {
+		return
+	}
+	if c.inFlight > 0 || c.dispatching {
+		c.deadline = 0
+		return
+	}
+	if c.readN == 0 && !c.outArmed && c.writeSent == len(c.writeBuf) {
+		releaseEpollReadBuf(c.readBuf)
+		c.readBuf = nil
+		releaseIOBuf(c.writeBuf)
+		c.writeBuf = nil
+		if c.appBuf != nil && len(c.appBuf) == 0 {
+			releaseIOBuf(c.appBuf)
+			c.appBuf = nil
+		}
+		if c.plainBuf != nil && len(c.plainBuf) == 0 {
+			releaseIOBuf(c.plainBuf)
+			c.plainBuf = nil
+		}
+		c.resp.resetFastH1()
+		c.deadline = deadlineFrom(w.idleTO)
 	}
 }
 
@@ -642,12 +789,18 @@ func (w *epollWorker) armOut(c *epollConn) {
 		return
 	}
 	c.outArmed = true
+	if w.writeTO > 0 {
+		c.deadline = deadlineFrom(w.writeTO)
+	}
 	ev := unix.EpollEvent{Events: uint32(unix.EPOLLIN|unix.EPOLLOUT|unix.EPOLLRDHUP) | uint32(unix.EPOLLET&0xffffffff), Fd: int32(c.fd)}
 	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_MOD, c.fd, &ev)
 }
 
 func (w *epollWorker) disarmOut(c *epollConn) {
 	c.outArmed = false
+	if w.idleTO > 0 {
+		c.deadline = deadlineFrom(w.idleTO)
+	}
 	ev := unix.EpollEvent{Events: uint32(unix.EPOLLIN|unix.EPOLLRDHUP) | uint32(unix.EPOLLET&0xffffffff), Fd: int32(c.fd)}
 	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_MOD, c.fd, &ev)
 }

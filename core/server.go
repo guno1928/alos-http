@@ -115,13 +115,15 @@ var timeNow = time.Now
 //	Example: Listeners: 16.
 //	Example: Listeners: 0 uses one event-loop per CPU thread.
 //
-// MinPrealloc sets a floor of preallocated (and page-faulted) connection/request
-// slots kept hot across all epoll workers. The pool prewarms this many slots at
-// startup, grows on demand in PreallocBatch-sized steps, and shrinks fully-idle
-// batches under low load but never below this floor. 0 disables prewarming
-// (grow/shrink on demand from empty).
+// MinPrealloc sets a floor of preallocated (and page-faulted) connection
+// objects kept hot across all epoll workers, ready to accept traffic instantly.
+// The pool prewarms this many, grows on demand in PreallocBatch-sized steps, and
+// shrinks fully-idle batches under low load but never below this floor. 0 disables
+// connection prewarming (grow/shrink on demand from empty). This is the knob for
+// "keep N connections ready"; it does NOT bound memory under load — use MaxConns
+// for that.
 //
-//	Example: MinPrealloc: 5000 keeps at least 5000 slots ready for instant reuse.
+//	Example: MinPrealloc: 2000 keeps 2000 connections ready to go.
 //	Example: MinPrealloc: 0 preallocates nothing.
 //
 // PreallocBatch is the number of slots added (or reclaimed) per pool growth step

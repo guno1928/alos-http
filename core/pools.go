@@ -131,3 +131,61 @@ func releasePooledBuf(pool *sync.Pool, buf []byte, maxCap int) {
 	*bp = buf[:0]
 	pool.Put(bp)
 }
+
+const (
+	epollReadBufCap        = 2048
+	epollReadBufPoolMaxCap = 16 << 10
+)
+
+var epollReadBufPool = sync.Pool{
+	New: func() any { b := make([]byte, epollReadBufCap); return &b },
+}
+
+var tlsScratchPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, MaxRecordPayload); return &b },
+}
+
+var HpackDecoderPool = sync.Pool{
+	New: func() any { return NewHpackDecoder() },
+}
+
+var clientHelloPool = sync.Pool{
+	New: func() any { return &ParsedClientHello{} },
+}
+
+const (
+	epollIOBufCap        = 2048
+	epollIOBufPoolMaxCap = 32 << 10
+)
+
+var epollIOBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, epollIOBufCap); return &b },
+}
+
+func acquireIOBuf() []byte {
+	return acquirePooledBuf(&epollIOBufPool)
+}
+
+func releaseIOBuf(b []byte) {
+	releasePooledBuf(&epollIOBufPool, b, epollIOBufPoolMaxCap)
+}
+
+func acquireEpollReadBuf() []byte {
+	bp := epollReadBufPool.Get().(*[]byte)
+	b := *bp
+	*bp = nil
+	bufBoxPool.Put(bp)
+	if cap(b) < epollReadBufCap {
+		b = make([]byte, epollReadBufCap)
+	}
+	return b[:cap(b)]
+}
+
+func releaseEpollReadBuf(b []byte) {
+	if cap(b) == 0 || cap(b) > epollReadBufPoolMaxCap {
+		return
+	}
+	bp := bufBoxPool.Get().(*[]byte)
+	*bp = b
+	epollReadBufPool.Put(bp)
+}

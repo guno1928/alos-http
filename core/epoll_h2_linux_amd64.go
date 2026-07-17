@@ -111,6 +111,10 @@ func (c *epollConn) epollH2Frame(srv *Server, frameType, frameFlags byte, stream
 			return true
 		}
 		epollReleaseH2Stream(st, streamID)
+		if st.countReset() {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return true
+		}
 		return false
 	case H2FrameGoAway:
 		return true
@@ -519,7 +523,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		plain, d := c.h2AppendWindowed(w.h2FinishScratch[:0], stream, streamID)
 		done = d
 		w.h2FinishScratch = plain[:0]
-		c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain, &c.innerScratch)
+		c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
 	} else {
 		c.writeBuf, done = c.h2AppendWindowed(c.writeBuf, stream, streamID)
 	}

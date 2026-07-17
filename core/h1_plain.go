@@ -271,12 +271,18 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 		}
 		nl := pos + lineEndOff
 		if nl == pos {
+			if hasContentLength && chunkedEncoding {
+				badTransferEncoding = true
+			}
 			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
 		}
 
 		line := data[pos:nl]
 		colon := bytes.IndexByte(line, ':')
 		if colon > 0 {
+			if line[colon-1] == ' ' || line[colon-1] == '\t' || line[0] == ' ' || line[0] == '\t' {
+				return nl + 2, contentLength, hasContentLength, closeConn, true, chunkedEncoding, false, true
+			}
 			name := UnsafeString(line[:colon])
 			val := line[colon+1:]
 			if len(val) > 0 && val[0] == ' ' {

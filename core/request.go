@@ -41,52 +41,61 @@ type Param struct {
 //	    resp.String(req.RemoteAddr)
 //	})
 type Request struct {
-	Method          string
-	Path            string
-	RawPath         string
-	Query           string
-	Proto           string
-	Host            string
-	RemoteAddr      string
-	Headers         [][2]string
-	Body            []byte
+	Method     string
+	Path       string
+	RawPath    string
+	Query      string
+	Proto      string
+	Host       string
+	RemoteAddr string
+
+	Headers [][2]string
+	Body    []byte
+
+	Params     [8]Param
+	ParamCount int
+
+	StreamWriter StreamWriter
+	conn         net.Conn
+	ctx          context.Context
+
+	tlsReader  *TrafficAEAD
+	tlsWriter  *TrafficAEAD
+	server     *Server
+	attachConn func(*Request) net.Conn
+
+	hdrBuf        []byte
+	hijackReadBuf []byte
+	cookiesCache  []Cookie
+
+	store      map[string]any
+	queryCache map[string][]string
+	formCache  map[string][]string
+	filesCache map[string][]FileHeader
+
+	cachedCL      string
+	cachedConn    string
+	cachedTE      string
+	cachedHost    string
+	cachedAE      string
+	cachedOrigin  string
+	cachedXFF     string
+	cachedXRI     string
+	cachedAuth    string
+	cachedUpgrade string
+	cachedWSKey   string
+	cachedWSVer   string
+
 	StreamID        uint32
-	IsH2            bool
-	Params          [8]Param
-	ParamCount      int
-	StreamWriter    StreamWriter
-	conn            net.Conn
-	tlsReader       *TrafficAEAD
-	tlsWriter       *TrafficAEAD
-	hdrBuf          []byte
-	hijacked        bool
-	cachedCL        string
-	cachedConn      string
-	cachedTE        string
-	cachedHost      string
-	cachedAE        string
-	cachedOrigin    string
-	cachedXFF       string
-	cachedXRI       string
-	cachedAuth      string
-	cachedUpgrade   string
-	cachedWSKey     string
-	cachedWSVer     string
 	headerCacheMask uint32
-	server          *Server
-	attachConn      func(*Request) net.Conn
-	connTakenOver   bool
-	hijackReadBuf   []byte
-	store           map[string]any
-	queryParsed     bool
-	queryCache      map[string][]string
-	formParsed      bool
-	formCache       map[string][]string
-	filesParsed     bool
-	filesCache      map[string][]FileHeader
-	cookiesParsed   bool
-	cookiesCache    []Cookie
-	ctx             context.Context
+
+	IsH2          bool
+	hijacked      bool
+	connTakenOver bool
+	queryParsed   bool
+	formParsed    bool
+	filesParsed   bool
+	cookiesParsed bool
 }
 
 // Context returns the request's context, or context.Background if none is set.

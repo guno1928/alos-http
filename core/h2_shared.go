@@ -1,5 +1,12 @@
 package core
 
+import "github.com/guno1928/turbo"
+
+const (
+	h2MaxResetsPerWindow = 200
+	h2ResetWindowNanos   = 1_000_000_000
+)
+
 type tlsWorkerH2State struct {
 	decoder           *HpackDecoder
 	streams           map[uint32]*H2Stream
@@ -18,16 +25,18 @@ type tlsWorkerH2State struct {
 	headersBuf         [][2]string
 	pendingBody        map[uint32][]byte
 	sending            map[uint32]*H2Stream
+
+	rstCount  int
+	rstWindow int64
 }
 
 func (st *tlsWorkerH2State) init() {
 	if st.decoder == nil {
-		st.decoder = NewHpackDecoder()
-	} else {
-		*st.decoder = HpackDecoder{
-			maxTableSize:    H2HeaderTableSize,
-			protocolMaxSize: H2HeaderTableSize,
-		}
+		st.decoder = HpackDecoderPool.Get().(*HpackDecoder)
+	}
+	*st.decoder = HpackDecoder{
+		maxTableSize:    H2HeaderTableSize,
+		protocolMaxSize: H2HeaderTableSize,
 	}
 	if st.streams == nil {
 		st.streams = make(map[uint32]*H2Stream, 4)
@@ -59,6 +68,18 @@ func (st *tlsWorkerH2State) init() {
 	st.appBufOff = 0
 	st.headerAccum = st.headerAccum[:0]
 	st.headersBuf = st.headersBuf[:0]
+	st.rstCount = 0
+	st.rstWindow = 0
+}
+
+func (st *tlsWorkerH2State) countReset() bool {
+	now := turbo.UnixNano()
+	if now-st.rstWindow > h2ResetWindowNanos {
+		st.rstWindow = now
+		st.rstCount = 0
+	}
+	st.rstCount++
+	return st.rstCount > h2MaxResetsPerWindow
 }
 
 func (st *tlsWorkerH2State) reset() {

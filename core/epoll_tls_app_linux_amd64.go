@@ -3,7 +3,7 @@
 package core
 
 func (c *epollConn) epollTLSEncryptResponse(srv *Server, plain []byte) {
-	c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain, &c.innerScratch)
+	c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
 }
 
 func (c *epollConn) epollTLSHTTP1(srv *Server) int {

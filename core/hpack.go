@@ -472,7 +472,7 @@ type hpackDecoderSnapshot struct {
 }
 
 const (
-	hpackHuffmanDecodeCacheSize = 64
+	hpackHuffmanDecodeCacheSize = 16
 	hpackHuffmanDecodeInlineMax = 64
 )
 
@@ -1236,7 +1236,6 @@ func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot boo
 	d.memoRoot = isRoot
 	d.memoValid = true
 }
-
 
 func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	if len(data) == 0 {
