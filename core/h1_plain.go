@@ -90,13 +90,14 @@ func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
 	return newBuf, true
 }
 
-var rootPrefixBytes = []byte("GET / HTTP/1.1\r\n")
+var rootPrefix16 = [16]byte{'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1', '\r', '\n'}
+var rootPrefixBytes = rootPrefix16[:]
 
 func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool) {
 	if !s.plainRootFast.enabled {
 		return nil, 0, false, false
 	}
-	if len(data) < len(rootPrefixBytes)+4 || !bytes.Equal(data[:len(rootPrefixBytes)], rootPrefixBytes) {
+	if len(data) < len(rootPrefixBytes)+4 || !equalPrefix16(data, &rootPrefix16) {
 		return nil, 0, false, false
 	}
 	maxHeaderBytes := s.config.MaxHeaderSize
@@ -173,26 +174,23 @@ func asciiEqualFoldBytes(line []byte, value string) bool {
 	return true
 }
 
-var crlfcrlfSlice = []byte{'\r', '\n', '\r', '\n'}
 
 func findHeaderTerminatorBytes(buf []byte, start int) int {
 	if start >= len(buf) {
 		return -1
 	}
-	idx := bytes.Index(buf[start:], crlfcrlfSlice)
+	idx := indexCRLFCRLF(buf[start:])
 	if idx < 0 {
 		return -1
 	}
 	return start + idx + 4
 }
 
-var crlfSlice = []byte{'\r', '\n'}
-
 func findCRLFBytes(buf []byte, start int) int {
 	if start >= len(buf) {
 		return -1
 	}
-	idx := bytes.Index(buf[start:], crlfSlice)
+	idx := indexCRLF2(buf[start:])
 	if idx < 0 {
 		return -1
 	}
@@ -209,7 +207,7 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 		maxCount = 128
 	}
 
-	idx := bytes.Index(data, crlfSlice)
+	idx := indexCRLF2(data)
 	if idx < 0 {
 		if len(data) > maxBytes {
 			return 0, 0, false, false, false, false, true, false
@@ -262,7 +260,7 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 			return 0, 0, false, false, false, false, true, false
 		}
 		remaining := data[pos:]
-		lineEndOff := bytes.Index(remaining, crlfSlice)
+		lineEndOff := indexCRLF2(remaining)
 		if lineEndOff < 0 {
 			if len(data) > maxBytes {
 				return 0, 0, false, false, false, false, true, false

@@ -125,6 +125,12 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 			c.reqBodyCopy = append(c.reqBodyCopy[:0], c.req.Body...)
 			c.req.Body = c.reqBodyCopy
 		}
+		if !c.acquireIPConn(srv, &c.req) {
+			c.resp.resetFastH1()
+			c.resp.Status(429).String("Too Many Connections")
+			c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
+			return epollActionCloseAfterFlush
+		}
 		c.resp.resetFastH1()
 		c.resp.SetSW(nil)
 		c.resp.lazyReq = &c.req

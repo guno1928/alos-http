@@ -133,8 +133,8 @@ func releasePooledBuf(pool *sync.Pool, buf []byte, maxCap int) {
 }
 
 const (
-	epollReadBufCap        = 2048
-	epollReadBufPoolMaxCap = 16 << 10
+	epollReadBufCap        = 8192
+	epollReadBufPoolMaxCap = 2 * epollReadBufCap
 )
 
 var epollReadBufPool = sync.Pool{

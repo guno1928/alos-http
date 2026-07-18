@@ -40,6 +40,7 @@ type epollConn struct {
 	outArmed    bool
 	tls         bool
 	dispatching bool
+	ipHeld      bool
 	inFlight    int
 	readN       int
 	writeSent   int
@@ -48,6 +49,7 @@ type epollConn struct {
 	readBuf     []byte
 	writeBuf    []byte
 	remoteAddr  string
+	ipKey       string
 	req         Request
 	resp        Response
 	h2          tlsWorkerH2State
@@ -146,6 +148,7 @@ func (c *epollConn) releaseClientHello() {
 func (p *epollConnPool) put(c *epollConn) {
 	if p.server != nil {
 		p.server.activeConns.Add(-1)
+		Stats.ActiveConns.Add(-1)
 	}
 	releaseEpollReadBuf(c.readBuf)
 	c.readBuf = nil
@@ -270,36 +273,51 @@ func (s *Server) serveEpoll(addr string, tlsMode bool) error {
 
 func (s *Server) epollScavenger() {
 	const (
-		idleCheckNs    = 30 * int64(time.Second)
-		freeThrottleNs = 15 * int64(time.Second)
-		minPeakConns   = 500
-		dropFactor     = 4
-		minSpikeHeap   = 256 << 20
-		minReturnable  = 256 << 20
+		freeThrottleNs  = 10 * int64(time.Second)
+		idleRatePerTick = 40
+		connActive      = 32
+		minReturnable   = 24 << 20
+		maxReclaims     = 2
 	)
-	var peakConns, lastCheck, lastFree int64
+	var lastFree int64
+	var lastReqs, rate uint64
+	var armed bool
+	var reclaims int
 	var ms runtime.MemStats
 	for {
 		turbo.Sleep(2 * time.Second)
 		now := turbo.UnixNano()
 		cur := s.activeConns.Load()
-		if cur > peakConns {
-			peakConns = cur
+		reqs := Stats.TotalReqs.Load()
+		if reqs >= lastReqs {
+			rate = reqs - lastReqs
+		} else {
+			rate = 0
 		}
-		connDrop := peakConns >= minPeakConns && cur*dropFactor < peakConns
-		if !connDrop && now-lastCheck < idleCheckNs {
+		lastReqs = reqs
+
+		if rate > idleRatePerTick || cur > connActive {
+			armed = true
+			reclaims = 0
 			continue
 		}
-		lastCheck = now
+		if !armed || reclaims >= maxReclaims {
+			continue
+		}
+		if now-lastFree < freeThrottleNs {
+			continue
+		}
 		runtime.ReadMemStats(&ms)
 		heldIdle := int64(ms.HeapIdle) - int64(ms.HeapReleased)
-		spikeReceded := connDrop && ms.HeapInuse > minSpikeHeap
-		if (spikeReceded || heldIdle > minReturnable) && now-lastFree > freeThrottleNs {
-			debug.FreeOSMemory()
-			lastFree = now
+		if heldIdle <= minReturnable && ms.HeapInuse <= minReturnable {
+			armed = false
+			continue
 		}
-		if connDrop {
-			peakConns = cur
+		debug.FreeOSMemory()
+		lastFree = now
+		reclaims++
+		if reclaims >= maxReclaims {
+			armed = false
 		}
 	}
 }
@@ -523,8 +541,10 @@ func (w *epollWorker) acceptLoop() {
 			return
 		}
 		active := w.server.activeConns.Add(1)
+		Stats.ActiveConns.Add(1)
 		if lim := w.server.config.MaxConns; lim > 0 && active > lim {
 			w.server.activeConns.Add(-1)
+			Stats.ActiveConns.Add(-1)
 			_ = unix.Close(nfd)
 			continue
 		}
@@ -542,6 +562,19 @@ func (w *epollWorker) acceptLoop() {
 		c.h1Off = 0
 		c.deadline = deadlineFrom(w.readTO)
 		c.remoteAddr = epollRemoteAddr(sa)
+		c.ipHeld = false
+		c.ipKey = ""
+		if w.server.perIPConnLimiter != nil && !w.server.trustedProxies.active {
+			key := extractIP(c.remoteAddr)
+			if !w.server.perIPConnLimiter.acquire(key, w.server.maxConnsPerIP) {
+				c.fd = -1
+				_ = unix.Close(nfd)
+				w.pool.put(c)
+				continue
+			}
+			c.ipHeld = true
+			c.ipKey = key
+		}
 		c.writeBuf = c.writeBuf[:0]
 		c.h2.appBufOff = 0
 		c.tls = w.tlsMode
@@ -847,10 +880,31 @@ func (w *epollWorker) closeConn(c *epollConn) {
 		c.appBuf = c.appBuf[:0]
 	}
 	c.tls = false
+	releaseEpollReadBuf(c.readBuf)
+	c.readBuf = nil
+	if c.ipHeld {
+		w.server.perIPConnLimiter.release(c.ipKey)
+		c.ipHeld = false
+		c.ipKey = ""
+	}
 	if c.inFlight > 0 {
 		return
 	}
 	w.pool.put(c)
+}
+
+func (c *epollConn) acquireIPConn(srv *Server, req *Request) bool {
+	if srv.perIPConnLimiter == nil || c.ipHeld || !srv.trustedProxies.active {
+		return true
+	}
+	applyTrustedRealIP(req, srv.trustedProxies)
+	key := extractIP(req.RemoteAddr)
+	if !srv.perIPConnLimiter.acquire(key, srv.maxConnsPerIP) {
+		return false
+	}
+	c.ipHeld = true
+	c.ipKey = key
+	return true
 }
 
 func (c *epollConn) compactH2ReadBuffer(force bool) {

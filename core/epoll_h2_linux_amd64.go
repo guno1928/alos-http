@@ -455,6 +455,14 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 	stream.req.tlsWriter = nil
 	stream.req.hdrBuf = nil
 
+	if !c.acquireIPConn(srv, &stream.req) {
+		stream.Reset()
+		StreamPool.Put(stream)
+		delete(st.streams, streamID)
+		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+		return true
+	}
+
 	stream.resp.Reset()
 	stream.resp.SetSW(nil)
 	stream.resp.lazyReq = &stream.req

@@ -131,6 +131,14 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		c.req.server = srv
 		c.req.Host = c.req.cachedHost
 		c.req.RemoteAddr = c.remoteAddr
+		if !c.acquireIPConn(srv, &c.req) {
+			c.resp.Reset()
+			c.resp.Status(429).String("Too Many Connections")
+			scratch = appendPlainResponse(&c.resp, scratch)
+			c.plainBuf = scratch[:0]
+			c.epollTLSEncryptResponse(srv, scratch)
+			return epollActionCloseAfterFlush
+		}
 		c.resp.resetFastH1()
 		c.resp.SetSW(nil)
 		c.resp.lazyReq = &c.req

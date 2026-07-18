@@ -67,6 +67,14 @@ var timeNow = time.Now
 //	Example: MaxRequestsPerIP: 100.
 //	Example: MaxRequestsPerIP: 0 disables per-IP limiting.
 //
+// MaxConnsPerIP caps concurrent connections per client IP. When ProxyMode (or TrustedProxies) is
+// active the limit is keyed by the real client IP taken from X-Forwarded-For / X-Real-IP after the
+// proxy rewrite; otherwise it is keyed by the socket peer IP at accept. 0 applies a default of 20;
+// a negative value disables the limit. Excess connections are refused with 429 and closed.
+//
+//	Example: MaxConnsPerIP: 20.
+//	Example: MaxConnsPerIP: -1 disables the per-IP connection limit.
+//
 // MaxConcurrentReqs is a server-wide concurrency cap; 0 means unlimited. Excess requests get 503.
 //
 //	Example: MaxConcurrentReqs: 10000.
@@ -198,6 +206,7 @@ type Config struct {
 	MaxHeaderSize     int
 	MaxHeaderCount    int
 	MaxRequestsPerIP  int64
+	MaxConnsPerIP     int64
 	MaxConcurrentReqs int64
 	MaxConns          int64
 
@@ -395,6 +404,84 @@ func (l *perIPRequestLimiter) release(ip string) {
 	}
 }
 
+type perIPConnLimiter struct {
+	m    *alosmap.TypedMap[string, *ipReqCounter]
+	done chan struct{}
+}
+
+func newPerIPConnLimiter() *perIPConnLimiter {
+	l := &perIPConnLimiter{
+		m:    alosmap.NewTyped[string, *ipReqCounter]().Prealloc(128),
+		done: make(chan struct{}),
+	}
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							Dbg("[connlimiter sweep] recovered panic: %v", r)
+						}
+					}()
+					l.m.Range(func(key string, c *ipReqCounter) bool {
+						if c.n.Load() <= 0 {
+							l.m.Delete(key)
+						}
+						return true
+					})
+				}()
+			case <-l.done:
+				return
+			}
+		}
+	}()
+	return l
+}
+
+func (l *perIPConnLimiter) Stop() {
+	if l == nil {
+		return
+	}
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+}
+
+func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
+	if l == nil || ip == "" || limit <= 0 {
+		return true
+	}
+	c, ok := l.m.Load(ip)
+	if !ok {
+		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
+	}
+	for {
+		cur := c.n.Load()
+		if cur >= limit {
+			return false
+		}
+		if c.n.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (l *perIPConnLimiter) release(ip string) {
+	if l == nil || ip == "" {
+		return
+	}
+	if c, ok := l.m.Load(ip); ok {
+		if c.n.Add(-1) < 0 {
+			c.n.Add(1)
+		}
+	}
+}
+
 // Server is the main entry point. Create one with New, register routes on its Router, then call ListenAndServeTLS (or ListenAndServe). It manages its own TLS 1.3/1.2 stack, optional HTTP/2 and HTTP/3, connection pooling, reverse proxy, CORS, rate limiting, and ACME. All exported methods are safe for concurrent use.
 //
 // Router holds the route table; register handlers on it.
@@ -436,9 +523,11 @@ type Server struct {
 	fastDispatch    atomic.Bool
 	plainRootFast   plainRootFastResponse
 	h2RootFast      h2RootFastResponse
-	trustedProxies  trustedProxyMatcher
-	perIPLimiter    *perIPRequestLimiter
-	trackedConnMu   sync.Mutex
+	trustedProxies   trustedProxyMatcher
+	perIPLimiter     *perIPRequestLimiter
+	perIPConnLimiter *perIPConnLimiter
+	maxConnsPerIP    int64
+	trackedConnMu    sync.Mutex
 	trackedConns    map[*trackedHandoffConn]struct{}
 	onRequestHooks  []func(*Request, *Response) bool
 	onResponseHooks []func(*Request, *Response)
@@ -553,6 +642,14 @@ func New(configs ...Config) *Server {
 	}
 	if cfg.MaxRequestsPerIP > 0 {
 		s.perIPLimiter = newPerIPRequestLimiter()
+	}
+	maxConnsPerIP := cfg.MaxConnsPerIP
+	if maxConnsPerIP == 0 {
+		maxConnsPerIP = 20
+	}
+	if maxConnsPerIP > 0 {
+		s.maxConnsPerIP = maxConnsPerIP
+		s.perIPConnLimiter = newPerIPConnLimiter()
 	}
 
 	s.debug.Store(cfg.Debug)
@@ -971,6 +1068,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 		if s.perIPLimiter != nil {
 			s.perIPLimiter.Stop()
+		}
+		if s.perIPConnLimiter != nil {
+			s.perIPConnLimiter.Stop()
 		}
 		for _, ln := range s.listeners {
 			ln.Close()
