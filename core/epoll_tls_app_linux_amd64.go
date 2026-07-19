@@ -2,14 +2,26 @@
 
 package core
 
+func (c *epollConn) sealTLSAppData(dst, plain []byte) []byte {
+	if c.tls12 != nil {
+		return buildTLS12AppDataRecords(dst, c.tls12.writer, plain)
+	}
+	return buildTLSAppDataRecords(dst, c.appWriter, plain)
+}
+
 func (c *epollConn) epollTLSEncryptResponse(srv *Server, plain []byte) {
-	c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
+	c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
 }
 
 func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 	proxyActive := srv.httpRouter != nil
 	scratch := c.plainBuf[:0]
 	for c.appBufOff < len(c.appBuf) {
+		if len(c.writeBuf)-c.writeSent+len(scratch) > epollMaxPendingWrite {
+			c.plainBuf = scratch[:0]
+			c.epollTLSEncryptResponse(srv, scratch)
+			return epollActionCloseAfterFlush
+		}
 		data := c.appBuf[c.appBufOff:]
 		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data); ok && !proxyActive {
 			if !srv.tryAcquireRequestSlot() {

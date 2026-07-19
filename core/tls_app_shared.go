@@ -5,6 +5,7 @@ const (
 	tlsConnPhaseClientFinished = 1
 	tlsConnPhaseApplication    = 2
 	tlsConnPhaseH2Native       = 3
+	tlsConnPhase12ClientFinish = 4
 )
 
 func nextTLSRecord(buf []byte) (byte, []byte, int, bool, error) {

@@ -26,8 +26,9 @@ type tlsWorkerH2State struct {
 	pendingBody        map[uint32][]byte
 	sending            map[uint32]*H2Stream
 
-	rstCount  int
-	rstWindow int64
+	rstCount     int
+	rstWindow    int64
+	sendingBytes int64
 }
 
 func (st *tlsWorkerH2State) init() {
@@ -70,6 +71,7 @@ func (st *tlsWorkerH2State) init() {
 	st.headersBuf = st.headersBuf[:0]
 	st.rstCount = 0
 	st.rstWindow = 0
+	st.sendingBytes = 0
 }
 
 func (st *tlsWorkerH2State) countReset() bool {

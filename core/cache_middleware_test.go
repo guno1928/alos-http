@@ -1,6 +1,9 @@
 package core
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -9,6 +12,94 @@ import (
 
 	"github.com/guno1928/turbo"
 )
+
+func gunzipOnce(t *testing.T, b []byte) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("body is not valid gzip: %v", err)
+	}
+	out, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("gzip decode error: %v", err)
+	}
+	return out
+}
+
+func TestCache_NoDoubleGzip_WithCompressMiddleware(t *testing.T) {
+	body := strings.Repeat("hello world ", 200)
+	var calls int32
+	handler := func(req *Request, resp *Response) {
+		atomic.AddInt32(&calls, 1)
+		resp.Status(200).String(body)
+	}
+
+	compressMW := Compress(CompressConfig{Level: 3})
+	cacheMW := Cache(CacheConfig{TTL: 6 * time.Second, Methods: []string{"GET"}, IgnoreQuery: true, Gzip: true, MaxEntries: 50000})
+	chain := compressMW(cacheMW(handler))
+
+	do := func() *Response {
+		req := &Request{Method: "GET", Path: "/", Headers: [][2]string{{"Accept-Encoding", "gzip"}}}
+		resp := &Response{}
+		resp.Reset()
+		chain(req, resp)
+		return resp
+	}
+
+	responses := []*Response{do(), do()}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("handler ran %d times over 2 requests; cache should serve the 2nd", calls)
+	}
+	for i, r := range responses {
+		ce := 0
+		for _, kv := range r.Headers {
+			if EqualFoldASCII(kv[0], "content-encoding") {
+				ce++
+			}
+		}
+		if ce != 1 {
+			t.Fatalf("response %d has %d Content-Encoding headers, want exactly 1", i+1, ce)
+		}
+		dec := gunzipOnce(t, r.transmittedBodyBytes())
+		if string(dec) != body {
+			t.Fatalf("response %d: a single gzip decode did not recover the original (double gzip?): got %d bytes", i+1, len(dec))
+		}
+		if len(dec) >= 2 && dec[0] == 0x1f && dec[1] == 0x8b {
+			t.Fatalf("response %d: decoded body is itself gzip framed -> DOUBLE GZIP", i+1)
+		}
+	}
+}
+
+func TestCache_NoDoubleGzip_CacheOuterCompressInner(t *testing.T) {
+	body := strings.Repeat("payload data ", 200)
+	handler := func(req *Request, resp *Response) { resp.Status(200).String(body) }
+	cacheMW := Cache(CacheConfig{TTL: time.Minute, Gzip: true})
+	compressMW := Compress(CompressConfig{Level: 3})
+	chain := cacheMW(compressMW(handler))
+
+	do := func() *Response {
+		req := &Request{Method: "GET", Path: "/", Headers: [][2]string{{"Accept-Encoding", "gzip"}}}
+		resp := &Response{}
+		resp.Reset()
+		chain(req, resp)
+		return resp
+	}
+	for i, r := range []*Response{do(), do()} {
+		ce := 0
+		for _, kv := range r.Headers {
+			if EqualFoldASCII(kv[0], "content-encoding") {
+				ce++
+			}
+		}
+		if ce != 1 {
+			t.Fatalf("response %d has %d Content-Encoding headers, want exactly 1", i+1, ce)
+		}
+		dec := gunzipOnce(t, r.transmittedBodyBytes())
+		if string(dec) != body {
+			t.Fatalf("response %d: single gzip decode did not recover original (double gzip?)", i+1)
+		}
+	}
+}
 
 func cReq(method, host, path, query string, hdrs ...[2]string) *Request {
 	return &Request{Method: method, Host: host, Path: path, Query: query, Headers: hdrs}

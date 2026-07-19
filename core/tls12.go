@@ -300,6 +300,83 @@ func buildTLS12Certificate(chain [][]byte) []byte {
 
 func buildTLS12ServerHelloDone() []byte { return tls12Handshake(0x0e, nil) }
 
+type tls12State struct {
+	suite        *tls12Suite
+	curve        tls12Curve
+	ecdhePriv    *ecdh.PrivateKey
+	clientRandom [32]byte
+	serverRandom [32]byte
+	master       []byte
+	transcript   hash.Hash
+	reader       *tls12AEAD
+	writer       *tls12AEAD
+	gotCCS       bool
+}
+
+func tls12KeyTypeOf(signer crypto.Signer) (tls12KeyType, bool) {
+	switch signer.(type) {
+	case *ecdsa.PrivateKey:
+		return keyTypeECDSA, true
+	case *rsa.PrivateKey:
+		return keyTypeRSA, true
+	}
+	return 0, false
+}
+
+func selectTLS12Curve(groups []uint16) (tls12Curve, bool) {
+	hasX, hasP := false, false
+	for _, g := range groups {
+		switch tls12Curve(g) {
+		case curveX25519:
+			hasX = true
+		case curveP256:
+			hasP = true
+		}
+	}
+	if hasX {
+		return curveX25519, true
+	}
+	if hasP || len(groups) == 0 {
+		return curveP256, true
+	}
+	return 0, false
+}
+
+func (st *tls12State) deriveKeys(peer []byte) bool {
+	shared, ok := tls12ECDHEShared(st.curve, st.ecdhePriv, peer)
+	if !ok {
+		return false
+	}
+	st.master = tls12MasterSecret(st.suite.newHash, shared, st.clientRandom[:], st.serverRandom[:])
+	cwk, swk, civ, siv := tls12KeyBlock(st.suite.newHash, st.master, st.clientRandom[:], st.serverRandom[:], st.suite.keyLen, st.suite.ivLen)
+	rAead, err := st.suite.aead(cwk)
+	if err != nil {
+		return false
+	}
+	wAead, err := st.suite.aead(swk)
+	if err != nil {
+		return false
+	}
+	st.reader = &tls12AEAD{aead: rAead, iv: civ, isChaCha: st.suite.isChaCha}
+	st.writer = &tls12AEAD{aead: wAead, iv: siv, isChaCha: st.suite.isChaCha}
+	return true
+}
+
+func buildTLS12AppDataRecords(dst []byte, w *tls12AEAD, payload []byte) []byte {
+	if w == nil || len(payload) == 0 {
+		return dst
+	}
+	for len(payload) > 0 {
+		chunk := payload
+		if len(chunk) > MaxRecordPayload {
+			chunk = chunk[:MaxRecordPayload]
+		}
+		payload = payload[len(chunk):]
+		dst = append(dst, w.seal(0x17, chunk)...)
+	}
+	return dst
+}
+
 func parseTLS12ClientKeyExchange(msg []byte) ([]byte, bool) {
 	if len(msg) < 4 || msg[0] != 0x10 {
 		return nil, false

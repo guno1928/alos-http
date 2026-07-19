@@ -66,6 +66,7 @@ type epollConn struct {
 	clientHello  *ParsedClientHello
 	expectedFin  [64]byte
 	expectedFinN int
+	tls12        *tls12State
 
 	proxyRoute  *httpRouteEntry
 	proxyRawReq []byte
@@ -474,7 +475,7 @@ func (w *epollWorker) run() error {
 				}
 			}
 			if evs&(unix.EPOLLIN|unix.EPOLLRDHUP) != 0 {
-				w.readable(c)
+				w.readable(c, evs&unix.EPOLLRDHUP != 0)
 			}
 		}
 		if tasksPending {
@@ -587,6 +588,7 @@ func (w *epollWorker) acceptLoop() {
 			c.hsReader = nil
 			c.appReader = nil
 			c.appWriter = nil
+			c.tls12 = nil
 			c.selectedALPN = ""
 		}
 		for nfd >= len(w.conns) {
@@ -610,7 +612,7 @@ func epollRemoteAddr(sa unix.Sockaddr) string {
 	return net.IP(sa4.Addr[:]).String() + ":" + strconv.Itoa(sa4.Port)
 }
 
-func (w *epollWorker) readable(c *epollConn) {
+func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 	if c.dispatching {
 		return
 	}
@@ -693,6 +695,13 @@ func (w *epollWorker) readable(c *epollConn) {
 		c.deadline = 0
 		return
 	}
+	if peerClosed {
+		if !c.outArmed && c.writeSent == len(c.writeBuf) {
+			w.closeConn(c)
+			return
+		}
+		c.closeAfter = true
+	}
 	if c.readN == 0 && !c.outArmed && c.writeSent == len(c.writeBuf) {
 		releaseEpollReadBuf(c.readBuf)
 		c.readBuf = nil
@@ -747,6 +756,7 @@ func (w *epollWorker) recycleConn(c *epollConn) {
 	c.hsReader = nil
 	c.appReader = nil
 	c.appWriter = nil
+	c.tls12 = nil
 	c.appBufOff = 0
 	if c.appBuf != nil {
 		c.appBuf = c.appBuf[:0]
@@ -788,6 +798,8 @@ func (c *epollConn) epollProcess(srv *Server) int {
 	return c.epollProcessH2Frames(srv)
 }
 
+const epollMaxPendingWrite = 8 << 20
+
 func (w *epollWorker) flush(c *epollConn) bool {
 	for c.writeSent < len(c.writeBuf) {
 		n, err := unix.Write(c.fd, c.writeBuf[c.writeSent:])
@@ -799,6 +811,10 @@ func (w *epollWorker) flush(c *epollConn) bool {
 			continue
 		}
 		if err == unix.EAGAIN {
+			if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {
+				w.closeConn(c)
+				return false
+			}
 			w.armOut(c)
 			return true
 		}
@@ -875,6 +891,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.hsReader = nil
 	c.appReader = nil
 	c.appWriter = nil
+	c.tls12 = nil
 	c.appBufOff = 0
 	if c.appBuf != nil {
 		c.appBuf = c.appBuf[:0]

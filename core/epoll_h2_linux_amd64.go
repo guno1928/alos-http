@@ -277,12 +277,16 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrEnhanceYourCalm)
 		return false
 	}
-	if len(st.streams)+c.inFlight >= int(srv.h2MaxStreams()) {
+	if len(st.streams)+len(st.sending)+c.inFlight >= int(srv.h2MaxStreams()) {
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrRefusedStream)
 		return false
 	}
 	if meta.method == "" || meta.path == "" {
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrProtocol)
+		if st.countReset() {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return true
+		}
 		return false
 	}
 
@@ -531,7 +535,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		plain, d := c.h2AppendWindowed(w.h2FinishScratch[:0], stream, streamID)
 		done = d
 		w.h2FinishScratch = plain[:0]
-		c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
+		c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
 	} else {
 		c.writeBuf, done = c.h2AppendWindowed(c.writeBuf, stream, streamID)
 	}
@@ -540,6 +544,12 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		StreamPool.Put(stream)
 	} else {
 		st.sending[streamID] = stream
+		stream.stallBytes = len(resp.transmittedBodyBytes())
+		st.sendingBytes += int64(stream.stallBytes)
+		if st.sendingBytes > epollMaxPendingWrite {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			c.closeAfter = true
+		}
 	}
 	w.markFlush(c)
 }
@@ -595,6 +605,7 @@ func (c *epollConn) h2ResumeSending(streamID uint32) {
 		c.writeBuf, done = c.h2AppendWindowed(c.writeBuf, stream, streamID)
 		if done {
 			delete(st.sending, streamID)
+			st.sendingBytes -= int64(stream.stallBytes)
 			stream.Reset()
 			StreamPool.Put(stream)
 		}
@@ -605,6 +616,7 @@ func (c *epollConn) h2ResumeSending(streamID uint32) {
 		c.writeBuf, done = c.h2AppendWindowed(c.writeBuf, stream, id)
 		if done {
 			delete(st.sending, id)
+			st.sendingBytes -= int64(stream.stallBytes)
 			stream.Reset()
 			StreamPool.Put(stream)
 		}

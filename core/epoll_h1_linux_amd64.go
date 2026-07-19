@@ -208,7 +208,7 @@ func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) 
 		return
 	}
 	w.markFlush(c)
-	w.readable(c)
+	w.readable(c, false)
 }
 
 func (c *epollConn) compactH1ReadBuffer() {

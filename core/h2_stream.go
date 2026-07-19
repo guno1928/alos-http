@@ -30,6 +30,7 @@ type H2Stream struct {
 	asyncBusy       bool
 	respOff         int
 	respHeadersSent bool
+	stallBytes      int
 }
 
 func (s *H2Stream) Reset() {
@@ -48,4 +49,5 @@ func (s *H2Stream) Reset() {
 	s.endStream = false
 	s.respOff = 0
 	s.respHeadersSent = false
+	s.stallBytes = 0
 }

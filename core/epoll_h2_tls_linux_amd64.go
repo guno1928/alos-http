@@ -20,6 +20,10 @@ func (c *epollConn) epollProcessH2FramesTLS(srv *Server) int {
 	}
 
 	for {
+		if len(c.writeBuf) > epollMaxPendingWrite {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return epollActionCloseAfterFlush
+		}
 		avail := len(c.appBuf) - c.appBufOff
 		if avail < 9 {
 			st.appBufOff = c.appBufOff
