@@ -24,11 +24,12 @@ func indexByteFrom(b []byte, c byte, from int) int {
 	return -1
 }
 
-func asyncChunkedComplete(buf []byte, pos int) (int, int) {
+func asyncChunkedComplete(buf []byte, pos int) (bodyEnd int, status int, resume int) {
 	for {
+		chunkStart := pos
 		nl := indexByteFrom(buf, '\n', pos)
 		if nl < 0 {
-			return 0, 0
+			return 0, 0, chunkStart
 		}
 		line := buf[pos:nl]
 		if len(line) > 0 && line[len(line)-1] == '\r' {
@@ -40,25 +41,25 @@ func asyncChunkedComplete(buf []byte, pos int) (int, int) {
 		line = trimASCIISpaceBytes(line)
 		size, ok := parseHex64Bytes(line)
 		if !ok {
-			return 0, -1
+			return 0, -1, chunkStart
 		}
 		pos = nl + 1
 		if size == 0 {
 			for {
 				nl2 := indexByteFrom(buf, '\n', pos)
 				if nl2 < 0 {
-					return 0, 0
+					return 0, 0, chunkStart
 				}
 				tline := buf[pos:nl2]
 				pos = nl2 + 1
 				if len(tline) == 0 || (len(tline) == 1 && tline[0] == '\r') {
-					return pos, 1
+					return pos, 1, pos
 				}
 			}
 		}
 		pos += int(size) + 2
 		if pos > len(buf) {
-			return 0, 0
+			return 0, 0, pos
 		}
 	}
 }

@@ -5,6 +5,7 @@ import "github.com/guno1928/turbo"
 const (
 	h2MaxResetsPerWindow = 200
 	h2ResetWindowNanos   = 1_000_000_000
+	h2MaxCtrlPerWindow   = 5000
 )
 
 type tlsWorkerH2State struct {
@@ -29,6 +30,8 @@ type tlsWorkerH2State struct {
 	rstCount     int
 	rstWindow    int64
 	sendingBytes int64
+	ctrlCount    int
+	ctrlWindow   int64
 }
 
 func (st *tlsWorkerH2State) init() {
@@ -72,6 +75,8 @@ func (st *tlsWorkerH2State) init() {
 	st.rstCount = 0
 	st.rstWindow = 0
 	st.sendingBytes = 0
+	st.ctrlCount = 0
+	st.ctrlWindow = 0
 }
 
 func (st *tlsWorkerH2State) countReset() bool {
@@ -82,6 +87,16 @@ func (st *tlsWorkerH2State) countReset() bool {
 	}
 	st.rstCount++
 	return st.rstCount > h2MaxResetsPerWindow
+}
+
+func (st *tlsWorkerH2State) countCtrl() bool {
+	now := turbo.UnixNano()
+	if now-st.ctrlWindow > h2ResetWindowNanos {
+		st.ctrlWindow = now
+		st.ctrlCount = 0
+	}
+	st.ctrlCount++
+	return st.ctrlCount > h2MaxCtrlPerWindow
 }
 
 func (st *tlsWorkerH2State) reset() {

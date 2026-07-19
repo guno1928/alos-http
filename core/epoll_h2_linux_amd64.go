@@ -15,6 +15,10 @@ func (c *epollConn) epollProcessH2Frames(srv *Server) int {
 	}
 
 	for {
+		if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return epollActionCloseAfterFlush
+		}
 		avail := c.readN - st.appBufOff
 		if avail < 9 {
 			c.compactH2ReadBuffer(false)
@@ -59,6 +63,18 @@ func (c *epollConn) epollProcessH2Frames(srv *Server) int {
 
 func (c *epollConn) epollH2Frame(srv *Server, frameType, frameFlags byte, streamID uint32, payload []byte) bool {
 	st := &c.h2
+	switch frameType {
+	case H2FrameSettings, H2FramePing, H2FramePriority, H2FrameWindowUpdate:
+		if st.countCtrl() {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return true
+		}
+	case H2FrameData:
+		if len(payload) == 0 && st.countCtrl() {
+			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
+			return true
+		}
+	}
 	switch frameType {
 	case H2FrameSettings:
 		if streamID != 0 {
@@ -134,6 +150,8 @@ func (c *epollConn) epollH2Frame(srv *Server, frameType, frameFlags byte, stream
 
 func (c *epollConn) epollH2Settings(payload []byte) bool {
 	st := &c.h2
+	windowChanged := false
+	oldWindow := st.initialWindowSize
 	for i := 0; i+6 <= len(payload); i += 6 {
 		id := uint16(payload[i])<<8 | uint16(payload[i+1])
 		val := uint32(payload[i+2])<<24 | uint32(payload[i+3])<<16 | uint32(payload[i+4])<<8 | uint32(payload[i+5])
@@ -149,8 +167,18 @@ func (c *epollConn) epollH2Settings(payload []byte) bool {
 				c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrFlowControl)
 				return false
 			}
-			delta := int64(val) - int64(st.initialWindowSize)
 			st.initialWindowSize = val
+			windowChanged = true
+		case H2SettingHeaderTableSize:
+			if val > 65536 {
+				val = 65536
+			}
+			st.decoder.protocolMaxSize = int(val)
+			st.decoder.setMaxSize(int(val))
+		}
+	}
+	if windowChanged {
+		if delta := int64(st.initialWindowSize) - int64(oldWindow); delta != 0 {
 			for id, stream := range st.streams {
 				newWindow := stream.Window.Load() + delta
 				if newWindow > 2147483647 {
@@ -160,12 +188,6 @@ func (c *epollConn) epollH2Settings(payload []byte) bool {
 				}
 				stream.Window.Store(newWindow)
 			}
-		case H2SettingHeaderTableSize:
-			if val > 65536 {
-				val = 65536
-			}
-			st.decoder.protocolMaxSize = int(val)
-			st.decoder.setMaxSize(int(val))
 		}
 	}
 	return true

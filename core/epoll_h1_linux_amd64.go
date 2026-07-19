@@ -6,6 +6,9 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 	maxRead := resolveReadCap(srv.config.MaxReadSize)
 	proxyActive := srv.httpRouter != nil
 	for c.readN-c.h1Off > 0 {
+		if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {
+			return epollActionCloseAfterFlush
+		}
 		data := c.readBuf[c.h1Off:c.readN]
 		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data); ok && !proxyActive {
 			if !srv.tryAcquireRequestSlot() {
@@ -41,14 +44,20 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 			return epollActionCloseAfterFlush
 		}
 		if chunked {
-			bodyEnd, status := asyncChunkedComplete(data, headerEnd)
+			scanFrom := headerEnd
+			if c.chunkScanPos > headerEnd && c.chunkScanPos <= len(data) {
+				scanFrom = c.chunkScanPos
+			}
+			bodyEnd, status, resume := asyncChunkedComplete(data, scanFrom)
 			if status == -1 {
+				c.chunkScanPos = 0
 				c.resp.Reset()
 				c.resp.Status(400).String("Bad Request")
 				c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
 				return epollActionCloseAfterFlush
 			}
 			if status == 0 {
+				c.chunkScanPos = resume
 				if srv.config.MaxBodySize > 0 && int64(len(data)-headerEnd) > srv.config.MaxBodySize+chunkedFramingSlack {
 					c.resp.Reset()
 					c.resp.Status(413).String("Payload Too Large")
@@ -58,6 +67,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 				c.compactH1ReadBuffer()
 				return epollActionNeedRead
 			}
+			c.chunkScanPos = 0
 			decoded, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
 			if !dok {
 				c.resp.Reset()
@@ -127,7 +137,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 		}
 		if !c.acquireIPConn(srv, &c.req) {
 			c.resp.resetFastH1()
-			c.resp.Status(429).String("Too Many Connections")
+			c.resp.Status(429).String("Your IP has too many connections open")
 			c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
 			return epollActionCloseAfterFlush
 		}

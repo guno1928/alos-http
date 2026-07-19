@@ -62,8 +62,13 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			return epollActionCloseAfterFlush
 		}
 		if chunked {
-			bodyEnd, status := asyncChunkedComplete(data, headerEnd)
+			scanFrom := headerEnd
+			if c.chunkScanPos > headerEnd && c.chunkScanPos <= len(data) {
+				scanFrom = c.chunkScanPos
+			}
+			bodyEnd, status, resume := asyncChunkedComplete(data, scanFrom)
 			if status == -1 {
+				c.chunkScanPos = 0
 				c.resp.Reset()
 				c.resp.Status(400).String("Bad Request")
 				scratch = appendPlainResponse(&c.resp, scratch)
@@ -72,6 +77,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				return epollActionCloseAfterFlush
 			}
 			if status == 0 {
+				c.chunkScanPos = resume
 				if srv.config.MaxBodySize > 0 && int64(len(data)-headerEnd) > srv.config.MaxBodySize+chunkedFramingSlack {
 					c.resp.Reset()
 					c.resp.Status(413).String("Payload Too Large")
@@ -82,6 +88,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				}
 				break
 			}
+			c.chunkScanPos = 0
 			decoded, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
 			if !dok || (srv.config.MaxBodySize > 0 && int64(len(decoded)) > srv.config.MaxBodySize) {
 				c.resp.Reset()
@@ -145,7 +152,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		c.req.RemoteAddr = c.remoteAddr
 		if !c.acquireIPConn(srv, &c.req) {
 			c.resp.Reset()
-			c.resp.Status(429).String("Too Many Connections")
+			c.resp.Status(429).String("Your IP has too many connections open")
 			scratch = appendPlainResponse(&c.resp, scratch)
 			c.plainBuf = scratch[:0]
 			c.epollTLSEncryptResponse(srv, scratch)

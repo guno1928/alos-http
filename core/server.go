@@ -380,6 +380,9 @@ func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
 	}
 	c, ok := l.m.Load(ip)
 	if !ok {
+		if l.m.Len() >= maxTrackedIPs {
+			return true
+		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
 	for {
@@ -452,12 +455,17 @@ func (l *perIPConnLimiter) Stop() {
 	}
 }
 
+const maxTrackedIPs = 1_000_000
+
 func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
 		return true
 	}
 	c, ok := l.m.Load(ip)
 	if !ok {
+		if l.m.Len() >= maxTrackedIPs {
+			return true
+		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
 	for {

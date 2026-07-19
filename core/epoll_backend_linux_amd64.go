@@ -71,6 +71,7 @@ type epollConn struct {
 	proxyRoute  *httpRouteEntry
 	proxyRawReq []byte
 	reqBodyCopy []byte
+	chunkScanPos int
 
 	worker *epollWorker
 }
@@ -561,6 +562,7 @@ func (w *epollWorker) acceptLoop() {
 		c.readN = 0
 		c.writeSent = 0
 		c.h1Off = 0
+	c.chunkScanPos = 0
 		c.deadline = deadlineFrom(w.readTO)
 		c.remoteAddr = epollRemoteAddr(sa)
 		c.ipHeld = false
@@ -748,6 +750,7 @@ func (w *epollWorker) recycleConn(c *epollConn) {
 	c.readN = 0
 	c.writeSent = 0
 	c.h1Off = 0
+	c.chunkScanPos = 0
 	c.writeBuf = c.writeBuf[:0]
 	c.h2.appBufOff = 0
 	c.protocol = plainConnProtoUnknown
@@ -882,6 +885,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.readN = 0
 	c.writeSent = 0
 	c.h1Off = 0
+	c.chunkScanPos = 0
 	c.writeBuf = c.writeBuf[:0]
 	c.h2.appBufOff = 0
 	c.protocol = plainConnProtoUnknown
