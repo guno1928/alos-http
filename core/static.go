@@ -30,12 +30,19 @@ type StaticConfig struct {
 	Browse bool
 }
 
+const maxStaticFileSize = 64 << 20
+
 func sanitizeStaticPath(p string) (string, bool) {
 	if strings.ContainsAny(p, "\x00\\") {
 		return "", false
 	}
 	if strings.Contains(p, "..") {
 		return "", false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if len(seg) > 0 && seg[0] == '.' && seg != ".well-known" {
+			return "", false
+		}
 	}
 	return p, true
 }
@@ -157,6 +164,10 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
+		if fi, serr := os.Stat(absFullPath); serr == nil && fi.Size() > maxStaticFileSize {
+			resp.Status(413).String("File Too Large")
+			return
+		}
 		data, err := os.ReadFile(absFullPath)
 		if err != nil {
 			resp.Status(500).String("Internal Server Error")

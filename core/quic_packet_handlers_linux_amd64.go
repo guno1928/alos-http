@@ -90,6 +90,12 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 				log.Printf("[H3-DBG] handleLongPacket: existing conn for dcid=%x", hdr.dcid)
 			}
 		}
+		if len(data) < quicMinInitialDatagram && (qc == nil || !qc.addressValidated.Load()) {
+			if pbuf != nil {
+				quicRecvBufPool.Put(pbuf)
+			}
+			return
+		}
 		if qc == nil {
 			if debugFlag.Load() {
 				log.Printf("[H3-DBG] handleLongPacket: NEW Initial from %s, creating conn", remoteAddr)
@@ -155,6 +161,9 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 	if quicActiveConns.Load() >= quicMaxConns {
 		return nil
 	}
+	if quicHandshakingConns.Load() >= quicMaxHandshaking {
+		return nil
+	}
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
 		if debugFlag.Load() {
@@ -179,6 +188,8 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 	go qc.runLossTimer()
 
 	quicActiveConns.Add(1)
+	quicHandshakingConns.Add(1)
+	qc.handshakeCounted.Store(true)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
 		log.Printf("[QUIC] new io_uring connection from %s dcid=%x scid=%x tlsState=%v keys=%v",
@@ -189,6 +200,7 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 	go func() {
 		<-qc.done
 		quicActiveConns.Add(-1)
+		qc.clearHandshaking()
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
 		if origKey != dcidKey {

@@ -324,9 +324,14 @@ func (h *h2Proto) onHeaders(c *backendConn, flags byte, streamID uint32, payload
 	return h.completeHeaders(c, streamID, flags&h2FlagEndStream != 0)
 }
 
+const fpMaxHeaderAssembly = 256 << 10
+
 func (h *h2Proto) onContinuation(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
 	if hc.continuation != streamID {
+		return fpErrBadResponse
+	}
+	if len(hc.headerAssembly)+len(payload) > fpMaxHeaderAssembly {
 		return fpErrBadResponse
 	}
 	hc.headerAssembly = append(hc.headerAssembly, payload...)

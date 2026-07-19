@@ -272,6 +272,8 @@ func (l *eventLoop) writeProxyError(ic *inConn, err error) {
 	status := 502
 	if err == fpErrTimeout {
 		status = 504
+	} else if err == fpErrTooManyConns {
+		status = 503
 	}
 	body := "proxy error"
 	dst := ic.wbuf.b

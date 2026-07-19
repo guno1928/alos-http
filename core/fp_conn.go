@@ -13,6 +13,8 @@ const (
 	connClosed
 )
 
+const fpMaxBackendConns = 4096
+
 type transport interface {
 	start(c *backendConn) error
 	feed(c *backendConn, raw []byte) error
@@ -29,24 +31,28 @@ type protoHandler interface {
 }
 
 type backendConn struct {
-	fd        int
-	loop      *eventLoop
-	key       poolKey
-	state     int8
-	reused    bool
-	gotBytes  bool
-	inIdle    bool
-	transport transport
-	proto     protoHandler
-	cur       *Exchange
-	h2        *h2Conn
-	wbuf      byteBuffer
-	rbuf      byteBuffer
+	fd           int
+	loop         *eventLoop
+	key          poolKey
+	state        int8
+	reused       bool
+	gotBytes     bool
+	inIdle       bool
+	transport    transport
+	proto        protoHandler
+	cur          *Exchange
+	h2           *h2Conn
+	wbuf         byteBuffer
+	rbuf         byteBuffer
 	h1           h1Parser
 	idleDeadline int64
 }
 
 func (l *eventLoop) newConn(ex *Exchange) {
+	if l.liveConns >= fpMaxBackendConns {
+		l.finish(ex, fpErrTooManyConns)
+		return
+	}
 	fd, err := dialNonBlocking(ex.ip, ex.port)
 	if err != nil {
 		l.finish(ex, fpErrDialFailed)
@@ -227,4 +233,3 @@ func (l *eventLoop) finish(ex *Exchange, err error) {
 	}
 	close(ex.done)
 }
-

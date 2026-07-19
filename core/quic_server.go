@@ -116,6 +116,9 @@ func (s *Server) handleQUICLongPacket(pc net.PacketConn, remoteAddr net.Addr, da
 		if v, exists := connMap.Load(dcidKey); exists {
 			qc = v
 		}
+		if len(data) < quicMinInitialDatagram && (qc == nil || !qc.addressValidated.Load()) {
+			return
+		}
 		if qc == nil {
 			qc = s.createQUICConn(pc, remoteAddr, hdr.dcid, hdr.scid, connMap)
 			if qc == nil {
@@ -149,6 +152,9 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	if quicActiveConns.Load() >= quicMaxConns {
 		return nil
 	}
+	if quicHandshakingConns.Load() >= quicMaxHandshaking {
+		return nil
+	}
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
 		if debugFlag.Load() {
@@ -173,6 +179,8 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	go qc.runLossTimer()
 
 	quicActiveConns.Add(1)
+	quicHandshakingConns.Add(1)
+	qc.handshakeCounted.Store(true)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
 		log.Printf("[QUIC] new connection from %s dcid=%x scid=%x", remoteAddr, dcid, qc.srcCID())
@@ -182,6 +190,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	go func() {
 		<-qc.done
 		quicActiveConns.Add(-1)
+		qc.clearHandshaking()
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
 		if origKey != dcidKey {

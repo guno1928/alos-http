@@ -31,13 +31,16 @@ const (
 	quicInitialMaxData          = 10 << 20
 	quicInitialMaxStreamData    = 1 << 20
 	quicMaxCryptoBuf            = 64 << 10
+	quicMaxInitialCryptoBuf     = 16 << 10
 	quicMaxConcurrentReqStreams = 256
 	quicKeyUpdateThreshold      = 1 << 20
 	quicMaxBidiStreams          = 1024
 	quicMaxUniStreams           = 128
 	quicMaxTrackedStreams       = 2048
 	quicMaxConns                = 1 << 16
+	quicMaxHandshaking          = 8192
 	quicCoalesceBudget          = 1100
+	quicMinInitialDatagram      = 1200
 )
 
 const reqStreamShards = 4
@@ -68,6 +71,14 @@ func reqStreamWorker(ch chan *QUICStream) {
 
 var quicActiveConns atomic.Int64
 
+var quicHandshakingConns atomic.Int64
+
+func (qc *QUICConn) clearHandshaking() {
+	if qc.handshakeCounted.CompareAndSwap(true, false) {
+		quicHandshakingConns.Add(-1)
+	}
+}
+
 var quicPktBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, quicPktBufCap); return &b },
 }
@@ -90,15 +101,15 @@ type QUICConn struct {
 	origDstLen    int
 	version       uint32
 
-	keys        [3]*quicKeys
-	sendKeys    [3]*quicKeys
-	sendPN      [3]uint64
-	recvLargest    [3]int64
-	ackRanges      [3][]pnRange
-	pendingAck     [3][]byte
-	ackScratch     [3][]byte
-	frameScratch   []byte
-	combineScratch []byte
+	keys             [3]*quicKeys
+	sendKeys         [3]*quicKeys
+	sendPN           [3]uint64
+	recvLargest      [3]int64
+	ackRanges        [3][]pnRange
+	pendingAck       [3][]byte
+	ackScratch       [3][]byte
+	frameScratch     []byte
+	combineScratch   []byte
 	coalesceBuf      []byte
 	coalesceEnds     []int
 	coalesceStart    int
@@ -106,9 +117,9 @@ type QUICConn struct {
 	peerStreamWindow uint64
 	streamWriters    atomic.Int32
 	workShard        uint8
-	loss           *quicLossState
-	cryptoBuf   [3][]byte
-	cryptoRcv   [3][]bool
+	loss             *quicLossState
+	cryptoBuf        [3][]byte
+	cryptoRcv        [3][]bool
 
 	recvKeyPhase   uint32
 	sendKeyPhase   uint32
@@ -136,15 +147,16 @@ type QUICConn struct {
 	nextBidiLocal  uint64
 	nextUniLocal   uint64
 
-	maxDataLocal  uint64
-	maxDataRemote uint64
-	dataSent       uint64
-	dataRecv       uint64
+	maxDataLocal    uint64
+	maxDataRemote   uint64
+	dataSent        uint64
+	dataRecv        uint64
 	dataRecvGranted uint64
 
 	bytesSent        atomic.Uint64
 	bytesReceived    atomic.Uint64
 	addressValidated atomic.Bool
+	handshakeCounted atomic.Bool
 
 	server     *Server
 	remoteAddr net.Addr
@@ -172,21 +184,21 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		maxData = uint64(server.config.QUICMaxData)
 	}
 	qc := &QUICConn{
-		version:        quicVersion1,
-		server:         server,
-		udpConn:        udpConn,
-		remoteAddr:     remoteAddr,
-		done:           make(chan struct{}),
-		streams:        make(map[uint64]*QUICStream),
-		loss:           newQuicLossState(),
-		idleTimeout:    defaultDuration(server.config.IdleTimeout, quicDefaultIdleTimeout),
+		version:         quicVersion1,
+		server:          server,
+		udpConn:         udpConn,
+		remoteAddr:      remoteAddr,
+		done:            make(chan struct{}),
+		streams:         make(map[uint64]*QUICStream),
+		loss:            newQuicLossState(),
+		idleTimeout:     defaultDuration(server.config.IdleTimeout, quicDefaultIdleTimeout),
 		maxDataLocal:    maxData,
 		maxDataRemote:   maxData,
 		dataRecvGranted: maxData,
-		nextBidiRemote: 0,
-		nextUniRemote:  2,
-		nextBidiLocal:  1,
-		nextUniLocal:   3,
+		nextBidiRemote:  0,
+		nextUniRemote:   2,
+		nextBidiLocal:   1,
+		nextUniLocal:    3,
 	}
 
 	qc.workShard = uint8(connShardCounter.Add(1) % reqStreamShards)
@@ -547,8 +559,12 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 		return
 	}
 
+	maxBuf := uint64(quicMaxCryptoBuf)
+	if space == quicSpaceInitial {
+		maxBuf = quicMaxInitialCryptoBuf
+	}
 	end := f.offset + uint64(len(f.data))
-	if f.offset > quicMaxCryptoBuf || end > quicMaxCryptoBuf {
+	if f.offset > maxBuf || end > maxBuf {
 		return
 	}
 	if end > uint64(len(qc.cryptoBuf[space])) {
@@ -917,7 +933,6 @@ func (qc *QUICConn) applyPeerTransportParams(ch *ParsedClientHello) {
 	}
 	qc.writeMu.Unlock()
 }
-
 
 func (qc *QUICConn) deriveNextRecvKeys() {
 	if qc.appSuite == nil || len(qc.recvSecret) == 0 {

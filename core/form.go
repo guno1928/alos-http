@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const maxMultipartParts = 1000
+
 // FileHeader describes a single file uploaded in a multipart/form-data request.
 //
 // Filename is the client-provided file name (e.g. "photo.png").
@@ -29,7 +31,7 @@ func parseMultipart(body []byte, boundary string) (map[string][]string, map[stri
 	delim := []byte("--" + boundary)
 	endMarker := []byte("--" + boundary + "--")
 
-	parts := bytes.Split(body, delim)
+	parts := bytes.SplitN(body, delim, maxMultipartParts+2)
 	for _, part := range parts {
 		if len(part) == 0 {
 			continue

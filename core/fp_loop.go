@@ -18,26 +18,27 @@ const (
 )
 
 type eventLoop struct {
-	ep       int
-	wakeFd   int
-	q        mpscQueue
-	sleeping atomic.Int32
-	cfg          *fpConfig
-	conns        []*backendConn
-	inconns      []*inConn
-	listenFd     int
+	ep          int
+	wakeFd      int
+	q           mpscQueue
+	sleeping    atomic.Int32
+	cfg         *fpConfig
+	conns       []*backendConn
+	inconns     []*inConn
+	listenFd    int
 	proxyRoutes *routeTable
-	idle         map[poolKey][]*backendConn
-	h2conns      map[poolKey]*backendConn
-	lastSweep    int64
-	liveConns    int
-	exFree       *Exchange
-	events   []unix.EpollEvent
-	scratch  []byte
-	serBuf   []byte
-	h1proto  h1Proto
-	h2proto  h2Proto
-	wakeBuf  [8]byte
+	idle        map[poolKey][]*backendConn
+	h2conns     map[poolKey]*backendConn
+	lastSweep   int64
+	liveConns   int
+	liveInconns int
+	exFree      *Exchange
+	events      []unix.EpollEvent
+	scratch     []byte
+	serBuf      []byte
+	h1proto     h1Proto
+	h2proto     h2Proto
+	wakeBuf     [8]byte
 }
 
 func newEventLoop(cfg *fpConfig) (*eventLoop, error) {

@@ -624,7 +624,7 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 	if c.writeBuf == nil {
 		c.writeBuf = acquireIOBuf()
 	}
-	maxRead := resolveReadCap(w.server.config.MaxReadSize)
+	maxRead := w.server.effectiveReadCap()
 	prevReadN := c.readN
 	closed := false
 	for {

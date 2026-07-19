@@ -3,7 +3,7 @@
 package core
 
 func (c *epollConn) epollProcessH1(srv *Server) int {
-	maxRead := resolveReadCap(srv.config.MaxReadSize)
+	maxRead := srv.effectiveReadCap()
 	proxyActive := srv.httpRouter != nil
 	for c.readN-c.h1Off > 0 {
 		if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {

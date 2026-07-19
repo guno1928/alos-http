@@ -45,10 +45,10 @@ var timeNow = time.Now
 //
 //	Example: HandshakeTimeout: 5 * time.Second.
 //
-// MaxBodySize rejects request bodies larger than this many bytes; 0 means unlimited.
+// MaxBodySize rejects request bodies larger than this many bytes; 0 applies a 4 MiB default, -1 disables the limit (unlimited).
 //
 //	Example: MaxBodySize: 10 << 20 caps bodies at 10 MiB.
-//	Example: MaxBodySize: 0 allows unlimited bodies.
+//	Example: MaxBodySize: -1 allows unlimited bodies.
 //
 // MaxReadSize caps the per-connection read buffer in bytes; 0 applies a 2 MiB default cap, -1 disables the cap (unsafe).
 //
@@ -259,7 +259,7 @@ func DefaultConfig() Config {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		HandshakeTimeout:  30 * time.Second,
-		MaxBodySize:       0,
+		MaxBodySize:       4 << 20,
 		MaxReadSize:       0,
 		MaxWriteSize:      0,
 		MaxHeaderSize:     8192,
@@ -300,6 +300,19 @@ func resolveReadCap(v int64) int {
 	default:
 		return int(v)
 	}
+}
+
+// effectiveReadCap is the per-connection read-buffer ceiling. It grows the base
+// read cap so a body up to MaxBodySize can be buffered and cleanly rejected with
+// 413 rather than being silently dropped by a smaller read cap.
+func (s *Server) effectiveReadCap() int {
+	rc := resolveReadCap(s.config.MaxReadSize)
+	if s.config.MaxReadSize == 0 && s.config.MaxBodySize > 0 {
+		if want := int(s.config.MaxBodySize) + (1 << 16); want > rc {
+			rc = want
+		}
+	}
+	return rc
 }
 
 func (s *Server) h2MaxStreams() uint32 {
@@ -502,45 +515,45 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config          Config
-	caps            Capabilities
-	capsLogOnce     sync.Once
-	Router          *Router
-	CORS            *CORSEngine
-	RateLimit       *RateLimitEngine
-	certStore       *CertStore
-	fallbackTLS     atomic.Pointer[tls.Config]
-	proxy           atomic.Pointer[ProxyEngine]
-	httpRouter      *HTTPRouter
-	acme            *acmeIntegration
-	listeners       []net.Listener
-	done            chan struct{}
-	tlsRuntimeOnce  sync.Once
-	routerInitOnce  sync.Once
-	certInitOnce    sync.Once
-	certInitErr     error
-	x25519Pool      *x25519KeyPool
-	activeConns     atomic.Int64
-	shuttingDown    atomic.Bool
-	drainDone       chan struct{}
-	drainOnce       sync.Once
-	shutdownOnce    sync.Once
-	connLimiter     *ConnectionLimiter
-	globalLimiter   *GlobalLimiter
-	activeReqs      atomic.Int64
-	fastDispatch    atomic.Bool
-	plainRootFast   plainRootFastResponse
-	h2RootFast      h2RootFastResponse
+	config           Config
+	caps             Capabilities
+	capsLogOnce      sync.Once
+	Router           *Router
+	CORS             *CORSEngine
+	RateLimit        *RateLimitEngine
+	certStore        *CertStore
+	fallbackTLS      atomic.Pointer[tls.Config]
+	proxy            atomic.Pointer[ProxyEngine]
+	httpRouter       *HTTPRouter
+	acme             *acmeIntegration
+	listeners        []net.Listener
+	done             chan struct{}
+	tlsRuntimeOnce   sync.Once
+	routerInitOnce   sync.Once
+	certInitOnce     sync.Once
+	certInitErr      error
+	x25519Pool       *x25519KeyPool
+	activeConns      atomic.Int64
+	shuttingDown     atomic.Bool
+	drainDone        chan struct{}
+	drainOnce        sync.Once
+	shutdownOnce     sync.Once
+	connLimiter      *ConnectionLimiter
+	globalLimiter    *GlobalLimiter
+	activeReqs       atomic.Int64
+	fastDispatch     atomic.Bool
+	plainRootFast    plainRootFastResponse
+	h2RootFast       h2RootFastResponse
 	trustedProxies   trustedProxyMatcher
 	perIPLimiter     *perIPRequestLimiter
 	perIPConnLimiter *perIPConnLimiter
 	maxConnsPerIP    int64
 	trackedConnMu    sync.Mutex
-	trackedConns    map[*trackedHandoffConn]struct{}
-	onRequestHooks  []func(*Request, *Response) bool
-	onResponseHooks []func(*Request, *Response)
-	srvKeepAlive    []byte
-	srvClose        []byte
+	trackedConns     map[*trackedHandoffConn]struct{}
+	onRequestHooks   []func(*Request, *Response) bool
+	onResponseHooks  []func(*Request, *Response)
+	srvKeepAlive     []byte
+	srvClose         []byte
 }
 
 type trackedHandoffConn struct {
@@ -609,6 +622,9 @@ func New(configs ...Config) *Server {
 	}
 	if cfg.MaxHeaderSize == 0 {
 		cfg.MaxHeaderSize = 8192
+	}
+	if cfg.MaxBodySize == 0 {
+		cfg.MaxBodySize = 4 << 20
 	}
 	cfg.ServerName = sanitizeHeaderValue(cfg.ServerName)
 	if cfg.ServerName == "" {

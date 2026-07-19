@@ -425,6 +425,7 @@ func (ts *quicTLSState) handleClientFinished(qc *QUICConn, data []byte) {
 	ts.stage = quicTLSStageDone
 	qc.handshakeDone.Store(true)
 	qc.addressValidated.Store(true)
+	qc.clearHandshaking()
 	qc.keys[quicSpaceHandshake] = nil
 
 	var frames []byte

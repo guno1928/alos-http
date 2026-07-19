@@ -14,6 +14,11 @@ const (
 	inPhaseBody
 )
 
+const (
+	fpMaxInboundBody = 8 << 20
+	fpInboundIdleNS  = int64(15 * 1e9)
+)
+
 type inConn struct {
 	fd        int
 	loop      *eventLoop
@@ -22,6 +27,7 @@ type inConn struct {
 	ex        *Exchange
 	phase     int8
 	keepAlive bool
+	deadline  int64
 	remaining int64
 	method    string
 	path      string
@@ -41,20 +47,24 @@ func (l *eventLoop) acceptLoop() {
 		}
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 		ic := &inConn{fd: fd, loop: l, keepAlive: true}
+		ic.deadline = l.nowNano() + fpInboundIdleNS
 		if in4, ok := sa.(*unix.SockaddrInet4); ok {
 			ic.clientIP = ipv4String(in4.Addr)
 		}
 		l.ensureInFD(fd)
 		l.inconns[fd] = ic
+		l.liveInconns++
 		ev := unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP | unix.EPOLLET, Fd: int32(fd)}
 		if unix.EpollCtl(l.ep, unix.EPOLL_CTL_ADD, fd, &ev) != nil {
 			l.inconns[fd] = nil
+			l.liveInconns--
 			_ = unix.Close(fd)
 		}
 	}
 }
 
 func (l *eventLoop) inboundReadable(ic *inConn) {
+	ic.deadline = l.nowNano() + fpInboundIdleNS
 	for {
 		n, err := unix.Read(ic.fd, l.scratch)
 		if n > 0 {
@@ -178,7 +188,7 @@ func (ic *inConn) parseRequest(block []byte) error {
 		}
 		if asciiEqualFold(name, "content-length") {
 			v, err := strconv.ParseInt(string(value), 10, 64)
-			if err != nil || v < 0 {
+			if err != nil || v < 0 || v > fpMaxInboundBody {
 				return fpErrBadResponse
 			}
 			ic.remaining = v
@@ -263,6 +273,7 @@ func (l *eventLoop) closeInbound(ic *inConn) {
 		return
 	}
 	ic.closed = true
+	l.liveInconns--
 	if ic.fd >= 0 {
 		_ = unix.Close(ic.fd)
 		if ic.fd < len(l.inconns) {

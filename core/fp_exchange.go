@@ -17,6 +17,7 @@ var (
 	fpErrClientClosed   = errors.New("outbound: client closed")
 	fpErrBadAuthority   = errors.New("outbound: bad authority")
 	fpErrDNSFailed      = errors.New("outbound: dns lookup failed")
+	fpErrTooManyConns   = errors.New("outbound: backend connection limit reached")
 )
 
 type fpRequest struct {
