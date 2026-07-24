@@ -5,30 +5,37 @@ import (
 	"sync"
 )
 
+// RecordBufPool pools byte slices sized to hold a maximum-size TLS record plus its 5-byte header.
 var RecordBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, MaxRecordSize+5); return &b },
 }
 
+// SmallBufPool pools 512-byte scratch buffers.
 var SmallBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 512); return &b },
 }
 
+// MediumBufPool pools 4096-byte scratch buffers.
 var MediumBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 4096); return &b },
 }
 
+// LargeBufPool pools 32768-byte scratch buffers.
 var LargeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 32768); return &b },
 }
 
+// HdrBufPool pools 5-byte buffers sized for a TLS record header.
 var HdrBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 5, 5); return &b },
 }
 
+// H2FrameBufPool pools byte slices sized for a maximum-size HTTP/2 frame plus its 9-byte header.
 var H2FrameBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, H2DefaultMaxFrameSize+9); return &b },
 }
 
+// RequestPool pools reusable Request objects.
 var RequestPool = sync.Pool{
 	New: func() any {
 		return &Request{
@@ -38,6 +45,7 @@ var RequestPool = sync.Pool{
 	},
 }
 
+// ResponsePool pools reusable Response objects.
 var ResponsePool = sync.Pool{
 	New: func() any {
 		return &Response{
@@ -47,10 +55,12 @@ var ResponsePool = sync.Pool{
 	},
 }
 
+// WriteBufPool pools byte slices sized for a maximum-size TLS record, used for outgoing writes.
 var WriteBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, MaxRecordSize); return &b },
 }
 
+// StreamPool pools reusable H2Stream objects.
 var StreamPool = sync.Pool{
 	New: func() any {
 		return &H2Stream{
@@ -60,26 +70,32 @@ var StreamPool = sync.Pool{
 	},
 }
 
+// FileReadBufPool pools 65536-byte buffers used for file read operations.
 var FileReadBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 65536); return &b },
 }
 
+// H1StreamWriterPool pools reusable H1StreamWriter objects.
 var H1StreamWriterPool = sync.Pool{
 	New: func() any { return &H1StreamWriter{} },
 }
 
+// PlainH1StreamWriterPool pools reusable PlainH1StreamWriter objects.
 var PlainH1StreamWriterPool = sync.Pool{
 	New: func() any { return &PlainH1StreamWriter{} },
 }
 
+// H2StreamWriterPool pools reusable H2StreamWriter objects.
 var H2StreamWriterPool = sync.Pool{
 	New: func() any { return &H2StreamWriter{} },
 }
 
+// ErrChanPool pools buffered error channels with a capacity of 1.
 var ErrChanPool = sync.Pool{
 	New: func() any { return make(chan error, 1) },
 }
 
+// H2FramePool pools reusable H2Frame objects.
 var H2FramePool = sync.Pool{
 	New: func() any {
 		return &H2Frame{
@@ -88,6 +104,7 @@ var H2FramePool = sync.Pool{
 	},
 }
 
+// BufReaderPool pools bufio.Reader instances sized with a 65536-byte buffer.
 var BufReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 65536) },
 }
@@ -145,6 +162,7 @@ var tlsScratchPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, MaxRecordPayload); return &b },
 }
 
+// HpackDecoderPool pools reusable HPACK decoders.
 var HpackDecoderPool = sync.Pool{
 	New: func() any { return NewHpackDecoder() },
 }

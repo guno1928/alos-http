@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Capabilities describes the runtime environment and hardware features detected on the host.
 type Capabilities struct {
 	OS              string
 	Arch            string
@@ -25,6 +26,7 @@ type Capabilities struct {
 	NICOffloadRX    bool
 }
 
+// DetectCapabilities probes the host OS, architecture, CPU count, GOMAXPROCS, AES/PCLMULQDQ CPU support, kernel TLS (kTLS) availability, and the default-route NIC's TLS offload capabilities.
 func DetectCapabilities() Capabilities {
 	c := Capabilities{
 		OS:         runtime.GOOS,
@@ -48,6 +50,7 @@ func DetectCapabilities() Capabilities {
 	return c
 }
 
+// UseKTLS reports whether kernel TLS offload should be used, based on kTLS ULP availability and NIC TX offload support.
 func (c Capabilities) UseKTLS() bool {
 	return c.KTLSAvailable && c.NICOffloadTX
 }

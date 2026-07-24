@@ -27,17 +27,21 @@ var (
 	wrkTransferPattern       = regexp.MustCompile(`(?m)Transfer/sec:\s+(.+)$`)
 )
 
-// FineTuneScenario describes a single load-test scenario used by the
-// auto-tuner. The tuner runs wrk with these parameters against the server.
+// FineTuneScenario describes one wrk load-test scenario run against every
+// worker/listener candidate during Server.FineTuneWithOptions.
 type FineTuneScenario struct {
-	Name        string
+	// Name identifies the scenario in reports and logs.
+	Name string
+	// Connections is the number of concurrent wrk connections (wrk -c).
 	Connections int
-	Threads     int
-	Duration    time.Duration
+	// Threads is the number of wrk worker threads (wrk -t).
+	Threads int
+	// Duration is how long wrk runs the scenario for (wrk -d).
+	Duration time.Duration
 }
 
-// FineTuneResult holds the measured performance for one (workers, listeners,
-// scenario) combination produced by Server.FineTuneWithOptions.
+// FineTuneResult holds the outcome of running one FineTuneScenario against a
+// specific worker/listener configuration.
 type FineTuneResult struct {
 	Scenario       FineTuneScenario
 	Workers        int
@@ -50,8 +54,9 @@ type FineTuneResult struct {
 	RawOutput      string
 }
 
-// FineTuneReport summarises the auto-tuning sweep and records the best
-// worker/listener combination found. Returned by Server.FineTuneWithOptions.
+// FineTuneReport summarizes a full Server.FineTuneWithOptions sweep across
+// worker and listener candidates, including the best configuration found and
+// every individual scenario result.
 type FineTuneReport struct {
 	WrkPath            string
 	AutoInstalledWrk   bool
@@ -64,6 +69,8 @@ type FineTuneReport struct {
 	Results            []FineTuneResult
 }
 
+// String renders the report as a human-readable summary, or a placeholder
+// message if report is nil.
 func (report *FineTuneReport) String() string {
 	if report == nil {
 		return "ALOS finetuner: no report"
@@ -110,23 +117,31 @@ func (report *FineTuneReport) String() string {
 	return b.String()
 }
 
-// FineTuneOptions controls the parameter sweep performed by
-// Server.FineTuneWithOptions. Use DefaultFineTuneOptions for sensible defaults.
-//
-//	opts := core.DefaultFineTuneOptions()
-//	opts.WorkerCandidates = []int{12, 24, 48}
-//	opts.ListenerCandidates = []int{1, 5, 10}
-//	report, err := s.FineTuneWithOptions(opts)
+// FineTuneOptions configures a Server.FineTuneWithOptions sweep.
 type FineTuneOptions struct {
-	WorkerCandidates   []int
+	// WorkerCandidates lists the worker counts to sweep.
+	WorkerCandidates []int
+	// ListenerCandidates lists the listener counts to sweep.
 	ListenerCandidates []int
-	Scenarios          []FineTuneScenario
-	AutoInstallWrk     bool
-	StartupTimeout     time.Duration
-	RequestTimeout     time.Duration
-	BindHost           string
+	// Scenarios lists the wrk load scenarios to run against each candidate
+	// configuration.
+	Scenarios []FineTuneScenario
+	// AutoInstallWrk installs wrk via the OS package manager when it is not
+	// found in PATH.
+	AutoInstallWrk bool
+	// StartupTimeout bounds how long to wait for the benchmark server to
+	// become ready before giving up.
+	StartupTimeout time.Duration
+	// RequestTimeout is the HTTP client timeout used for readiness checks
+	// against the benchmark server.
+	RequestTimeout time.Duration
+	// BindHost is the address the benchmark server binds to during the
+	// sweep.
+	BindHost string
 }
 
+// DefaultFineTuneOptions returns the default worker/listener candidates and
+// scenarios used when FineTuneWithOptions is not given explicit options.
 func DefaultFineTuneOptions() FineTuneOptions {
 	return FineTuneOptions{
 		WorkerCandidates:   []int{12, 24, 32, 42, 52, 62},
@@ -144,11 +159,17 @@ func DefaultFineTuneOptions() FineTuneOptions {
 	}
 }
 
+// FineTune runs the finetuner with DefaultFineTuneOptions and applies the
+// best worker and listener counts it finds to the server's config.
 func (s *Server) FineTune() error {
 	_, err := s.FineTuneWithOptions(DefaultFineTuneOptions())
 	return err
 }
 
+// FineTuneWithOptions sweeps the given worker and listener candidates
+// against each scenario using wrk, applies the best-performing worker and
+// listener counts to the server's config, and returns a full report. It must
+// be called before the server starts listening.
 func (s *Server) FineTuneWithOptions(options FineTuneOptions) (*FineTuneReport, error) {
 	if s == nil {
 		return nil, errors.New("nil server")

@@ -14,16 +14,27 @@ import (
 	"github.com/guno1928/alosmap"
 )
 
-// CacheRule configures caching for a specific path prefix. If PathPrefix is empty
-// it acts as a default rule. Methods defaults to ["GET"] if empty.
+// CacheRule configures caching for a specific path prefix within a ProxyCacheConfig.Rules list. If PathPrefix is empty it acts as a default rule matching every path.
 //
-//	core.CacheRule{
-//	    PathPrefix: "/api/",
-//	    MaxAge:     10 * time.Minute,
-//	    Methods:    []string{"GET"},
-//	    MaxBytes:   1 << 20,         // 1 MB max per entry
-//	    StatusOnly: []int{200, 301}, // only cache these status codes
-//	}
+// PathPrefix is the request path prefix this rule applies to; empty matches every path.
+//
+//	Example: PathPrefix: "/api/".
+//
+// MaxAge is the TTL applied to entries matched by this rule; 0 falls back to ProxyCacheConfig.DefaultMaxAge.
+//
+//	Example: MaxAge: 10 * time.Minute.
+//
+// Methods restricts this rule to specific HTTP methods; empty matches any method eligible for caching (GET or HEAD).
+//
+//	Example: Methods: []string{"GET"}.
+//
+// MaxBytes is currently unused and has no effect; entry size is capped by ProxyCacheConfig.MaxEntrySize instead.
+//
+//	Example: MaxBytes: 1 << 20.
+//
+// StatusOnly restricts this rule to specific response status codes; empty matches any status eligible for caching (2xx, 301, or 308).
+//
+//	Example: StatusOnly: []int{200, 301}.
 type CacheRule struct {
 	PathPrefix string
 	MaxAge     time.Duration
@@ -32,18 +43,55 @@ type CacheRule struct {
 	StatusOnly []int
 }
 
-// ProxyCacheConfig controls how the reverse proxy caches backend responses.
+// ProxyCacheConfig controls how the reverse proxy caches backend responses. The zero
+// value is valid; NewProxyCache and UpdateConfig apply defaults to zero-valued fields.
 //
-//	cfg := core.DefaultProxyCacheConfig()
-//	cfg.MaxTotalBytes = 512 << 20           // 512 MB total cache
-//	cfg.MaxEntrySize = 8 << 20              // 8 MB max per entry
-//	cfg.DefaultMaxAge = 10 * time.Minute
-//	cfg.PreCompress = true                   // pre-gzip cached entries
-//	cfg.Rules = []core.CacheRule{
-//	    {PathPrefix: "/static/", MaxAge: time.Hour},
-//	    {PathPrefix: "/api/", MaxAge: 30 * time.Second, StatusOnly: []int{200}},
-//	}
-//	srv.SetProxyCache(cfg)
+// Rules lists path-specific caching rules, consulted in order; the first rule whose
+// PathPrefix, Methods, and StatusOnly all match supplies the TTL. Only GET/HEAD
+// responses with a 2xx, 301, or 308 status are ever eligible. An empty Rules caches
+// every eligible response using DefaultMaxAge; a non-empty Rules that matches nothing
+// skips caching.
+//
+//	Example: Rules: []core.CacheRule{{PathPrefix: "/static/", MaxAge: time.Hour}}.
+//
+// MaxEntrySize is the largest response body that may be cached, in bytes; 0 defaults
+// to 4 MiB. Larger responses bypass the cache.
+//
+//	Example: MaxEntrySize: 8 << 20.
+//
+// DefaultMaxAge is the TTL used when Rules is empty, or for a matching rule with
+// MaxAge unset; 0 defaults to 5 minutes.
+//
+//	Example: DefaultMaxAge: 10 * time.Minute.
+//
+// MaxTotalBytes caps the cache's aggregate stored bytes; 0 defaults to 256 MiB.
+// Exceeding it triggers eviction of the oldest entries down to 90% of the cap.
+//
+//	Example: MaxTotalBytes: 512 << 20.
+//
+// MaxEntries caps the number of stored entries; 0 disables the cap (DefaultProxyCacheConfig sets 10000).
+//
+//	Example: MaxEntries: 50000.
+//
+// StaleWhileRev extends how long an expired entry may still be served after its TTL
+// elapses; 0 disables stale serving.
+//
+//	Example: StaleWhileRev: 30 * time.Second.
+//
+// PreCompress, when true, stores a gzip copy of cacheable responses alongside the
+// original so clients that accept gzip skip runtime compression; the zero value is
+// false (DefaultProxyCacheConfig sets it true).
+//
+//	Example: PreCompress: true.
+//
+// CompressLevel is the gzip level used when PreCompress is set; values outside 1-9 default to 6.
+//
+//	Example: CompressLevel: 9.
+//
+// CompressMinLen is the minimum response body size, in bytes, before pre-compression
+// is applied; 0 defaults to 512. Smaller bodies are stored uncompressed.
+//
+//	Example: CompressMinLen: 1024.
 type ProxyCacheConfig struct {
 	Rules          []CacheRule
 	MaxEntrySize   int64
@@ -95,10 +143,12 @@ func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) {
 	}
 }
 
-// ProxyCache stores and serves cached upstream responses keyed by method, host,
-// and path. It supports automatic TTL expiration, hit-count limits, gzip/brotli
-// pre-compression, and per-path cache rules. Create one with NewProxyCache or
-// let the server provision one automatically via Server.SetProxyCache.
+// ProxyCache stores and serves cached upstream responses keyed by method, host, and
+// path. It normalizes gzip/deflate/brotli-encoded backend bodies to raw form before
+// storing, supports automatic TTL expiration and hit-count limits, and can pre-compress
+// cacheable responses with gzip so gzip-accepting clients skip runtime compression.
+// Create one with NewProxyCache, or let the server provision one automatically via
+// Server.SetProxyCache.
 type ProxyCache struct {
 	entries      *alosmap.TypedMap[string, *cacheEntry]
 	config       atomic.Pointer[ProxyCacheConfig]
@@ -110,6 +160,9 @@ type ProxyCache struct {
 	gzipPool     sync.Pool
 }
 
+// NewProxyCache creates a ProxyCache configured with cfg, normalizing zero-valued
+// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, and MaxTotalBytes to
+// their defaults, and starts a background goroutine that periodically evicts expired entries.
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
 		cfg.CompressLevel = 6
@@ -143,6 +196,10 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	return pc
 }
 
+// UpdateConfig atomically replaces the cache's active configuration with cfg,
+// normalizing zero-valued CompressLevel, CompressMinLen, and DefaultMaxAge to their
+// defaults. Unlike NewProxyCache, MaxEntrySize and MaxTotalBytes are stored as given.
+// Existing entries are left as-is.
 func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
 		cfg.CompressLevel = 6
@@ -156,6 +213,8 @@ func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	pc.config.Store(&cfg)
 }
 
+// Stop signals the cache's background eviction goroutine to exit. Safe to call
+// multiple times; only the first call takes effect.
 func (pc *ProxyCache) Stop() {
 	select {
 	case <-pc.stopCh:
@@ -379,10 +438,17 @@ func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, st
 	return 0, false
 }
 
+// Get looks up the cache entry for method, host, and path. Automatically-cached
+// entries are only returned when req's headers permit a cache lookup (no
+// Authorization/Cookie, and no Cache-Control/Pragma no-cache); manually cached
+// entries (see ProxyResponse.CacheThis) always qualify. It reports whether an entry
+// was found, including entries served stale within StaleWhileRev after expiring.
 func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry, bool) {
 	return pc.lookupEntry(method, host, path, proxyCacheRequestAllowed(req))
 }
 
+// GetFP is like Get but takes a precomputed reqAllows flag instead of a *Request, for
+// callers that have already evaluated the request's cache-eligibility headers.
 func (pc *ProxyCache) GetFP(method, host, path string, reqAllows bool) (*cacheEntry, bool) {
 	return pc.lookupEntry(method, host, path, reqAllows)
 }
@@ -422,6 +488,9 @@ func (pc *ProxyCache) lookupEntry(method, host, path string, reqAllows bool) (*c
 	return entry, true
 }
 
+// Put stores body in the cache for method, host, and path if a matching CacheRule (or
+// the default rule) permits it, subject to ProxyCacheConfig's size limits. It is a
+// no-op when no rule allows caching for this method/path/status combination.
 func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte) {
 	cfg := pc.config.Load()
 	ttl, ok := pc.shouldCache(cfg, method, path, statusCode)
@@ -431,6 +500,10 @@ func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][
 	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false)
 }
 
+// PutManual stores body in the cache for method, host, and path with an explicit ttl,
+// maxHits, and pre-compression policy, bypassing the automatic CacheRule matching
+// used by Put. It backs ProxyResponse.CacheThis and is a no-op when body exceeds
+// ProxyCacheConfig.MaxEntrySize.
 func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int) {
 	cfg := pc.config.Load()
 	if cfg.MaxEntrySize > 0 && int64(len(body)) > cfg.MaxEntrySize {
@@ -510,6 +583,8 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 	}
 }
 
+// Purge removes the cached entry for method, host, and path, if present, and reports
+// whether an entry was removed.
 func (pc *ProxyCache) Purge(method, host, path string) bool {
 	key := pc.buildKey(method, host, path)
 	if entry, ok := pc.entries.Load(key); ok {
@@ -519,12 +594,15 @@ func (pc *ProxyCache) Purge(method, host, path string) bool {
 	return false
 }
 
+// PurgeAll removes every cached entry and resets the cache's byte and entry counters.
 func (pc *ProxyCache) PurgeAll() {
 	pc.entries.Clear()
 	pc.totalBytes.Store(0)
 	pc.totalEntries.Store(0)
 }
 
+// PurgeDomain removes every GET and HEAD entry cached for domain and returns the
+// number of entries removed.
 func (pc *ProxyCache) PurgeDomain(domain string) int64 {
 	domain = normalizeCertDomain(domain)
 	prefix1 := "GET|" + domain + "|"
@@ -540,10 +618,14 @@ func (pc *ProxyCache) PurgeDomain(domain string) int64 {
 	return purged
 }
 
+// Stats returns the current entry count, total stored bytes, and cumulative hit/miss counters.
 func (pc *ProxyCache) Stats() (entries int64, totalBytes int64, hits uint64, misses uint64) {
 	return pc.totalEntries.Load(), pc.totalBytes.Load(), pc.totalHits.Load(), pc.totalMisses.Load()
 }
 
+// ServeCached writes entry to resp, setting the status, headers, and X-Cache /
+// X-Cache-Hits response headers, and serves the pre-compressed gzip body when req
+// accepts gzip encoding.
 func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Response) {
 	resp.Status(entry.statusCode)
 	if entry.contentType != "" {

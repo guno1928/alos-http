@@ -17,23 +17,30 @@ type ownedWriteConn interface {
 	WriteOwned(p []byte, releaseBuf *[]byte, releasePool uint8) (int, error)
 }
 
+// BufConn wraps a net.Conn with a pooled bufio.Reader for buffered reads, while
+// writes pass through directly to the underlying connection.
 type BufConn struct {
 	net.Conn
 	br *bufio.Reader
 }
 
+// NewBufConn wraps c in a BufConn, acquiring a pooled bufio.Reader for buffered
+// reads. Call Release when done to return the reader to the pool.
 func NewBufConn(c net.Conn) *BufConn {
 	br := BufReaderPool.Get().(*bufio.Reader)
 	br.Reset(c)
 	return &BufConn{Conn: c, br: br}
 }
 
+// Release resets and returns the BufConn's pooled bufio.Reader to the pool. The
+// BufConn must not be used again afterward.
 func (bc *BufConn) Release() {
 	bc.br.Reset(nil)
 	BufReaderPool.Put(bc.br)
 	bc.br = nil
 }
 
+// Read reads from the underlying connection through the buffered reader.
 func (bc *BufConn) Read(p []byte) (int, error) {
 	return bc.br.Read(p)
 }
@@ -55,6 +62,10 @@ func releaseOwnedWriteBuf(data []byte, releaseBuf *[]byte, releasePool uint8) {
 	}
 }
 
+// WriteOwned writes p to the underlying connection, delegating to the connection's
+// own WriteOwned if it implements ownedWriteConn (letting it defer buffer release
+// for async writes); otherwise it writes synchronously and immediately releases the
+// buffer to the pool identified by releasePool.
 func (bc *BufConn) WriteOwned(p []byte, releaseBuf *[]byte, releasePool uint8) (int, error) {
 	if owned, ok := bc.Conn.(ownedWriteConn); ok {
 		return owned.WriteOwned(p, releaseBuf, releasePool)
@@ -64,16 +75,21 @@ func (bc *BufConn) WriteOwned(p []byte, releaseBuf *[]byte, releasePool uint8) (
 	return n, err
 }
 
+// TLSConn pairs a raw net.Conn with a pooled scratch buffer sized for one TLS record.
 type TLSConn struct {
 	Raw     net.Conn
 	ReadBuf []byte
 }
 
+// NewTLSConn wraps c in a TLSConn, acquiring a pooled buffer sized for one TLS
+// record. Call Release when done to return the buffer to the pool.
 func NewTLSConn(c net.Conn) *TLSConn {
 	bp := RecordBufPool.Get().(*[]byte)
 	return &TLSConn{Raw: c, ReadBuf: (*bp)[:0]}
 }
 
+// Release returns the TLSConn's pooled read buffer to the pool. The TLSConn must
+// not be used again afterward.
 func (c *TLSConn) Release() {
 	if c.ReadBuf != nil {
 		b := c.ReadBuf[:0]
@@ -82,6 +98,10 @@ func (c *TLSConn) Release() {
 	}
 }
 
+// ReadRecord reads one raw TLS record from conn into a pooled buffer, using
+// hdrScratch as scratch space for the 5-byte header, and returns the record's
+// content type, payload, and the pool box pointer for the caller to release via
+// ReleaseRecordBuf.
 func ReadRecord(conn net.Conn, hdrScratch []byte) (byte, []byte, *[]byte, error) {
 	hdr := hdrScratch[:5]
 	if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -106,6 +126,8 @@ func ReadRecord(conn net.Conn, hdrScratch []byte) (byte, []byte, *[]byte, error)
 	return ct, payload, bp, nil
 }
 
+// ReadRecordSkipCCS is like ReadRecord but transparently discards up to 5 leading
+// ChangeCipherSpec (0x14) records, returning ErrTruncated if more than that many are seen.
 func ReadRecordSkipCCS(conn net.Conn, hdr []byte) (byte, []byte, *[]byte, error) {
 	maxCCSSkips := 5
 	for i := 0; ; i++ {
@@ -126,6 +148,7 @@ func ReadRecordSkipCCS(conn net.Conn, hdr []byte) (byte, []byte, *[]byte, error)
 	}
 }
 
+// ReleaseRecordBuf returns a record buffer obtained from ReadRecord (or ReadRecordSkipCCS) to RecordBufPool.
 func ReleaseRecordBuf(bp *[]byte) {
 	if bp != nil {
 		*bp = (*bp)[:0]
@@ -147,6 +170,8 @@ func writeFull(conn net.Conn, p []byte) error {
 	return nil
 }
 
+// WriteRecord writes payload to conn as a single TLS 1.2-framed record (version
+// 0x0303) of content type ct, returning ErrRecordTooLarge if payload exceeds MaxRecordSize.
 func WriteRecord(conn net.Conn, ct byte, payload []byte) error {
 	if len(payload) > MaxRecordSize {
 		return ErrRecordTooLarge
@@ -166,10 +191,14 @@ func WriteRecord(conn net.Conn, ct byte, payload []byte) error {
 	return err
 }
 
+// SendCCS writes a TLS ChangeCipherSpec record to conn.
 func SendCCS(conn net.Conn) error {
 	return WriteRecord(conn, 0x14, []byte{0x01})
 }
 
+// AppendRecord appends a TLS 1.2-framed record (version 0x0303) of content type ct
+// and payload to dst and returns the extended slice, truncating payload to
+// MaxRecordPayload bytes if it is larger.
 func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
 	pLen := len(payload)
 	if pLen > MaxRecordPayload {
@@ -181,6 +210,9 @@ func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
 	return dst
 }
 
+// StripInnerPlaintext parses a TLS 1.3 decrypted inner plaintext (content followed
+// by a one-byte content type, followed by zero padding), returning the content and
+// content type. It returns ErrAllZeroInner if data contains no non-zero byte.
 func StripInnerPlaintext(data []byte) (content []byte, contentType byte, err error) {
 	for i := len(data) - 1; i >= 0; i-- {
 		if data[i] != 0 {
@@ -190,6 +222,7 @@ func StripInnerPlaintext(data []byte) (content []byte, contentType byte, err err
 	return nil, 0, ErrAllZeroInner
 }
 
+// SendCloseNotify encrypts and writes a TLS 1.3 close_notify alert to conn using writer.
 func SendCloseNotify(conn net.Conn, writer *TrafficAEAD) {
 	var inner [3]byte
 	inner[0] = 0x01
@@ -202,6 +235,10 @@ func SendCloseNotify(conn net.Conn, writer *TrafficAEAD) {
 	SmallBufPool.Put(rbp)
 }
 
+// WriteAppData encrypts data with writer into one or more TLS 1.3 application-data
+// records (each carrying at most MaxRecordPayload-1 bytes of inner content) and
+// writes them to conn, using the connection's WriteOwned when available to hand off
+// buffer ownership for async writes.
 func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	const maxContent = MaxRecordPayload - 1
 	overhead := writer.Overhead()

@@ -46,6 +46,9 @@ type poolKey struct {
 	skipVerify bool
 }
 
+// Exchange represents a single outbound request/response cycle as it is
+// processed by an event loop, from submission through backend connection
+// handling to completion.
 type Exchange struct {
 	node     mpscNode
 	req      *fpRequest

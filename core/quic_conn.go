@@ -92,6 +92,9 @@ type quicInboundPkt struct {
 	pbuf *[]byte
 }
 
+// QUICConn represents a single server-side QUIC connection. It tracks connection IDs
+// and per-packet-number-space cryptographic state, drives the TLS handshake, multiplexes
+// and flow-controls streams, and handles ACK/loss recovery and packet transmission for one client.
 type QUICConn struct {
 	srcConnID     [20]byte
 	srcCIDLen     int

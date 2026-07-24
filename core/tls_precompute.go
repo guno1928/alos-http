@@ -55,6 +55,7 @@ func (t hkdfLabelTemplate) ExpandTo(h func() hash.Hash, secret, ctx, dst []byte)
 	return out[:t.outLen]
 }
 
+// TLSExtractTo performs the TLS 1.3 HKDF-Extract step (HMAC(salt, ikm)), appending the result to dst and returning the extended slice.
 func TLSExtractTo(h func() hash.Hash, salt, ikm, dst []byte) []byte {
 	mac := hmac.New(h, salt)
 	mac.Write(ikm)
@@ -92,10 +93,12 @@ func (cs *CipherSuiteConfig) initPrecompute() {
 	cs.derivedFromEarly = append(cs.derivedFromEarly[:0], cs.labelDerived.ExpandTo(cs.HashFn, cs.earlySecret, cs.emptyTranscriptHash, derivedBuf[:0])...)
 }
 
+// DeriveSecretTo derives a TLS 1.3 secret from secret and transcriptHash using the given HKDF label template, appending the result to dst.
 func (cs *CipherSuiteConfig) DeriveSecretTo(tmpl *hkdfLabelTemplate, secret, transcriptHash, dst []byte) []byte {
 	return tmpl.ExpandTo(cs.HashFn, secret, transcriptHash, dst)
 }
 
+// ComputeFinishedTo computes a TLS 1.3 Finished message MAC over transcriptHash using baseSecret, appending the result to dst.
 func (cs *CipherSuiteConfig) ComputeFinishedTo(baseSecret, transcriptHash, dst []byte) []byte {
 	var finishedKeyBuf [64]byte
 	finishedKey := cs.labelFinished.ExpandTo(cs.HashFn, baseSecret, nil, finishedKeyBuf[:0])

@@ -30,6 +30,9 @@ func fpNew(cfg fpConfig) (*fpClient, error) {
 	return c, nil
 }
 
+// Do sends req to the appropriate backend and blocks until a response is
+// received or the request fails (for example if the client is closed, the
+// authority cannot be resolved, or the request times out).
 func (c *fpClient) Do(req *fpRequest) (*fpResponse, error) {
 	if c.closed.Load() {
 		return nil, fpErrClientClosed
@@ -67,6 +70,8 @@ func (c *fpClient) Do(req *fpRequest) (*fpResponse, error) {
 	return &ex.resp, nil
 }
 
+// Close marks the client as closed, causing subsequent calls to Do to
+// return fpErrClientClosed.
 func (c *fpClient) Close() {
 	c.closed.Store(true)
 }

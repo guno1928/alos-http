@@ -231,18 +231,16 @@ type epollWorker struct {
 	lastSweep       int64
 }
 
-// ListenAndServeEpollH2 serves plain HTTP/1.1 and HTTP/2 prior-knowledge on
-// addr using the epoll backend: Config.Listeners SO_REUSEPORT sockets (default:
-// one per CPU thread), each with its own event-loop worker goroutine. It blocks
-// until the server stops.
+// ListenAndServeEpollH2 listens on addr and serves plain HTTP/1.1 and
+// HTTP/2-via-prior-knowledge connections using the epoll backend, blocking
+// until an error occurs.
 func (s *Server) ListenAndServeEpollH2(addr string) error {
 	return s.serveEpoll(addr, false)
 }
 
-// ListenAndServeEpollTLS serves HTTPS (TLS 1.3/1.2, HTTP/1.1 + HTTP/2) on addr
-// using the epoll backend with Config.Listeners SO_REUSEPORT sockets (default:
-// one per CPU thread), each with its own event-loop worker goroutine. It blocks
-// until the server stops.
+// ListenAndServeEpollTLS listens on addr and serves TLS-terminated HTTP/1.1
+// and HTTP/2 connections using the epoll backend, blocking until an error
+// occurs.
 func (s *Server) ListenAndServeEpollTLS(addr string) error {
 	return s.serveEpoll(addr, true)
 }

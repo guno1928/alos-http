@@ -10,7 +10,8 @@ import (
 	"github.com/guno1928/alosmap"
 )
 
-// ListenAndServeQUIC serves HTTP/3 over QUIC on the server's configured address (Addr, default ":443") using the loaded TLS certificates, blocking until the server stops. It is the QUIC counterpart to ListenAndServe.
+// ListenAndServeQUIC starts the QUIC (HTTP/3) UDP listener(s) on the
+// server's configured address and blocks until the server is shut down.
 func (s *Server) ListenAndServeQUIC() error {
 	if err := s.ensureStartInit(); err != nil {
 		return err

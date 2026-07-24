@@ -15,6 +15,9 @@ const (
 	writeReleaseH2Frame
 )
 
+// H2Conn holds the per-connection state for serving HTTP/2 over a single
+// net.Conn, including the HPACK decoder, flow-control windows, and the
+// table of active streams.
 type H2Conn struct {
 	conn              net.Conn
 	reader            *TrafficAEAD
@@ -113,6 +116,9 @@ func releaseWriteRequest(req *WriteRequest) {
 	req.releaseBuf = nil
 }
 
+// ServeH2 serves an HTTP/2 connection over conn, using reader and writer to
+// decrypt and encrypt TLS application data records and hdrBuf as a scratch
+// buffer for record headers, until the connection closes.
 func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []byte) {
 	bc := NewBufConn(conn)
 	hc := &H2Conn{

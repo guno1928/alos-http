@@ -37,6 +37,9 @@ func releaseStreamWriter(sw StreamWriter) {
 	}
 }
 
+// H2StreamWriter writes an HTTP/2 response as HEADERS and DATA frames on a
+// single stream, honoring per-stream and per-connection flow control and any
+// configured bandwidth limiter. It implements StreamWriter.
 type H2StreamWriter struct {
 	streamID     uint32
 	writeCh      chan<- WriteRequest
@@ -55,6 +58,8 @@ type H2StreamWriter struct {
 	flowCond     *sync.Cond
 }
 
+// WriteRequest is a single write submitted to a connection's serialized
+// writer goroutine; the outcome is delivered on Done.
 type WriteRequest struct {
 	Data        []byte
 	Done        chan error
@@ -76,6 +81,8 @@ func bindRequestMethodToStreamWriter(sw StreamWriter, method string) {
 	}
 }
 
+// WriteHeader encodes and sends the HTTP/2 HEADERS frame for the stream with
+// statusCode, headers, and contentType. Later calls are no-ops.
 func (w *H2StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
 	if w.headersSent {
 		return nil
@@ -99,6 +106,11 @@ func (w *H2StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 	return err
 }
 
+// WriteChunk sends data as one or more HTTP/2 DATA frames, splitting oversized
+// payloads to the negotiated max frame size and waiting for available
+// flow-control window (up to 30s) before each frame. It applies any
+// configured download rate limit and returns ErrBodyTooLarge if a maximum
+// response size was set and is exceeded.
 func (w *H2StreamWriter) WriteChunk(data []byte) error {
 	if !w.headersSent {
 		return ErrStreamClosed
@@ -175,10 +187,13 @@ func (w *H2StreamWriter) WriteChunk(data []byte) error {
 	return nil
 }
 
+// Flush is a no-op; H2StreamWriter has no internal buffering to flush.
 func (w *H2StreamWriter) Flush() error {
 	return nil
 }
 
+// Close sends an empty DATA frame with END_STREAM set, ending the HTTP/2
+// stream.
 func (w *H2StreamWriter) Close() error {
 	fbp := H2FrameBufPool.Get().(*[]byte)
 	emptyFrame := H2WriteFrame((*fbp)[:0], H2FrameData, H2FlagEndStream, w.streamID, nil)
@@ -201,6 +216,9 @@ func (w *H2StreamWriter) sendFrame(frame []byte) error {
 	}
 }
 
+// H1StreamWriter writes an HTTP/1.1 response over an encrypted (TLS)
+// connection, using chunked Transfer-Encoding unless the response declares
+// Content-Length or has no body. It implements StreamWriter.
 type H1StreamWriter struct {
 	conn         net.Conn
 	writer       *TrafficAEAD
@@ -216,6 +234,9 @@ type H1StreamWriter struct {
 	closeAfter   bool
 }
 
+// WriteHeader writes the HTTP/1.1 status line and headers, selecting chunked
+// Transfer-Encoding unless a Content-Length header is present or the response
+// has no body. Later calls are no-ops.
 func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
 	if w.headersSent {
 		return nil
@@ -274,6 +295,10 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 	return err
 }
 
+// WriteChunk writes data to the client, chunk-encoding it when the response
+// uses chunked Transfer-Encoding or writing it directly when Content-Length
+// was set. It applies any configured download rate limit and returns
+// ErrBodyTooLarge if a maximum response size was set and is exceeded.
 func (w *H1StreamWriter) WriteChunk(data []byte) error {
 	if !w.headersSent {
 		return ErrStreamClosed
@@ -314,10 +339,13 @@ func (w *H1StreamWriter) WriteChunk(data []byte) error {
 	return err
 }
 
+// Flush is a no-op; H1StreamWriter has no internal buffering to flush.
 func (w *H1StreamWriter) Flush() error {
 	return nil
 }
 
+// Close writes the terminating zero-length chunk when the response is
+// chunked; it is a no-op for Content-Length responses or bodiless responses.
 func (w *H1StreamWriter) Close() error {
 	if w.suppressBody || !w.chunked {
 		return nil
@@ -329,6 +357,9 @@ func (w *H1StreamWriter) writeEncrypted(data []byte) error {
 	return WriteAppData(w.conn, w.writer, data)
 }
 
+// PlainH1StreamWriter writes an HTTP/1.1 response over a plaintext
+// (non-TLS) connection, using the same Content-Length/chunked selection as
+// H1StreamWriter. It implements StreamWriter.
 type PlainH1StreamWriter struct {
 	conn         net.Conn
 	limiter      *ConnectionLimiter
@@ -343,6 +374,9 @@ type PlainH1StreamWriter struct {
 	closeAfter   bool
 }
 
+// WriteHeader writes the HTTP/1.1 status line and headers, selecting chunked
+// Transfer-Encoding unless a Content-Length header is present or the response
+// has no body. Later calls are no-ops.
 func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
 	if w.headersSent {
 		return nil
@@ -401,6 +435,10 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 	return err
 }
 
+// WriteChunk writes data to the client, chunk-encoding it when the response
+// uses chunked Transfer-Encoding or writing it directly when Content-Length
+// was set. It applies any configured download rate limit and returns
+// ErrBodyTooLarge if a maximum response size was set and is exceeded.
 func (w *PlainH1StreamWriter) WriteChunk(data []byte) error {
 	if !w.headersSent {
 		return ErrStreamClosed
@@ -441,10 +479,13 @@ func (w *PlainH1StreamWriter) WriteChunk(data []byte) error {
 	return err
 }
 
+// Flush is a no-op; PlainH1StreamWriter has no internal buffering to flush.
 func (w *PlainH1StreamWriter) Flush() error {
 	return nil
 }
 
+// Close writes the terminating zero-length chunk when the response is
+// chunked; it is a no-op for Content-Length responses or bodiless responses.
 func (w *PlainH1StreamWriter) Close() error {
 	if w.suppressBody || !w.chunked {
 		return nil

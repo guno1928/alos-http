@@ -1,7 +1,10 @@
 package core
 
+// H2ClientPreface is the 24-byte connection preface an HTTP/2 client sends
+// before the first frame.
 var H2ClientPreface = [24]byte{'P', 'R', 'I', ' ', '*', ' ', 'H', 'T', 'T', 'P', '/', '2', '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'}
 
+// H2Frame represents a parsed HTTP/2 frame header and payload.
 type H2Frame struct {
 	Length   uint32
 	Type     byte
@@ -15,6 +18,9 @@ func releaseH2Frame(f *H2Frame) {
 	H2FramePool.Put(f)
 }
 
+// H2ReadFrame parses an HTTP/2 frame from the bytes returned by reader,
+// returning a pooled *H2Frame, or an error if the data is too short or the
+// declared frame length exceeds it.
 func H2ReadFrame(reader func() ([]byte, error)) (*H2Frame, error) {
 	data, err := reader()
 	if err != nil {
@@ -36,6 +42,9 @@ func H2ReadFrame(reader func() ([]byte, error)) (*H2Frame, error) {
 	return f, nil
 }
 
+// H2WriteFrame appends an HTTP/2 frame with the given type, flags, stream ID,
+// and payload to dst, reusing dst's capacity when it is large enough, and
+// returns the resulting slice.
 func H2WriteFrame(dst []byte, typ, flags byte, streamID uint32, payload []byte) []byte {
 	pLen := len(payload)
 	needed := 9 + pLen
@@ -59,6 +68,8 @@ func H2WriteFrame(dst []byte, typ, flags byte, streamID uint32, payload []byte) 
 	return dst
 }
 
+// H2WriteSettings appends an HTTP/2 SETTINGS frame carrying the given
+// identifier/value pairs to dst and returns the resulting slice.
 func H2WriteSettings(dst []byte, settings [][2]uint32) []byte {
 	payloadLen := len(settings) * 6
 	needed := 9 + payloadLen
@@ -91,6 +102,8 @@ func H2WriteSettings(dst []byte, settings [][2]uint32) []byte {
 	return dst
 }
 
+// H2WriteSettingsAck appends an HTTP/2 SETTINGS frame with the ACK flag set
+// to dst and returns the resulting slice.
 func H2WriteSettingsAck(dst []byte) []byte {
 	if cap(dst) < 9 {
 		dst = make([]byte, 9)
@@ -109,6 +122,8 @@ func H2WriteSettingsAck(dst []byte) []byte {
 	return dst
 }
 
+// H2WriteWindowUpdate appends an HTTP/2 WINDOW_UPDATE frame for streamID
+// with the given increment to dst and returns the resulting slice.
 func H2WriteWindowUpdate(dst []byte, streamID, increment uint32) []byte {
 	if cap(dst) < 13 {
 		dst = make([]byte, 13)
@@ -132,6 +147,8 @@ func H2WriteWindowUpdate(dst []byte, streamID, increment uint32) []byte {
 	return dst
 }
 
+// H2WriteGoAway appends an HTTP/2 GOAWAY frame reporting lastStream and
+// errCode to dst and returns the resulting slice.
 func H2WriteGoAway(dst []byte, lastStream, errCode uint32) []byte {
 	if cap(dst) < 17 {
 		dst = make([]byte, 17)
@@ -158,6 +175,8 @@ func H2WriteGoAway(dst []byte, lastStream, errCode uint32) []byte {
 	return dst
 }
 
+// H2WritePing appends an HTTP/2 PING frame carrying data to dst, setting the
+// ACK flag when ack is true, and returns the resulting slice.
 func H2WritePing(dst []byte, ack bool, data [8]byte) []byte {
 	if cap(dst) < 17 {
 		dst = make([]byte, 17)
@@ -181,6 +200,8 @@ func H2WritePing(dst []byte, ack bool, data [8]byte) []byte {
 	return dst
 }
 
+// H2WriteRSTStream appends an HTTP/2 RST_STREAM frame for streamID with
+// errCode to dst and returns the resulting slice.
 func H2WriteRSTStream(dst []byte, streamID, errCode uint32) []byte {
 	if cap(dst) < 13 {
 		dst = make([]byte, 13)
@@ -203,6 +224,8 @@ func H2WriteRSTStream(dst []byte, streamID, errCode uint32) []byte {
 	return dst
 }
 
+// H2WriteContinuation appends an HTTP/2 CONTINUATION frame carrying
+// headerBlock to dst and returns the resulting slice.
 func H2WriteContinuation(dst []byte, flags byte, streamID uint32, headerBlock []byte) []byte {
 	return H2WriteFrame(dst, H2FrameContinuation, flags, streamID, headerBlock)
 }

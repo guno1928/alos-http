@@ -60,6 +60,7 @@ func resolveIPv4(ctx context.Context, host string) (net.IP, error) {
 	return ips[0], nil
 }
 
+// DialTCP4 dials addr over TCP/IPv4 within timeout, resolving hostnames through the internal DNS cache, and tunes the resulting connection's socket options.
 func DialTCP4(addr string, timeout time.Duration) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -151,6 +152,7 @@ func commonLowerHeader(s string) (string, bool) {
 	return "", false
 }
 
+// ToLowerASCII returns s with ASCII uppercase letters folded to lowercase, using a fast path for common HTTP header names.
 func ToLowerASCII(s string) string {
 	if low, ok := commonLowerHeaders[s]; ok {
 		return low
@@ -181,6 +183,7 @@ func ToLowerASCII(s string) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
+// EqualFoldASCII reports whether a and b are equal under ASCII case-insensitive comparison.
 func EqualFoldASCII(a, b string) bool {
 	if a == b {
 		return true
@@ -210,6 +213,7 @@ func EqualFoldASCII(a, b string) bool {
 	return true
 }
 
+// UnsafeString converts b to a string without copying, by reinterpreting its backing array. The returned string is only valid as long as b is not mutated.
 func UnsafeString(b []byte) string {
 	if len(b) == 0 {
 		return ""
@@ -217,6 +221,7 @@ func UnsafeString(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
+// UnsafeBytes converts s to a byte slice without copying, by reinterpreting its backing array. The caller must not mutate the returned slice.
 func UnsafeBytes(s string) []byte {
 	if len(s) == 0 {
 		return nil
@@ -442,6 +447,7 @@ func isValidIPv6(s string) bool {
 	return colonCount >= 2
 }
 
+// StatusText returns the standard reason phrase for the given HTTP status code, or "Unknown" if code is not recognized.
 func StatusText(code int) string {
 	switch code {
 	case 200:
@@ -489,6 +495,7 @@ func StatusText(code int) string {
 	}
 }
 
+// HexDigit returns the lowercase hex character for the nibble value b (0-15).
 func HexDigit(b byte) byte {
 	if b < 10 {
 		return '0' + b
@@ -496,6 +503,7 @@ func HexDigit(b byte) byte {
 	return 'a' + b - 10
 }
 
+// AppendJSONString appends s to dst as a double-quoted, JSON-escaped string, escaping control characters, quotes, and backslashes.
 func AppendJSONString(dst []byte, s string) []byte {
 	dst = append(dst, '"')
 	last := 0
@@ -612,6 +620,7 @@ func init() {
 	badHostChar[0] = true
 }
 
+// ValidateHost reports whether host contains none of the disallowed characters: path separators, CR, LF, or NUL.
 func ValidateHost(host string) bool {
 	for i := 0; i < len(host); i++ {
 		if badHostChar[host[i]] {
@@ -637,6 +646,7 @@ func init() {
 	}()
 }
 
+// CoarseNanotime returns a coarse-grained current time in Unix nanoseconds, refreshed by a background ticker roughly once per millisecond.
 func CoarseNanotime() int64 {
 	return coarseNow.Load()
 }

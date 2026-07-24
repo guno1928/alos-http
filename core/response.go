@@ -59,6 +59,8 @@ func shrinkBuffer(buf []byte, defaultCap int) []byte {
 	return buf[:0]
 }
 
+// Reset clears the response to its zero state (status 200, empty headers
+// and body) so it can be reused from a connection pool.
 func (r *Response) Reset() {
 	r.StatusCode = 200
 	r.Headers = r.Headers[:0]
@@ -82,6 +84,8 @@ func (r *Response) resetFastH1() {
 	r.streamed = false
 }
 
+// SetSW sets the StreamWriter returned by EnsureStreamWriter without marking
+// the response as streamed; use SetStreamer to also mark it streamed.
 func (r *Response) SetSW(sw StreamWriter) { r.sw = sw }
 
 // EnsureStreamWriter returns a StreamWriter for the current response, creating

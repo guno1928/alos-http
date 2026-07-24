@@ -123,16 +123,16 @@ var timeNow = time.Now
 //	Example: Listeners: 16.
 //	Example: Listeners: 0 uses one event-loop per CPU thread.
 //
-// MinPrealloc sets a floor of preallocated (and page-faulted) connection
-// objects kept hot across all epoll workers, ready to accept traffic instantly.
-// The pool prewarms this many, grows on demand in PreallocBatch-sized steps, and
-// shrinks fully-idle batches under low load but never below this floor. 0 disables
-// connection prewarming (grow/shrink on demand from empty). This is the knob for
-// "keep N connections ready"; it does NOT bound memory under load — use MaxConns
+// MinPrealloc is the number of connection objects kept preallocated (and
+// page-faulted) and ready to accept traffic instantly across all epoll
+// workers; the minimum is 15000. The pool prewarms this many, grows on
+// demand in PreallocBatch-sized steps, and shrinks fully-idle batches under
+// low load but never below the floor. This is the knob for "keep N
+// connections ready"; it does NOT bound memory under load — use MaxConns
 // for that.
 //
-//	Example: MinPrealloc: 2000 keeps 2000 connections ready to go.
-//	Example: MinPrealloc: 0 preallocates nothing.
+//	Example: MinPrealloc: 20000 keeps 20000 connections ready to go.
+//	Example: MinPrealloc: 0 uses the 15000 minimum.
 //
 // PreallocBatch is the number of slots added (or reclaimed) per pool growth step
 // — the slab size. 0 defaults to 128.
@@ -253,10 +253,13 @@ type Config struct {
 	ProxyEpoll bool
 }
 
+const minPreallocFloor = 15_000
+
 // DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
 func DefaultConfig() Config {
 	return Config{
 		Addr:              ":8443",
+		MinPrealloc:       minPreallocFloor,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -304,9 +307,6 @@ func resolveReadCap(v int64) int {
 	}
 }
 
-// effectiveReadCap is the per-connection read-buffer ceiling. It grows the base
-// read cap so a body up to MaxBodySize can be buffered and cleanly rejected with
-// 413 rather than being silently dropped by a smaller read cap.
 func (s *Server) effectiveReadCap() int {
 	rc := resolveReadCap(s.config.MaxReadSize)
 	if s.config.MaxReadSize == 0 && s.config.MaxBodySize > 0 {
@@ -646,6 +646,9 @@ func New(configs ...Config) *Server {
 	if cfg.Listeners <= 0 {
 		cfg.Listeners = autoListenerCount()
 	}
+	if cfg.MinPrealloc < minPreallocFloor {
+		cfg.MinPrealloc = minPreallocFloor
+	}
 
 	s := &Server{
 		config:    cfg,
@@ -765,9 +768,6 @@ func (s *Server) IsDebug() bool {
 	return s.debug.Load()
 }
 
-// ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack: it loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
-//
-// Example: log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ensureRouterInit() {
 	s.routerInitOnce.Do(func() {
 		s.Router.Build()
@@ -790,6 +790,9 @@ func (s *Server) ensureStartInit() error {
 	return nil
 }
 
+// ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack: it loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
+//
+// Example: log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ListenAndServeTLS() error {
 	s.logCapabilities()
 	maybeRaiseProcessFileLimit()
@@ -851,6 +854,8 @@ func (s *Server) ListenAndServeTLS() error {
 	return s.ListenAndServeEpollTLS(s.config.Addr)
 }
 
+// Capabilities reports the runtime capabilities detected at startup, such as
+// CPU AES-NI support, kernel TLS (kTLS) availability, and NIC offload.
 func (s *Server) Capabilities() Capabilities { return s.caps }
 
 func (s *Server) logCapabilities() {
@@ -1138,6 +1143,12 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
+// NewH2StreamWriter returns a pooled H2StreamWriter initialized for the given
+// HTTP/2 stream: it wires up the stream ID, the connection's write channel
+// and flow-control windows, and the server's configured bandwidth limiter
+// and Server header.
+//
+// Example: w := s.NewH2StreamWriter(streamID, hc, &streamWindow)
 func (s *Server) NewH2StreamWriter(streamID uint32, hc *H2Conn, streamWindow *atomic.Int64) *H2StreamWriter {
 	w := H2StreamWriterPool.Get().(*H2StreamWriter)
 	w.streamID = streamID
@@ -1158,6 +1169,11 @@ func (s *Server) NewH2StreamWriter(streamID uint32, hc *H2Conn, streamWindow *at
 	return w
 }
 
+// NewH1StreamWriter returns a pooled H1StreamWriter initialized for the given
+// TLS connection and AEAD writer, wired to the server's configured
+// bandwidth limiter and Server header.
+//
+// Example: w := s.NewH1StreamWriter(conn, aeadWriter)
 func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1StreamWriter {
 	w := H1StreamWriterPool.Get().(*H1StreamWriter)
 	w.conn = conn
@@ -1175,6 +1191,11 @@ func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1Stream
 	return w
 }
 
+// NewPlainH1StreamWriter returns a pooled PlainH1StreamWriter initialized for
+// the given plain (non-TLS) connection, wired to the server's configured
+// bandwidth limiter and Server header.
+//
+// Example: w := s.NewPlainH1StreamWriter(conn)
 func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	w := PlainH1StreamWriterPool.Get().(*PlainH1StreamWriter)
 	w.conn = conn

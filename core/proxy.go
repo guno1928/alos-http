@@ -22,10 +22,15 @@ import (
 type LoadBalancerType uint8
 
 const (
+	// LBRoundRobin cycles through backends in order.
 	LBRoundRobin LoadBalancerType = iota
+	// LBWeightedRR is round-robin weighted by BackendConfig.Weight.
 	LBWeightedRR
+	// LBLeastConn sends to the backend with the fewest active connections.
 	LBLeastConn
+	// LBIPHash hashes the client IP to a consistent backend.
 	LBIPHash
+	// LBRandom picks a random healthy backend.
 	LBRandom
 )
 
@@ -531,6 +536,7 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 	log.Printf("[PROXY] domain %s removed", domain)
 }
 
+// Lookup returns the domainState registered for host, or nil if host has no matching domain.
 func (pe *ProxyEngine) Lookup(host string) *domainState {
 	ds, ok := pe.domains.Load(normalizeCertDomain(host))
 	if !ok {

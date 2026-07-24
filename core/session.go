@@ -153,6 +153,7 @@ func NewMemorySessionStore() *MemorySessionStore {
 	}
 }
 
+// Get returns a copy of the stored session data for id, and whether it was found.
 func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 	v, ok := s.entries.Load(id)
 	if !ok {
@@ -165,6 +166,7 @@ func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 	return cp, true
 }
 
+// Save stores a copy of data under id, expiring it after maxAge seconds (no expiry when maxAge <= 0).
 func (s *MemorySessionStore) Save(id string, data map[string]any, maxAge int) {
 	cp := make(map[string]any, len(data))
 	for k, v := range data {
@@ -178,6 +180,7 @@ func (s *MemorySessionStore) Save(id string, data map[string]any, maxAge int) {
 	}
 }
 
+// Delete removes the stored session data for id.
 func (s *MemorySessionStore) Delete(id string) {
 	s.entries.Delete(id)
 }

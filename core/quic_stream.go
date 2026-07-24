@@ -29,6 +29,8 @@ func quicStreamIsBidi(id uint64) bool {
 	return id&0x02 == 0
 }
 
+// QUICStream is a single stream on a QUIC connection, providing buffered
+// reads of incoming data and buffered writes of outgoing data.
 type QUICStream struct {
 	id          uint64
 	conn        *QUICConn
@@ -159,6 +161,9 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 	}
 }
 
+// Read copies received stream data into p, blocking until data arrives,
+// the stream is closed, or the peer has finished sending, in which case
+// it returns io.EOF.
 func (s *QUICStream) Read(p []byte) (int, error) {
 	for {
 		s.mu.Lock()
@@ -190,6 +195,8 @@ func (s *QUICStream) Read(p []byte) (int, error) {
 	}
 }
 
+// ReadAll blocks until the peer finishes sending or the stream is closed,
+// then returns all data received so far.
 func (s *QUICStream) ReadAll() ([]byte, error) {
 	for {
 		s.mu.Lock()
@@ -208,6 +215,9 @@ func (s *QUICStream) ReadAll() ([]byte, error) {
 	}
 }
 
+// Write appends data to the stream's outgoing buffer for later
+// transmission. It returns ErrStreamClosed if the stream has already
+// been closed or its send side finished.
 func (s *QUICStream) Write(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -234,12 +244,16 @@ func (s *QUICStream) sendBufDrained() bool {
 	return empty
 }
 
+// FinishWrite marks the stream's send side as finished, so the outgoing
+// buffer is sent with a FIN once fully drained.
 func (s *QUICStream) FinishWrite() {
 	s.mu.Lock()
 	s.sendFin = true
 	s.mu.Unlock()
 }
 
+// Close marks both the receive and send sides of the stream as closed
+// and wakes any goroutine blocked in Read or ReadAll.
 func (s *QUICStream) Close() {
 	s.mu.Lock()
 	s.recvClosed = true

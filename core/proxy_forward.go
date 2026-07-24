@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// Handle serves req against the proxy domain matching req.Host: it returns a cached response when available, otherwise forwards the request to a healthy backend with retries, writing the result into resp. It reports false only when req.Host has no registered proxy domain, leaving resp untouched.
 func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 	host := stripPort(req.Host)
 	ds := pe.Lookup(host)

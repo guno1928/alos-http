@@ -26,6 +26,9 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// CipherSuiteConfig describes a supported TLS 1.3 cipher suite: its wire ID, key/IV/hash
+// sizes, and AEAD constructor, plus precomputed internal HKDF state. Obtain one via
+// NegotiateSuite or FindSuiteByID rather than constructing it directly.
 type CipherSuiteConfig struct {
 	ID       uint16
 	KeyLen   int
@@ -49,6 +52,10 @@ type CipherSuiteConfig struct {
 	labelServerAppTraffic hkdfLabelTemplate
 }
 
+// SupportedSuites lists, in negotiation-preference order, the TLS 1.3 cipher suites
+// this server supports: a private AEGIS-128L suite (ID 0x1306), followed by the
+// standard suites TLS_AES_128_GCM_SHA256 (0x1301), TLS_AES_256_GCM_SHA384 (0x1302),
+// and TLS_CHACHA20_POLY1305_SHA256 (0x1303).
 var SupportedSuites = [4]CipherSuiteConfig{
 	{
 		ID: 0x1306, KeyLen: 16, IVLen: 16,
@@ -88,6 +95,8 @@ var SupportedSuites = [4]CipherSuiteConfig{
 	},
 }
 
+// NegotiateSuite returns the first entry in SupportedSuites, in server preference
+// order, whose ID appears in clientIDs, or nil if none match.
 func NegotiateSuite(clientIDs []uint16) *CipherSuiteConfig {
 	for i := range SupportedSuites {
 		for _, cid := range clientIDs {
@@ -99,6 +108,7 @@ func NegotiateSuite(clientIDs []uint16) *CipherSuiteConfig {
 	return nil
 }
 
+// FindSuiteByID returns the SupportedSuites entry with the given wire ID, or nil if none match.
 func FindSuiteByID(id uint16) *CipherSuiteConfig {
 	for i := range SupportedSuites {
 		if SupportedSuites[i].ID == id {
@@ -108,6 +118,9 @@ func FindSuiteByID(id uint16) *CipherSuiteConfig {
 	return nil
 }
 
+// TrafficAEAD wraps a TLS 1.3 traffic secret's AEAD cipher, encrypting and decrypting
+// records with a per-record nonce derived from a fixed IV XORed with an incrementing
+// sequence number.
 type TrafficAEAD struct {
 	aead      cipher.AEAD
 	iv        [16]byte
@@ -133,6 +146,9 @@ var trafficAEADScratchPool = sync.Pool{
 	},
 }
 
+// NewTrafficAEAD derives the traffic key and IV from secret using cs's HKDF label
+// templates and constructs a TrafficAEAD ready to encrypt or decrypt records under
+// cs's AEAD algorithm.
 func NewTrafficAEAD(_ func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*TrafficAEAD, error) {
 	var keyBuf [64]byte
 	var ivBuf [64]byte
@@ -157,10 +173,13 @@ func (t *TrafficAEAD) prepareRecord(sp *trafficAEADScratch, recordLen uint16) {
 	sp.ad[4] = byte(recordLen)
 }
 
+// Overhead returns the number of extra bytes the AEAD adds to each record (the authentication tag length).
 func (t *TrafficAEAD) Overhead() int {
 	return t.oh
 }
 
+// Encrypt seals plaintext in place, reusing its backing array, with the next record
+// nonce, returns the ciphertext, and advances the internal sequence number.
 func (t *TrafficAEAD) Encrypt(plaintext []byte) []byte {
 	ciphertextLen := len(plaintext) + t.oh
 	if ciphertextLen > 0xFFFF {
@@ -175,6 +194,9 @@ func (t *TrafficAEAD) Encrypt(plaintext []byte) []byte {
 	return ct
 }
 
+// EncryptAppend seals plaintext with the next record nonce and appends the
+// ciphertext to dst, returning the extended slice and advancing the internal
+// sequence number.
 func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 	ciphertextLen := len(plaintext) + t.oh
 	if ciphertextLen > 0xFFFF {
@@ -189,6 +211,8 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 	return dst
 }
 
+// Decrypt opens ciphertext in place, reusing its backing array, using the next
+// record nonce, returning the plaintext and advancing the internal sequence number on success.
 func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	recordLen := uint16(len(ciphertext))
 	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
@@ -203,6 +227,9 @@ func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	return pt, nil
 }
 
+// GenerateSelfSignedForDomain creates a self-signed ECDSA P-256 certificate valid for
+// 365 days for domain, used as a DNS SAN, or as an IP SAN if domain parses as an IP
+// address, and returns the DER-encoded certificate and its private key.
 func GenerateSelfSignedForDomain(domain string) ([]byte, *ecdsa.PrivateKey, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -233,6 +260,8 @@ func GenerateSelfSignedForDomain(domain string) ([]byte, *ecdsa.PrivateKey, erro
 	return der, priv, nil
 }
 
+// GenerateCert creates a self-signed ECDSA P-256 certificate valid for 365 days for
+// "localhost" and 127.0.0.1, and returns the DER-encoded certificate and its private key.
 func GenerateCert() ([]byte, *ecdsa.PrivateKey, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -279,6 +308,10 @@ func parsePrivateKey(der []byte) (crypto.Signer, error) {
 	return nil, errors.New("unsupported private key format")
 }
 
+// LoadOrGenerateCert loads a certificate/key pair from certFile and keyFile
+// (defaulting to ".alos-cert.pem" / ".alos-key.pem" when empty), generating and
+// saving a new self-signed certificate via GenerateCert if none exists, is invalid,
+// or has expired.
 func LoadOrGenerateCert(certFile, keyFile string) ([]byte, crypto.Signer, error) {
 	if certFile == "" {
 		certFile = defaultCertFile

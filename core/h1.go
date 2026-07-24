@@ -77,6 +77,10 @@ func ctPrefixLookup(ct string) []byte {
 	return nil
 }
 
+// BuildH1Response serializes resp into a complete HTTP/1.1 response (status
+// line, headers, and body) using a buffer drawn from LargeBufPool. It
+// returns the built bytes along with the pool slot backing them; the caller
+// is responsible for resetting and returning the slot to LargeBufPool.
 func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
@@ -116,6 +120,11 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	return buf, bp
 }
 
+// WriteH1Response encrypts and writes resp to conn as an HTTP/1.1 response
+// over the given TLS record writer. Responses small enough to fit in a
+// single TLS record are assembled and encrypted directly for minimal
+// overhead; larger responses fall back to BuildH1Response followed by
+// WriteAppData.
 func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	const maxInner = MaxRecordPayload - 1
 	body := resp.transmittedBodyBytes()

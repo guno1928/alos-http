@@ -11,12 +11,15 @@ import (
 	"hash"
 )
 
+// TLSExtract performs the TLS 1.3 HKDF-Extract step (HMAC(salt, ikm)) and returns a newly allocated result.
 func TLSExtract(h func() hash.Hash, salt, ikm []byte) []byte {
 	return TLSExtractTo(h, salt, ikm, nil)
 }
 
 var hkdfExpandOneByte = [1]byte{0x01}
 
+// TLSExpandLabel performs the TLS 1.3 HKDF-Expand-Label step, deriving length bytes
+// from secret using label and ctx, and returns a newly allocated result.
 func TLSExpandLabel(h func() hash.Hash, secret []byte, label string, ctx []byte, length int) []byte {
 	const prefix = "tls13 "
 	fullLen := len(prefix) + len(label)
@@ -42,15 +45,21 @@ func TLSExpandLabel(h func() hash.Hash, secret []byte, label string, ctx []byte,
 	return mac.Sum(nil)[:length]
 }
 
+// TLSDeriveSecret derives a TLS 1.3 secret of hashLen bytes from secret using label
+// and transcriptHash as the HKDF-Expand-Label context.
 func TLSDeriveSecret(h func() hash.Hash, hashLen int, secret []byte, label string, transcriptHash []byte) []byte {
 	return TLSExpandLabel(h, secret, label, transcriptHash, hashLen)
 }
 
+// EmptyTranscriptHash returns the hash of an empty input using h, as used for the
+// TLS 1.3 transcript hash before any handshake messages have been processed.
 func EmptyTranscriptHash(h func() hash.Hash) []byte {
 	d := h()
 	return d.Sum(nil)
 }
 
+// HSWrap wraps body in a TLS handshake message header (1-byte type, 3-byte length)
+// of the given msgType and returns the framed message.
 func HSWrap(msgType byte, body []byte) []byte {
 	out := make([]byte, 4+len(body))
 	out[0] = msgType
@@ -61,6 +70,9 @@ func HSWrap(msgType byte, body []byte) []byte {
 	return out
 }
 
+// BuildServerHello constructs a framed TLS 1.3 ServerHello handshake message
+// carrying random, sessionID, the negotiated suiteID, and pubKey in a
+// supported_versions and X25519 key_share extension.
 func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) []byte {
 	const versionExtLen = 6
 	const keyShareEntryHeaderLen = 4
@@ -118,6 +130,7 @@ func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) [
 	return out
 }
 
+// BuildALPNExtension constructs a TLS ALPN extension (type 0x0010) advertising the single protocol proto.
 func BuildALPNExtension(proto string) []byte {
 	protoLen := len(proto)
 	listLen := 1 + protoLen
@@ -134,6 +147,8 @@ func BuildALPNExtension(proto string) []byte {
 	return out
 }
 
+// BuildEncryptedExtensions constructs a framed TLS 1.3 EncryptedExtensions handshake
+// message, including an ALPN extension for alpn when it is non-empty.
 func BuildEncryptedExtensions(alpn string) []byte {
 	if alpn == "" {
 		return HSWrap(0x08, []byte{0x00, 0x00})
@@ -147,6 +162,8 @@ func BuildEncryptedExtensions(alpn string) []byte {
 	return HSWrap(0x08, body)
 }
 
+// BuildCertificate constructs a framed TLS 1.3 Certificate handshake message from
+// chain, a list of DER-encoded certificates, with an empty extensions block for each entry.
 func BuildCertificate(chain [][]byte) []byte {
 	var entriesLen int
 	for _, certDER := range chain {
@@ -176,10 +193,13 @@ func BuildCertificate(chain [][]byte) []byte {
 	return out
 }
 
+// BuildCertificateVerify constructs a framed TLS 1.3 CertificateVerify handshake
+// message carrying the given signature scheme and signature.
 func BuildCertificateVerify(scheme uint16, sig []byte) []byte {
 	return appendCertificateVerify(nil, scheme, sig)
 }
 
+// BuildFinished constructs a framed TLS Finished handshake message carrying verifyData.
 func BuildFinished(verifyData []byte) []byte {
 	return appendFinished(nil, verifyData)
 }
@@ -208,6 +228,10 @@ var cvPrefix = func() [64]byte {
 
 var cvContext = []byte("TLS 1.3, server CertificateVerify")
 
+// SignCertificateVerify signs transcriptHash for a TLS 1.3 server CertificateVerify
+// message using signer, returning the negotiated signature scheme (ECDSA P-256/SHA-256
+// for an *ecdsa.PrivateKey, or RSA-PSS/SHA-256 for an *rsa.PrivateKey) and the
+// signature. It returns an error if signer is neither key type.
 func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte) (uint16, []byte, error) {
 	content := make([]byte, 64+len(cvContext)+1+len(transcriptHash))
 	copy(content, cvPrefix[:])
@@ -234,6 +258,8 @@ func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte) (uint16,
 	}
 }
 
+// ComputeFinished computes a TLS 1.3 Finished message MAC over transcriptHash,
+// deriving the finished key from baseSecret via TLSExpandLabel.
 func ComputeFinished(h func() hash.Hash, hashLen int, baseSecret, transcriptHash []byte) []byte {
 	finishedKey := TLSExpandLabel(h, baseSecret, "finished", nil, hashLen)
 	mac := hmac.New(h, finishedKey)
@@ -241,6 +267,9 @@ func ComputeFinished(h func() hash.Hash, hashLen int, baseSecret, transcriptHash
 	return mac.Sum(nil)
 }
 
+// ParsedClientHello holds the fields extracted from a parsed TLS ClientHello by
+// ParseClientHello. Reuse an instance across parses via Reset to avoid reallocating
+// its internal scratch buffers.
 type ParsedClientHello struct {
 	SessionID         []byte
 	CipherSuites      []uint16
@@ -267,6 +296,7 @@ type ParsedClientHello struct {
 	alpnProtosOverflow    []string
 }
 
+// SupportsTLS13 reports whether the client advertised TLS 1.3 (0x0304) in its supported_versions extension.
 func (ch *ParsedClientHello) SupportsTLS13() bool {
 	for _, v := range ch.SupportedVersions {
 		if v == 0x0304 {
@@ -276,6 +306,8 @@ func (ch *ParsedClientHello) SupportsTLS13() bool {
 	return false
 }
 
+// Reset clears ch so it can be reused for parsing another ClientHello, without
+// releasing its internal scratch buffers.
 func (ch *ParsedClientHello) Reset() {
 	ch.SessionID = nil
 	ch.CipherSuites = nil
@@ -324,6 +356,9 @@ func (ch *ParsedClientHello) alpnDst(count int) []string {
 	return ch.alpnProtosOverflow[:count]
 }
 
+// ParseClientHello parses a TLS handshake ClientHello message from data into result,
+// which is cleared first via result.Reset. It returns an error if the message is
+// truncated, malformed, or not a ClientHello.
 func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	if len(data) < 6 || data[0] != 0x01 {
 		return ErrNotClientHello
@@ -579,6 +614,8 @@ func findX25519KeyShare(ch *ParsedClientHello, data []byte) []byte {
 	return nil
 }
 
+// NegotiateALPN returns "h2" if allowH2 is true and clientProtos contains it,
+// otherwise "http/1.1" if clientProtos contains it, otherwise an empty string.
 func NegotiateALPN(clientProtos []string, allowH2 bool) string {
 	if allowH2 {
 		for _, p := range clientProtos {

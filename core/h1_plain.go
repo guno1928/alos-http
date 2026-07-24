@@ -197,6 +197,12 @@ func findCRLFBytes(buf []byte, start int) int {
 	return start + idx
 }
 
+// ParseH1RequestHead parses the HTTP/1.x request line and header block in
+// data into req. It returns the length of the parsed header block, the
+// Content-Length value (if any consistent value was present), whether the
+// connection should close, whether Transfer-Encoding was malformed or
+// chunked, whether the header block exceeded maxHeaderBytes or
+// maxHeaderCount, and whether a complete head was found.
 func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCount int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, tooLarge bool, ok bool) {
 	maxBytes := maxHeaderBytes
 	if maxBytes <= 0 {
@@ -420,6 +426,8 @@ func findRequestEndFrom(data []byte, start int) int {
 	return start + idx + 4
 }
 
+// ServeH2Plain serves an HTTP/2 connection over conn without TLS, running the
+// H2Conn read and write loops until the connection closes.
 func (s *Server) ServeH2Plain(conn net.Conn) {
 	hc := &H2Conn{
 		remoteAddr:        conn.RemoteAddr().String(),

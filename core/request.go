@@ -135,6 +135,8 @@ const (
 	headerCacheWSVersion
 )
 
+// Reset clears the request to its zero state, including headers, body,
+// params, and cached lookups, so it can be reused from a connection pool.
 func (r *Request) Reset() {
 	r.Method = ""
 	r.Path = ""

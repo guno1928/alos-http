@@ -4,6 +4,9 @@ import (
 	"log"
 )
 
+// H3Conn represents an HTTP/3 connection layered on a QUICConn. It manages
+// the control and QPACK streams and dispatches incoming request streams to
+// the server's handlers.
 type H3Conn struct {
 	qconn      *QUICConn
 	server     *Server

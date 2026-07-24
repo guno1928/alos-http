@@ -10,23 +10,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// FastProxyServer is a running FastProxy server returned by ListenAndFastProxy.
 type FastProxyServer struct {
 	client *fpClient
 	routes *routeTable
 }
 
+// FastBackend describes a single upstream server used by ListenAndFastProxy.
 type FastBackend struct {
-	Addr       string
-	TLS        bool
-	H2         bool
-	SkipVerify bool
-	Weight     int
+	Addr       string // Addr is the backend address as host:port, or a bare host defaulting to port 80 or 443 depending on TLS.
+	TLS        bool   // TLS connects to the backend over HTTPS.
+	H2         bool   // H2 forces the backend connection to use HTTP/2.
+	SkipVerify bool   // SkipVerify disables TLS certificate verification for this backend.
+	Weight     int    // Weight controls this backend's share of traffic under LBWeightedRR; values <= 0 default to 1.
 }
 
+// FastRoute maps a host to the group of backends that serve it.
 type FastRoute struct {
-	Host     string
-	Backends []FastBackend
-	LB       LoadBalancerType
+	Host     string        // Host is the request host this route matches.
+	Backends []FastBackend // Backends are the upstream servers for this route.
+	LB       LoadBalancerType // LB selects the load balancing strategy across Backends.
 }
 
 type fpBackend struct {
@@ -223,6 +226,11 @@ func buildGroup(bes []FastBackend, lb LoadBalancerType) (*backendGroup, error) {
 	return g, nil
 }
 
+// ListenAndFastProxy starts a FastProxy reverse proxy listening on listenAddr and
+// routing requests to routes by host. fallback backends serve any host that
+// matches no route; if fallback is empty and routes contains exactly one
+// entry, that route's backends are also used as the fallback. It runs the
+// given number of event loops and returns the running server.
 func ListenAndFastProxy(listenAddr string, routes []FastRoute, fallback []FastBackend, loops int) (*FastProxyServer, error) {
 	rt := &routeTable{hosts: make(map[string]*backendGroup)}
 	for _, r := range routes {

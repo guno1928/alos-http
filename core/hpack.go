@@ -6,6 +6,8 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
+// HpackStaticTable is the HPACK static table defined by RFC 7541 section
+// 2.3.1. Entries are indexed 1-61; index 0 is unused.
 var HpackStaticTable = [62][2]string{
 	{},
 	{":authority", ""},
@@ -71,14 +73,21 @@ var HpackStaticTable = [62][2]string{
 	{"www-authenticate", ""},
 }
 
+// HpackEncoder incrementally encodes HTTP/2 header fields into HPACK-encoded
+// bytes appended to Buf.
 type HpackEncoder struct {
 	Buf []byte
 }
 
+// Reset replaces the encoder's output buffer with dst, discarding any
+// previously encoded bytes.
 func (e *HpackEncoder) Reset(dst []byte) {
 	e.Buf = dst
 }
 
+// EncodeInt appends val to the buffer as an HPACK-encoded integer using an
+// N-bit prefix, where prefixBits is N and prefix supplies the leading flag
+// bits of the first byte, per RFC 7541 section 5.1.
 func (e *HpackEncoder) EncodeInt(prefix byte, prefixBits uint8, val uint64) {
 	maxFirst := uint64((1 << prefixBits) - 1)
 	if val < maxFirst {
@@ -133,6 +142,8 @@ func hpackHuffmanAppend(dst []byte, s string) []byte {
 	return dst
 }
 
+// EncodeString appends s to the buffer as an HPACK string literal, using
+// Huffman encoding when it produces a shorter representation than raw bytes.
 func (e *HpackEncoder) EncodeString(s string) {
 	huffLen := hpackHuffmanEncodedLen(s)
 	if huffLen < len(s) {
@@ -144,6 +155,10 @@ func (e *HpackEncoder) EncodeString(s string) {
 	}
 }
 
+// EncodeHeader appends name and value as an HPACK literal header field
+// without indexing, referencing the static table by index when the
+// lowercased name matches a known entry and encoding both name and value
+// literally otherwise.
 func (e *HpackEncoder) EncodeHeader(name, value string) {
 	name = ToLowerASCII(name)
 	idx := hpackFindStaticName(name)
@@ -157,6 +172,9 @@ func (e *HpackEncoder) EncodeHeader(name, value string) {
 	}
 }
 
+// EncodeHeaderFold behaves like EncodeHeader but matches name against the
+// static table case-insensitively without allocating a lowercase copy,
+// lowercasing name only while writing it when no static entry matches.
 func (e *HpackEncoder) EncodeHeaderFold(name, value string) {
 	idx := hpackFindStaticNameFold(name)
 	if idx > 0 {
@@ -390,10 +408,16 @@ func (e *HpackEncoder) encodeStringLower(s string) {
 	}
 }
 
+// EncodeIndexed appends idx to the buffer as a fully indexed HPACK header
+// field, referencing an entry already present in the static or dynamic
+// table.
 func (e *HpackEncoder) EncodeIndexed(idx uint64) {
 	e.EncodeInt(0x80, 7, idx)
 }
 
+// EncodeStatus appends code to the buffer as an HPACK-encoded :status
+// pseudo-header, using an indexed static-table entry for the common status
+// codes and a literal encoding otherwise.
 func (e *HpackEncoder) EncodeStatus(code int) {
 	switch code {
 	case 200:
@@ -530,6 +554,9 @@ func (e *hpackHuffmanDecodeCacheEntry) store(hash uint64, data []byte, value str
 	copy(e.heap, data)
 }
 
+// HpackDecoder decodes HPACK-encoded HTTP/2 header blocks, maintaining the
+// dynamic table, Huffman decode cache, and request memoization state needed
+// to interpret subsequent blocks on the same connection.
 type HpackDecoder struct {
 	maxTableSize     int
 	protocolMaxSize  int
@@ -546,6 +573,8 @@ type HpackDecoder struct {
 	memoRoot         bool
 }
 
+// NewHpackDecoder returns an HpackDecoder initialized with the connection's
+// default HPACK table size.
 func NewHpackDecoder() *HpackDecoder {
 	return &HpackDecoder{
 		maxTableSize:    H2HeaderTableSize,
@@ -673,10 +702,18 @@ func (d *HpackDecoder) setMaxSize(maxSize int) {
 	}
 }
 
+// Decode decodes the HPACK header block in data into a newly allocated
+// headers slice; it is a convenience wrapper around DecodeInto.
 func (d *HpackDecoder) Decode(data []byte) ([][2]string, error) {
 	return d.DecodeInto(nil, data)
 }
 
+// DecodeInto decodes the HPACK header block in data, appending each
+// name/value pair to headers (reusing its backing array when possible), and
+// updates the decoder's dynamic table. It returns ErrH2BadHeader for
+// malformed input, ErrTooManyHeaders if the block contains more than 128
+// headers, or ErrHpackTableSizeExceeded if a dynamic table size update
+// exceeds the protocol maximum.
 func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string, error) {
 	const maxHeaders = 128
 	if headers == nil {
@@ -774,6 +811,10 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 	return headers, nil
 }
 
+// DecodeIntoRequest decodes the HPACK header block in data like DecodeInto,
+// additionally validating it as an HTTP/2 request and accumulating request
+// metadata (method, path, scheme, authority) as each header is observed. It
+// takes a fast path for the common GET-path-over-HTTPS request shape.
 func (d *HpackDecoder) DecodeIntoRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, error) {
 	const maxHeaders = 128
 	var meta hpackRequestMeta
@@ -1092,6 +1133,10 @@ func (d *HpackDecoder) decodeStringSelective(data []byte, want bool) (string, in
 	return str, n, nil
 }
 
+// DecodeRequestMeta decodes the HPACK header block in data, validating it as
+// an HTTP/2 request and returning only the accumulated request metadata,
+// skipping full decoding of regular (non-pseudo) header values it does not
+// need.
 func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) {
 	const maxHeaders = 128
 	var meta hpackRequestMeta
@@ -1197,6 +1242,11 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 	return meta, nil
 }
 
+// DecodeFastRootRequest decodes the HPACK header block in data and reports
+// whether it represents a GET request for the root path. It reuses the
+// memoized result of the previous call when data is byte-identical to it,
+// and otherwise restores the decoder's dynamic table to its prior state
+// whenever the block does not target the root path.
 func (d *HpackDecoder) DecodeFastRootRequest(data []byte) (hpackRequestMeta, bool, error) {
 	if d.memoValid && bytes.Equal(data, d.memoBlock) {
 		return d.memoMeta, d.memoRoot, nil
@@ -1237,6 +1287,9 @@ func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot boo
 	d.memoValid = true
 }
 
+// HpackDecodeInt decodes an HPACK integer with the given prefix width from
+// the start of data, returning the decoded value and the number of bytes
+// consumed, or (0, 0) if data is truncated or the integer is malformed.
 func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	if len(data) == 0 {
 		return 0, 0
@@ -1263,6 +1316,9 @@ func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	return 0, 0
 }
 
+// HpackDecodeString decodes an HPACK string literal (Huffman-encoded or raw)
+// from the start of data, returning the decoded string and the number of
+// bytes consumed, or ("", 0) on malformed input.
 func HpackDecodeString(data []byte) (string, int) {
 	if len(data) == 0 {
 		return "", 0

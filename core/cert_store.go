@@ -26,19 +26,30 @@ const (
 	CertACME
 )
 
-// CertConfig specifies a TLS certificate to load for a domain. Used with manual
-// certificate management instead of ACME.
+// CertConfig specifies a TLS certificate to load for a domain, passed via
+// Config.Certs.
 //
-//	cfg := core.Config{
-//	    Certs: []core.CertConfig{
-//	        {
-//	            Domain:   "example.com",
-//	            CertFile: "/etc/ssl/example.com.pem",
-//	            KeyFile:  "/etc/ssl/example.com-key.pem",
-//	            Source:   core.CertManual,
-//	        },
-//	    },
-//	}
+// Domain is the SNI hostname the certificate serves.
+//
+//	Example: Domain: "example.com".
+//
+// CertFile is the path to a PEM-encoded certificate (or chain); used when
+// Source is CertManual.
+//
+//	Example: CertFile: "/etc/ssl/example.com.pem".
+//
+// KeyFile is the path to the PEM-encoded private key matching CertFile; used
+// when Source is CertManual.
+//
+//	Example: KeyFile: "/etc/ssl/example.com-key.pem".
+//
+// Source selects how the certificate is obtained: CertManual reads CertFile
+// and KeyFile, CertSelfSigned generates a self-signed certificate for Domain
+// (CertFile and KeyFile are ignored), and CertACME provisions the certificate
+// through ACME.
+//
+//	Example: Source: core.CertManual.
+//	Example: Source: core.CertSelfSigned.
 type CertConfig struct {
 	Domain   string
 	CertFile string
@@ -46,6 +57,9 @@ type CertConfig struct {
 	Source   CertSource
 }
 
+// CertEntry holds a loaded TLS certificate and its private key, along with
+// pre-serialized TLS 1.3 handshake messages cached per ALPN protocol. Build
+// one with NewCertEntryFromPEM or NewCertEntryFromDER.
 type CertEntry struct {
 	Domain   string
 	ChainDER [][]byte
@@ -70,12 +84,16 @@ type CertInfo struct {
 	Source CertSource
 }
 
+// CertStore is a concurrent registry of CertEntry values keyed by domain,
+// used to resolve the certificate for a TLS ClientHello via SNI. Create one
+// with NewCertStore.
 type CertStore struct {
 	certs    *alosmap.TypedMap[string, *CertEntry]
 	defEntry atomic.Pointer[CertEntry]
 	mu       sync.Mutex
 }
 
+// NewCertStore returns an empty CertStore.
 func NewCertStore() *CertStore {
 	cs := &CertStore{
 		certs: alosmap.NewTypedSized[string, *CertEntry](32, 0).Prealloc(256),
@@ -89,6 +107,12 @@ func normalizeCertDomain(domain string) string {
 	return strings.ToLower(domain)
 }
 
+// Lookup returns the CertEntry registered for serverName (case-insensitively,
+// with any trailing dot trimmed), falling back to the store's default entry
+// when serverName is empty or unregistered. It returns nil if the store has
+// no entries at all.
+//
+// Example: entry := certStore.Lookup(hello.ServerName)
 func (cs *CertStore) Lookup(serverName string) *CertEntry {
 	serverName = normalizeCertDomain(serverName)
 	if serverName != "" {
@@ -115,6 +139,11 @@ func (entry *CertEntry) initCachedHandshake() {
 	}
 }
 
+// CachedEE returns the pre-serialized TLS 1.3 EncryptedExtensions message for
+// the negotiated ALPN protocol ("h2" or "http/1.1"), or the ALPN-less variant
+// for any other value.
+//
+// Example: ee := entry.CachedEE("h2")
 func (entry *CertEntry) CachedEE(alpn string) []byte {
 	switch alpn {
 	case "h2":
@@ -126,6 +155,11 @@ func (entry *CertEntry) CachedEE(alpn string) []byte {
 	}
 }
 
+// CachedEECert returns the pre-serialized EncryptedExtensions and Certificate
+// messages concatenated for the negotiated ALPN protocol ("h2" or
+// "http/1.1"), or the ALPN-less variant for any other value.
+//
+// Example: eeCert := entry.CachedEECert("http/1.1")
 func (entry *CertEntry) CachedEECert(alpn string) []byte {
 	switch alpn {
 	case "h2":
@@ -137,6 +171,11 @@ func (entry *CertEntry) CachedEECert(alpn string) []byte {
 	}
 }
 
+// AddCert registers entry under its (normalized) Domain, precomputing its
+// cached TLS handshake messages, and makes it the store's default
+// certificate if none is set yet.
+//
+// Example: certStore.AddCert(entry)
 func (cs *CertStore) AddCert(entry *CertEntry) {
 	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
@@ -146,6 +185,11 @@ func (cs *CertStore) AddCert(entry *CertEntry) {
 	}
 }
 
+// RemoveCert removes the certificate registered for domain; if it was the
+// store's default, an arbitrary remaining certificate (if any) becomes the
+// new default.
+//
+// Example: certStore.RemoveCert("old.example.com")
 func (cs *CertStore) RemoveCert(domain string) {
 	domain = normalizeCertDomain(domain)
 	cs.mu.Lock()
@@ -160,6 +204,11 @@ func (cs *CertStore) RemoveCert(domain string) {
 	cs.mu.Unlock()
 }
 
+// SetDefault makes the certificate registered for domain the store's default
+// entry, used when a ClientHello's SNI has no exact match. It is a no-op if
+// domain is not registered.
+//
+// Example: certStore.SetDefault("example.com")
 func (cs *CertStore) SetDefault(domain string) {
 	domain = normalizeCertDomain(domain)
 	v, ok := cs.certs.Load(domain)
@@ -169,6 +218,8 @@ func (cs *CertStore) SetDefault(domain string) {
 	cs.defEntry.Store(v)
 }
 
+// ListCerts returns a snapshot of every registered certificate's domain and
+// source.
 func (cs *CertStore) ListCerts() []CertInfo {
 	var out []CertInfo
 	cs.certs.Range(func(_ string, e *CertEntry) bool {
@@ -178,6 +229,12 @@ func (cs *CertStore) ListCerts() []CertInfo {
 	return out
 }
 
+// NewCertEntryFromPEM builds a CertEntry for domain from a PEM-encoded
+// certificate chain and private key, recording source as how the certificate
+// was obtained. It returns an error if certPEM and keyPEM do not form a
+// valid key pair or certPEM contains no certificate.
+//
+// Example: entry, err := NewCertEntryFromPEM("example.com", certPEM, keyPEM, CertManual)
 func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSource) (*CertEntry, error) {
 	domain = normalizeCertDomain(domain)
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -215,6 +272,13 @@ func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSourc
 	}, nil
 }
 
+// NewCertEntryFromDER builds a CertEntry for domain from a single
+// DER-encoded certificate and its private key, recording source as how the
+// certificate was obtained. If the key cannot be marshaled or paired with
+// the certificate, it logs the failure and returns an entry with an unset
+// TLSCert.
+//
+// Example: entry := NewCertEntryFromDER("example.com", certDER, privKey, CertSelfSigned)
 func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, source CertSource) *CertEntry {
 	domain = normalizeCertDomain(domain)
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
@@ -243,6 +307,11 @@ func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, s
 	}
 }
 
+// AddCert loads a certificate and private key from PEM-encoded bytes,
+// registers it for domain (source CertManual), and rebuilds the server's TLS
+// configuration.
+//
+// Example: err := srv.AddCert("example.com", certPEM, keyPEM)
 func (s *Server) AddCert(domain string, certPEM, keyPEM []byte) error {
 	entry, err := NewCertEntryFromPEM(domain, certPEM, keyPEM, CertManual)
 	if err != nil {
@@ -254,6 +323,10 @@ func (s *Server) AddCert(domain string, certPEM, keyPEM []byte) error {
 	return nil
 }
 
+// AddCertFromFiles reads certFile and keyFile from disk and registers them
+// for domain via AddCert.
+//
+// Example: err := srv.AddCertFromFiles("example.com", "cert.pem", "key.pem")
 func (s *Server) AddCertFromFiles(domain, certFile, keyFile string) error {
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
@@ -266,6 +339,11 @@ func (s *Server) AddCertFromFiles(domain, certFile, keyFile string) error {
 	return s.AddCert(domain, certPEM, keyPEM)
 }
 
+// AddSelfSignedCert generates and registers a self-signed certificate for
+// domain, rebuilding the server's TLS configuration. It is intended for
+// local development.
+//
+// Example: err := srv.AddSelfSignedCert("localhost")
 func (s *Server) AddSelfSignedCert(domain string) error {
 	der, priv, err := GenerateSelfSignedForDomain(domain)
 	if err != nil {
@@ -277,21 +355,35 @@ func (s *Server) AddSelfSignedCert(domain string) error {
 	return nil
 }
 
+// RemoveCert removes the certificate registered for domain and rebuilds the
+// server's TLS configuration.
+//
+// Example: srv.RemoveCert("old.example.com")
 func (s *Server) RemoveCert(domain string) {
 	s.certStore.RemoveCert(domain)
 	s.rebuildFallbackTLSConfig()
 	log.Printf("[CERT] removed cert for %s", domain)
 }
 
+// SetDefaultCert makes the certificate registered for domain the server's
+// default, used when a TLS ClientHello carries no matching SNI.
+//
+// Example: srv.SetDefaultCert("example.com")
 func (s *Server) SetDefaultCert(domain string) {
 	s.certStore.SetDefault(domain)
 	log.Printf("[CERT] default cert set to %s", domain)
 }
 
+// ListCerts returns a snapshot of every certificate registered on the
+// server.
 func (s *Server) ListCerts() []CertInfo {
 	return s.certStore.ListCerts()
 }
 
+// ReloadCert reads certFile and keyFile from disk and re-registers the
+// certificate for domain, rebuilding the server's TLS configuration.
+//
+// Example: err := srv.ReloadCert("example.com", "cert.pem", "key.pem")
 func (s *Server) ReloadCert(domain, certFile, keyFile string) error {
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
@@ -311,6 +403,11 @@ func (s *Server) ReloadCert(domain, certFile, keyFile string) error {
 	return nil
 }
 
+// UpdateCert replaces the certificate registered for domain with the given
+// PEM-encoded certificate and key, rebuilding the server's TLS
+// configuration.
+//
+// Example: err := srv.UpdateCert("example.com", newCertPEM, newKeyPEM)
 func (s *Server) UpdateCert(domain string, certPEM, keyPEM []byte) error {
 	entry, err := NewCertEntryFromPEM(domain, certPEM, keyPEM, CertManual)
 	if err != nil {
@@ -322,6 +419,9 @@ func (s *Server) UpdateCert(domain string, certPEM, keyPEM []byte) error {
 	return nil
 }
 
+// AddCerts is an alias for AddCert.
+//
+// Example: err := srv.AddCerts("example.com", certPEM, keyPEM)
 func (s *Server) AddCerts(domain string, certPEM, keyPEM []byte) error {
 	return s.AddCert(domain, certPEM, keyPEM)
 }

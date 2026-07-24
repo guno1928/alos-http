@@ -25,16 +25,29 @@ import (
 )
 
 // ACMEConfig configures automatic TLS certificate provisioning through Let's
-// Encrypt (or any ACME-compatible CA). Pass this in the server Config to enable
-// automatic certificate management.
+// Encrypt (or any ACME-compatible CA), passed via Config.ACME.
 //
-//	cfg := core.Config{
-//	    ACME: &core.ACMEConfig{
-//	        Email:    "admin@example.com",
-//	        CacheDir: "/etc/letsencrypt",
-//	        Domains:  []string{"example.com", "www.example.com"},
-//	    },
-//	}
+// Email is the account contact address submitted to the ACME CA.
+//
+//	Example: Email: "admin@example.com".
+//
+// CacheDir is where account keys and the Certbot-style certificate lineage
+// (live/archive/renewal directories) are persisted; defaults to
+// "/etc/letsencrypt" when empty.
+//
+//	Example: CacheDir: "/etc/letsencrypt".
+//	Example: CacheDir: "" uses the default "/etc/letsencrypt".
+//
+// Domains lists the hostnames to obtain and automatically renew certificates
+// for via the HTTP-01 challenge.
+//
+//	Example: Domains: []string{"example.com", "www.example.com"}.
+//
+// ACMENode overrides the ACME directory URL; empty uses the Let's Encrypt
+// production directory.
+//
+//	Example: ACMENode: "" uses Let's Encrypt production.
+//	Example: ACMENode: "https://acme-staging-v02.api.letsencrypt.org/directory" uses the LE staging environment.
 type ACMEConfig struct {
 	Email    string
 	CacheDir string
@@ -875,6 +888,10 @@ func (ai *acmeIntegration) addDomain(domain string) {
 	}()
 }
 
+// GetCertificate returns the TLS certificate registered for the
+// ClientHello's SNI, implementing the tls.Config.GetCertificate callback
+// signature. It returns ErrNoCertForSNI if no matching or default
+// certificate is registered.
 func (ai *acmeIntegration) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	entry := ai.server.certStore.Lookup(hello.ServerName)
 	if entry != nil {
@@ -883,10 +900,20 @@ func (ai *acmeIntegration) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Cert
 	return nil, ErrNoCertForSNI
 }
 
+// AddDomainCert is an alias for AddCert.
+//
+// Example: err := srv.AddDomainCert("example.com", certPEM, keyPEM)
 func (s *Server) AddDomainCert(domain string, certPEM, keyPEM []byte) error {
 	return s.AddCert(domain, certPEM, keyPEM)
 }
 
+// AddACMEDomain registers domain for automatic ACME certificate management,
+// initializing the server's ACME integration on first use with the optional
+// email as the account contact. It is safe to call before or after
+// EnableACME.
+//
+// Example: srv.AddACMEDomain("example.com")
+// Example: srv.AddACMEDomain("example.com", "admin@example.com")
 func (s *Server) AddACMEDomain(domain string, email ...string) {
 	if s.acme == nil {
 		e := ""
@@ -904,6 +931,10 @@ func (s *Server) AddACMEDomain(domain string, email ...string) {
 	s.acme.addDomain(domain)
 }
 
+// EnableACME starts automatic TLS certificate provisioning for cfg.Domains
+// through ACME, replacing any existing ACME integration on the server.
+//
+// Example: srv.EnableACME(core.ACMEConfig{Email: "admin@example.com", Domains: []string{"example.com"}})
 func (s *Server) EnableACME(cfg ACMEConfig) {
 	ai := newACMEIntegration(cfg, s)
 	if ai == nil {
@@ -913,6 +944,9 @@ func (s *Server) EnableACME(cfg ACMEConfig) {
 	ai.Start()
 }
 
+// LocalIPs returns the server's detected public IPv4 addresses, used to
+// verify that a domain's DNS points at this machine before requesting an
+// ACME certificate.
 func (s *Server) LocalIPs() []net.IP {
 	if s.acme == nil {
 		return gatherPublicIPv4()

@@ -32,30 +32,34 @@ const (
 	matchRegex  matchType = 2
 )
 
-// RateLimitRule defines a rate limit for a specific path pattern. Path can be an
-// exact path, a prefix ending in * (wildcard), or a regex prefixed with ~.
+// RateLimitRule defines a rate limit for a specific path pattern, used with
+// RateLimitEngine.SetRules/AddRule.
 //
-//	// Exact path: 100 requests per minute, block for 5 minutes on exceed
-//	core.RateLimitRule{
-//	    Path:     "/api/login",
-//	    MaxReqs:  100,
-//	    Window:   time.Minute,
-//	    BlockFor: 5 * time.Minute,
-//	}
+// Path selects which requests the rule applies to: an exact path, a prefix
+// ending in "*", or a regex prefixed with "~".
 //
-//	// Prefix wildcard: anything under /api/
-//	core.RateLimitRule{
-//	    Path:    "/api/*",
-//	    MaxReqs: 1000,
-//	    Window:  time.Minute,
-//	}
+//	Example: Path: "/api/login" matches only that exact path.
+//	Example: Path: "/api/*" matches anything under /api/.
+//	Example: Path: "~^/users/[0-9]+$" matches paths by regex.
 //
-//	// Regex: match /users/{digits}
-//	core.RateLimitRule{
-//	    Path:    "~^/users/[0-9]+$",
-//	    MaxReqs: 50,
-//	    Window:  time.Minute,
-//	}
+// MaxReqs is the maximum number of requests allowed per client within Window.
+//
+//	Example: MaxReqs: 100 allows 100 requests per Window.
+//
+// Window is the duration over which MaxReqs is counted.
+//
+//	Example: Window: time.Minute counts requests per minute.
+//
+// BlockFor is how long an offending client is blocked after exceeding
+// MaxReqs; <= 0 falls back to Window.
+//
+//	Example: BlockFor: 5 * time.Minute blocks offenders for five minutes.
+//	Example: BlockFor: 0 blocks for the same duration as Window.
+//
+// OnLimit, when set, is invoked instead of the default 429 response.
+//
+//	Example: OnLimit: nil sends the default 429 "Too Many Requests".
+//	Example: OnLimit: func(ev RateLimitEvent, req *Request, resp *Response) bool { resp.Status(429).JSONString(`{"error":"slow down"}`); return true }
 type RateLimitRule struct {
 	Path     string
 	MaxReqs  int64
@@ -156,6 +160,9 @@ func (cr *compiledRule) specificity() int {
 	return 0
 }
 
+// SetRules atomically replaces the engine's entire rule set with rules.
+//
+// Example: engine.SetRules([]RateLimitRule{{Path: "/api/*", MaxReqs: 1000, Window: time.Minute}})
 func (rle *RateLimitEngine) SetRules(rules []RateLimitRule) {
 	compiled := make([]compiledRule, len(rules))
 	for i := range rules {
@@ -164,6 +171,10 @@ func (rle *RateLimitEngine) SetRules(rules []RateLimitRule) {
 	rle.rules.Store(&compiled)
 }
 
+// AddRule adds rule to the engine, replacing any existing rule with the same
+// Path.
+//
+// Example: engine.AddRule(RateLimitRule{Path: "/api/login", MaxReqs: 100, Window: time.Minute})
 func (rle *RateLimitEngine) AddRule(rule RateLimitRule) {
 	old := *rle.rules.Load()
 	updated := make([]compiledRule, 0, len(old)+1)
@@ -176,6 +187,9 @@ func (rle *RateLimitEngine) AddRule(rule RateLimitRule) {
 	rle.rules.Store(&updated)
 }
 
+// RemoveRule removes the rule registered for the exact path, if any.
+//
+// Example: engine.RemoveRule("/api/login")
 func (rle *RateLimitEngine) RemoveRule(path string) {
 	old := *rle.rules.Load()
 	updated := make([]compiledRule, 0, len(old))
@@ -203,6 +217,13 @@ func (rle *RateLimitEngine) matchRule(path string) *compiledRule {
 	return best
 }
 
+// Check reports whether a request from ip to path is allowed under the rule
+// matching path, incrementing that client's counter as a side effect. It
+// returns true with a zero duration when no rule matches or the request is
+// within its limit, and false with the remaining wait time when the client
+// is currently blocked.
+//
+// Example: allowed, _, retryAfter := engine.Check(req.RemoteAddr, req.Path)
 func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, time.Duration) {
 	cr := rle.matchRule(path)
 	if cr == nil {
@@ -260,6 +281,8 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 	return true, cr, 0
 }
 
+// Stop halts the engine's background cleanup goroutine. It is safe to call
+// multiple times.
 func (rle *RateLimitEngine) Stop() {
 	select {
 	case <-rle.stopCh:

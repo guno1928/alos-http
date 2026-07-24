@@ -10,16 +10,15 @@ import (
 type SameSite uint8
 
 // SameSite attribute values for Cookie.SameSite.
-//
-// Example: SameSiteDefault omits the SameSite attribute entirely.
-// Example: SameSiteLax restricts the cookie to same-site requests and top-level navigations ("; SameSite=Lax").
-// Example: SameSiteStrict restricts the cookie to same-site requests only ("; SameSite=Strict").
-// Example: SameSiteNone sends the cookie on cross-site requests and emits "; SameSite=None" (pair with Secure: true).
 const (
+	// SameSiteDefault omits the SameSite attribute entirely.
 	SameSiteDefault SameSite = 0
-	SameSiteLax     SameSite = 1
-	SameSiteStrict  SameSite = 2
-	SameSiteNone    SameSite = 3
+	// SameSiteLax restricts the cookie to same-site requests and top-level navigations ("; SameSite=Lax").
+	SameSiteLax SameSite = 1
+	// SameSiteStrict restricts the cookie to same-site requests only ("; SameSite=Strict").
+	SameSiteStrict SameSite = 2
+	// SameSiteNone sends the cookie on cross-site requests and emits "; SameSite=None" (pair with Secure: true).
+	SameSiteNone SameSite = 3
 )
 
 // Cookie is an HTTP cookie that serializes into a Set-Cookie header value via String.

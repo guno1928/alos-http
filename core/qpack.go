@@ -158,14 +158,20 @@ var qpackStaticTable = [99][2]string{
 	{"x-frame-options", "sameorigin"},
 }
 
+// QPACKEncoder encodes HTTP/3 header fields into a QPACK-encoded header
+// block (RFC 9204) using the static table only; it does not maintain a
+// dynamic table.
 type QPACKEncoder struct {
 	buf []byte
 }
 
+// Reset sets dst as the encoder's output buffer; subsequent Encode calls
+// append to it.
 func (e *QPACKEncoder) Reset(dst []byte) {
 	e.buf = dst
 }
 
+// Bytes returns the encoder's current output buffer.
 func (e *QPACKEncoder) Bytes() []byte {
 	return e.buf
 }
@@ -276,6 +282,10 @@ func init() {
 	}
 }
 
+// EncodeStatus appends a QPACK-encoded ":status" header field for code. It
+// uses the static table's indexed representation when code has a matching
+// static-table entry, and otherwise falls back to a literal value with a
+// static name reference.
 func (e *QPACKEncoder) EncodeStatus(code int) {
 	if code > 0 && code < 600 {
 		idx := qpackStatusIndex[code]
@@ -294,6 +304,9 @@ func (e *QPACKEncoder) EncodeStatus(code int) {
 	}
 }
 
+// EncodeHeader appends a QPACK-encoded header field for name and value. It
+// prefers a full static-table match, then a literal value with a static name
+// reference, and falls back to a fully literal representation.
 func (e *QPACKEncoder) EncodeHeader(name, value string) {
 	idx := qpackFindStaticIndex(name, value)
 	if idx >= 0 {
@@ -308,17 +321,25 @@ func (e *QPACKEncoder) EncodeHeader(name, value string) {
 	e.encodeLiteral(name, value)
 }
 
+// QPACKDecoder decodes QPACK-encoded HTTP/3 header blocks (RFC 9204) using
+// the static table only; it does not maintain a dynamic table.
 type QPACKDecoder struct{}
 
 var qpackArenaPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 4096); return &b },
 }
 
+// Decode decodes a QPACK-encoded header block and returns the resulting
+// name/value pairs.
 func (d *QPACKDecoder) Decode(data []byte) ([][2]string, error) {
 	h, _, err := d.DecodeAppend(data, nil)
 	return h, err
 }
 
+// DecodeAppend decodes a QPACK-encoded header block and appends the
+// resulting name/value pairs to headers. It returns the updated headers
+// slice and a pooled buffer holding the decoded string data; the caller must
+// return the buffer to qpackArenaPool once done with the decoded strings.
 func (d *QPACKDecoder) DecodeAppend(data []byte, headers [][2]string) ([][2]string, *[]byte, error) {
 	ap := qpackArenaPool.Get().(*[]byte)
 	need := len(data)*8/5 + 16

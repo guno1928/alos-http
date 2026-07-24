@@ -6,6 +6,22 @@ import (
 	"testing"
 )
 
+func TestConfig_MinPrealloc_DefaultFloor(t *testing.T) {
+	cases := []struct{ set, want int }{
+		{0, minPreallocFloor},
+		{5, minPreallocFloor},
+		{minPreallocFloor - 1, minPreallocFloor},
+		{minPreallocFloor, minPreallocFloor},
+		{30000, 30000},
+	}
+	for _, c := range cases {
+		s := New(Config{MinPrealloc: c.set, MaxConnsPerIP: -1})
+		if s.config.MinPrealloc != c.want {
+			t.Fatalf("MinPrealloc set=%d => %d, want %d", c.set, s.config.MinPrealloc, c.want)
+		}
+	}
+}
+
 func TestPerIPConnLimiter_AcquireUpToLimit(t *testing.T) {
 	l := newPerIPConnLimiter()
 	defer l.Stop()

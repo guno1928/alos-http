@@ -22,14 +22,13 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 // the check entirely and must be selected explicitly.
 type WSOriginMode int
 
-// WSOrigin modes for the server's WebSocketOriginMode setting.
-//
-// Example: WSOriginSameOrigin (the default) rejects handshakes whose Origin host differs from the request Host.
-// Example: WSOriginAllowlist accepts only origins listed in WebSocketAllowedOrigins.
-// Example: WSOriginOff disables Origin checking entirely.
 const (
+	// WSOriginSameOrigin rejects handshakes whose Origin host differs from
+	// the request Host. It is the zero value and default.
 	WSOriginSameOrigin WSOriginMode = iota
+	// WSOriginAllowlist accepts only origins listed in WebSocketAllowedOrigins.
 	WSOriginAllowlist
+	// WSOriginOff disables Origin checking entirely.
 	WSOriginOff
 )
 
@@ -525,6 +524,8 @@ func indexOf(s string, c byte) int {
 	return strings.IndexByte(s, c)
 }
 
+// Uint32Hash64 mixes the bits of v through a multiply-xorshift finalizer and
+// returns a well-distributed pseudo-random value derived from v.
 func Uint32Hash64(v uint64) uint64 {
 	x := v
 	x = ((x >> 16) ^ x) * 0x45d9f3b

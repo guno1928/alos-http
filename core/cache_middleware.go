@@ -10,6 +10,59 @@ import (
 	"github.com/guno1928/turbo"
 )
 
+// CacheConfig configures the in-memory response cache built by Cache and
+// NewResponseCache. The zero value is valid; each field below falls back to a
+// default when left zero.
+//
+// TTL is how long a cached response stays fresh; 0 defaults to 60s.
+//
+//	Example: TTL: 30 * time.Second.
+//	Example: TTL: 5 * time.Minute.
+//
+// Methods lists the HTTP methods eligible for caching; empty defaults to {"GET"}.
+//
+//	Example: Methods: []string{"GET"}.
+//	Example: Methods: []string{"GET", "HEAD"}.
+//
+// IgnoreQuery, when true, drops the query string from the cache key so that
+// "/p?a=1" and "/p?a=2" share one entry; defaults to false (the query is keyed).
+//
+//	Example: IgnoreQuery: true.
+//	Example: IgnoreQuery: false.
+//
+// MaxEntries caps the number of stored responses; 0 defaults to 10000. When the
+// cache is full the oldest entries are evicted first.
+//
+//	Example: MaxEntries: 50000.
+//
+// MaxBodyBytes is the largest response body that will be cached; 0 defaults to
+// 1 MiB. Larger responses bypass the cache entirely.
+//
+//	Example: MaxBodyBytes: 4 << 20.
+//
+// Gzip, when true, pre-compresses cacheable text-like responses and serves the
+// gzip copy to clients that send Accept-Encoding: gzip; defaults to false.
+//
+//	Example: Gzip: true.
+//
+// GzipMinBytes is the minimum body size pre-compressed when Gzip is set; 0
+// defaults to 512.
+//
+//	Example: GzipMinBytes: 1024.
+//
+// GzipLevel is the gzip level used when Gzip is set; values outside 1–9 default
+// to 6.
+//
+//	Example: GzipLevel: 9.
+//
+// SweepInterval is how often expired and overflow entries are reaped; 0 defaults
+// to 15s.
+//
+//	Example: SweepInterval: 30 * time.Second.
+//
+// CacheableStatus decides which status codes may be cached; nil caches only 200.
+//
+//	Example: CacheableStatus: func(code int) bool { return code == 200 || code == 404 }.
 type CacheConfig struct {
 	TTL           time.Duration
 	Methods       []string
@@ -33,6 +86,9 @@ type cachedResponse struct {
 	storedAtNs  int64
 }
 
+// ResponseCache is a concurrent in-memory HTTP response cache. Create one with
+// NewResponseCache, or use the Cache middleware, and call Stop to release its
+// background sweeper.
 type ResponseCache struct {
 	cfg      CacheConfig
 	store    *alosmap.TypedMap[string, *cachedResponse]
@@ -42,6 +98,11 @@ type ResponseCache struct {
 	stopOnce sync.Once
 }
 
+// Cache returns middleware that caches handler responses in memory according to
+// cfg. It is the middleware form of NewResponseCache.
+//
+// Example: s.Router.Use(Cache(CacheConfig{TTL: time.Minute}))
+// Example: s.Router.Use(Cache(CacheConfig{TTL: 5 * time.Minute, Gzip: true, Methods: []string{"GET", "HEAD"}}))
 func Cache(cfg CacheConfig) MiddlewareFunc {
 	rc := NewResponseCache(cfg)
 	return func(next HandlerFunc) HandlerFunc {
@@ -51,6 +112,13 @@ func Cache(cfg CacheConfig) MiddlewareFunc {
 	}
 }
 
+// NewResponseCache builds a ResponseCache from cfg, applying defaults for any
+// zero field (TTL 60s, Methods {"GET"}, MaxEntries 10000, MaxBodyBytes 1 MiB,
+// GzipMinBytes 512, GzipLevel 6, SweepInterval 15s) and starting the background
+// sweeper. Call Stop when done to end the sweeper goroutine.
+//
+// Example: rc := NewResponseCache(CacheConfig{})
+// Example: rc := NewResponseCache(CacheConfig{TTL: 10 * time.Second, MaxEntries: 1000})
 func NewResponseCache(cfg CacheConfig) *ResponseCache {
 	if cfg.TTL <= 0 {
 		cfg.TTL = 60 * time.Second
@@ -88,6 +156,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 	return rc
 }
 
+// Stop halts the background sweeper. It is safe to call multiple times.
 func (rc *ResponseCache) Stop() {
 	if rc == nil {
 		return
@@ -95,8 +164,10 @@ func (rc *ResponseCache) Stop() {
 	rc.stopOnce.Do(func() { close(rc.stop) })
 }
 
+// Len returns the number of entries currently cached.
 func (rc *ResponseCache) Len() int { return rc.store.Len() }
 
+// Purge removes every cached entry.
 func (rc *ResponseCache) Purge() { rc.store.Clear() }
 
 func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) {

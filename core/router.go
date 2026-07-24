@@ -112,6 +112,10 @@ type staticEntry struct {
 	handler HandlerFunc
 }
 
+// Router is the request-routing table: a per-method radix trie of registered
+// paths plus a static-route fast-path index. Create one with NewRouter,
+// register routes with the HTTP method helpers, then call Build before the
+// server starts handling requests.
 type Router struct {
 	trees                   [methodCount]*node
 	staticHashes            [methodCount][]uint32

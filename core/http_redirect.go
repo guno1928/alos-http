@@ -33,6 +33,9 @@ type httpRoutesSnapshot struct {
 	routes []httpRouteEntry
 }
 
+// HTTPRouter holds a set of path-prefix rules that proxy plain HTTP requests
+// to backend servers instead of redirecting to HTTPS. It is managed
+// internally by Server via SetHTTPRoutes, AddHTTPRoute, and RemoveHTTPRoute.
 type HTTPRouter struct {
 	snapshot atomic.Pointer[httpRoutesSnapshot]
 	mu       sync.Mutex
@@ -70,6 +73,10 @@ func normalizeRouteAddr(addr string) string {
 	return addr
 }
 
+// SetRoutes replaces the router's entire set of routes with routes,
+// normalizing each backend address.
+//
+// Example: hr.SetRoutes([]HTTPRoute{{PathPrefix: "/api/", Backend: "10.0.0.5:3000"}})
 func (hr *HTTPRouter) SetRoutes(routes []HTTPRoute) {
 	entries := make([]httpRouteEntry, len(routes))
 	for i, r := range routes {
@@ -82,6 +89,9 @@ func (hr *HTTPRouter) SetRoutes(routes []HTTPRoute) {
 	hr.snapshot.Store(&httpRoutesSnapshot{routes: entries})
 }
 
+// AddRoute appends a single route without replacing existing ones.
+//
+// Example: hr.AddRoute(HTTPRoute{PathPrefix: "/api/", Backend: "10.0.0.5:3000"})
 func (hr *HTTPRouter) AddRoute(route HTTPRoute) {
 	hr.mu.Lock()
 	old := hr.snapshot.Load()
@@ -97,6 +107,9 @@ func (hr *HTTPRouter) AddRoute(route HTTPRoute) {
 	hr.mu.Unlock()
 }
 
+// RemoveRoute removes the route with the given path prefix.
+//
+// Example: hr.RemoveRoute("/api/")
 func (hr *HTTPRouter) RemoveRoute(pathPrefix string) {
 	hr.mu.Lock()
 	old := hr.snapshot.Load()
