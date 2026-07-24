@@ -2,10 +2,38 @@
 
 package core
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func xffReq(port, realIP string) *Request {
 	return &Request{RemoteAddr: "10.0.0.1:" + port, Headers: [][2]string{{"X-Forwarded-For", realIP}}}
+}
+
+func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
+	s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
+	defer s.perIPConnLimiter.Stop()
+
+	if !s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+		t.Fatal("first acquire should succeed")
+	}
+
+	_, srvSide := net.Pipe()
+	tracked := s.trackHandoffConn(srvSide, "203.0.113.5")
+	if tracked == nil {
+		t.Fatal("trackHandoffConn returned nil")
+	}
+
+	if s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+		t.Fatal("slot must stay held while the streamed connection is alive")
+	}
+
+	_ = tracked.Close()
+
+	if !s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+		t.Fatal("slot must be released once the streamed connection closes")
+	}
 }
 
 func TestAcquireIPConn_ProxyModeUsesRealIP(t *testing.T) {

@@ -83,14 +83,18 @@ func (hc *healthChecker) loop() {
 }
 
 func (hc *healthChecker) check(b *backend) bool {
-	if hc.config.Path == "" {
-		return hc.checkTCP(b)
-	}
-	return hc.checkHTTP(b)
+	return probeBackendHealth(b.Addr, b.TLS, b.TLSSkipVerify, hc.config)
 }
 
-func (hc *healthChecker) checkTCP(b *backend) bool {
-	conn, err := dialBackendConn(b.Addr, b.TLS, b.TLSSkipVerify, hc.config.Timeout)
+func probeBackendHealth(addr string, useTLS, skipVerify bool, cfg HealthCheckConfig) bool {
+	if cfg.Path == "" {
+		return probeBackendTCP(addr, useTLS, skipVerify, cfg.Timeout)
+	}
+	return probeBackendHTTP(addr, useTLS, skipVerify, cfg)
+}
+
+func probeBackendTCP(addr string, useTLS, skipVerify bool, timeout time.Duration) bool {
+	conn, err := dialBackendConn(addr, useTLS, skipVerify, timeout)
 	if err != nil {
 		return false
 	}
@@ -98,20 +102,20 @@ func (hc *healthChecker) checkTCP(b *backend) bool {
 	return true
 }
 
-func (hc *healthChecker) checkHTTP(b *backend) bool {
-	conn, err := dialBackendConn(b.Addr, b.TLS, b.TLSSkipVerify, hc.config.Timeout)
+func probeBackendHTTP(addr string, useTLS, skipVerify bool, cfg HealthCheckConfig) bool {
+	conn, err := dialBackendConn(addr, useTLS, skipVerify, cfg.Timeout)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(hc.config.Timeout))
+	conn.SetDeadline(time.Now().Add(cfg.Timeout))
 
 	bp := SmallBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
 	buf = append(buf, "GET "...)
-	buf = append(buf, hc.config.Path...)
+	buf = append(buf, cfg.Path...)
 	buf = append(buf, " HTTP/1.1\r\nHost: "...)
-	buf = append(buf, b.Addr...)
+	buf = append(buf, addr...)
 	buf = append(buf, "\r\nConnection: close\r\n\r\n"...)
 
 	err = writeFull(conn, buf)

@@ -380,13 +380,21 @@ func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, st
 }
 
 func (pc *ProxyCache) Get(method, host, path string, req *Request) (*cacheEntry, bool) {
+	return pc.lookupEntry(method, host, path, proxyCacheRequestAllowed(req))
+}
+
+func (pc *ProxyCache) GetFP(method, host, path string, reqAllows bool) (*cacheEntry, bool) {
+	return pc.lookupEntry(method, host, path, reqAllows)
+}
+
+func (pc *ProxyCache) lookupEntry(method, host, path string, reqAllows bool) (*cacheEntry, bool) {
 	key := pc.buildKey(method, host, path)
 	entry, ok := pc.entries.Load(key)
 	if !ok {
 		pc.totalMisses.Add(1)
 		return nil, false
 	}
-	if !entry.manual && !proxyCacheRequestAllowed(req) {
+	if !entry.manual && !reqAllows {
 		pc.totalMisses.Add(1)
 		return nil, false
 	}

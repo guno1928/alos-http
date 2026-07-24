@@ -249,6 +249,8 @@ type Config struct {
 	WSWriteTimeout          time.Duration
 	WebSocketOriginMode     WSOriginMode
 	WebSocketAllowedOrigins []string
+
+	ProxyEpoll bool
 }
 
 // DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
@@ -524,6 +526,7 @@ type Server struct {
 	certStore        *CertStore
 	fallbackTLS      atomic.Pointer[tls.Config]
 	proxy            atomic.Pointer[ProxyEngine]
+	proxyDomains     []DomainConfig
 	httpRouter       *HTTPRouter
 	acme             *acmeIntegration
 	listeners        []net.Listener
@@ -559,6 +562,7 @@ type Server struct {
 type trackedHandoffConn struct {
 	net.Conn
 	server    *Server
+	ipKey     string
 	closeOnce sync.Once
 }
 
@@ -879,6 +883,12 @@ func (s *Server) ListenAndServe() error {
 		addr = ":80"
 	}
 
+	if s.config.ProxyEpoll && len(s.proxyDomains) > 0 {
+		if handled, err := s.serveEpollProxy(addr); handled {
+			return err
+		}
+	}
+
 	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge | epoll) ===")
 	log.Printf("Listening on http://%s (epoll listeners=%d)", addr, s.config.Listeners)
 	return s.ListenAndServeEpollH2(addr)
@@ -906,7 +916,7 @@ func (s *Server) releaseTrackedConn() {
 	}
 }
 
-func (s *Server) trackHandoffConn(conn net.Conn) net.Conn {
+func (s *Server) trackHandoffConn(conn net.Conn, ipKey string) net.Conn {
 	if conn == nil {
 		return nil
 	}
@@ -914,7 +924,7 @@ func (s *Server) trackHandoffConn(conn net.Conn) net.Conn {
 		_ = conn.Close()
 		return nil
 	}
-	tc := &trackedHandoffConn{Conn: conn, server: s}
+	tc := &trackedHandoffConn{Conn: conn, server: s, ipKey: ipKey}
 	s.trackedConnMu.Lock()
 	if s.trackedConns == nil {
 		s.trackedConns = make(map[*trackedHandoffConn]struct{})
@@ -933,6 +943,9 @@ func (s *Server) untrackHandoffConn(conn *trackedHandoffConn) {
 	delete(s.trackedConns, conn)
 	s.trackedConnMu.Unlock()
 	Stats.ActiveConns.Add(-1)
+	if conn.ipKey != "" && s.perIPConnLimiter != nil {
+		s.perIPConnLimiter.release(conn.ipKey)
+	}
 	s.releaseTrackedConn()
 }
 
@@ -1420,6 +1433,7 @@ func (s *Server) AddProxyDomain(cfg DomainConfig) {
 		s.proxy.Store(pe)
 	}
 	pe.AddDomain(cfg)
+	s.proxyDomains = append(s.proxyDomains, cfg)
 	s.computeFastDispatch()
 }
 

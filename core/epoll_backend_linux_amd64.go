@@ -152,6 +152,13 @@ func (p *epollConnPool) put(c *epollConn) {
 		p.server.activeConns.Add(-1)
 		Stats.ActiveConns.Add(-1)
 	}
+	if c.ipHeld {
+		if p.server != nil && p.server.perIPConnLimiter != nil {
+			p.server.perIPConnLimiter.release(c.ipKey)
+		}
+		c.ipHeld = false
+		c.ipKey = ""
+	}
 	releaseEpollReadBuf(c.readBuf)
 	c.readBuf = nil
 	releaseIOBuf(c.writeBuf)

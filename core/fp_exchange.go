@@ -18,6 +18,7 @@ var (
 	fpErrBadAuthority   = errors.New("outbound: bad authority")
 	fpErrDNSFailed      = errors.New("outbound: dns lookup failed")
 	fpErrTooManyConns   = errors.New("outbound: backend connection limit reached")
+	fpErrBlocked        = errors.New("outbound: request blocked by interceptor")
 )
 
 type fpRequest struct {
@@ -56,6 +57,7 @@ type Exchange struct {
 	port     uint16
 	key      poolKey
 	inbound  *inConn
+	be       *fpBackend
 	pnext    *Exchange
 	retried  bool
 	finished bool

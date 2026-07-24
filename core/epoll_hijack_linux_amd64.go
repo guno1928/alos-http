@@ -66,11 +66,13 @@ func (w *epollWorker) tlsH1Attacher(c *epollConn, consumed int) func(*Request) n
 		if len(rawPrefix) > 0 {
 			handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(rawPrefix), nc)}
 		}
-		tracked := w.server.trackHandoffConn(handed)
+		tracked := w.server.trackHandoffConn(handed, c.ipKey)
 		if tracked == nil {
 			_ = nc.Close()
 			return nil
 		}
+		c.ipHeld = false
+		c.ipKey = ""
 		req.connTakenOver = true
 		req.attachConn = nil
 		req.conn = tracked
@@ -98,11 +100,13 @@ func (w *epollWorker) plainH1Attacher(c *epollConn, gen uint32) func(*Request) n
 			if len(prefix) > 0 {
 				handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(prefix), nc)}
 			}
-			tracked := w.server.trackHandoffConn(handed)
+			tracked := w.server.trackHandoffConn(handed, c.ipKey)
 			if tracked == nil {
 				_ = nc.Close()
 				return
 			}
+			c.ipHeld = false
+			c.ipKey = ""
 			req.connTakenOver = true
 			req.attachConn = nil
 			req.conn = tracked

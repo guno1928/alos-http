@@ -14,12 +14,13 @@ func StartFastProxy(listenAddr string, domains []DomainConfig, loops int) error 
 				Addr:       b.Addr,
 				TLS:        b.TLS,
 				SkipVerify: b.TLSSkipVerify,
+				Weight:     b.Weight,
 			})
 		}
 		if d.Domain == "" || d.Domain == "*" {
 			fallback = bes
 		} else {
-			routes = append(routes, FastRoute{Host: d.Domain, Backends: bes})
+			routes = append(routes, FastRoute{Host: d.Domain, Backends: bes, LB: d.LoadBalancer})
 		}
 	}
 	_, err := ListenAndFastProxy(listenAddr, routes, fallback, loops)
