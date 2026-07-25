@@ -67,13 +67,17 @@ var timeNow = time.Now
 //	Example: MaxRequestsPerIP: 100.
 //	Example: MaxRequestsPerIP: 0 disables per-IP limiting.
 //
-// MaxConnsPerIP caps concurrent connections per client IP. When ProxyMode (or TrustedProxies) is
-// active the limit is keyed by the real client IP taken from X-Forwarded-For / X-Real-IP after the
-// proxy rewrite; otherwise it is keyed by the socket peer IP at accept. 0 applies a default of 20;
-// a negative value disables the limit. Excess connections are refused with 429 and closed.
+// MaxConnsPerIP caps how much of the server a single client IP may occupy concurrently. Without a
+// trusted proxy it limits concurrent TCP connections, keyed by the socket peer IP and enforced at
+// accept. When ProxyMode (or TrustedProxies) is active the TCP connections belong to the proxy and
+// are pooled across clients, so the limit instead caps concurrent in-flight requests keyed by the
+// real client IP taken from X-Forwarded-For / X-Real-IP; each request frees its slot when it
+// completes, and a long-lived handler such as a WebSocket holds one slot while it runs.
+// MaxRequestsPerIP takes precedence over this value behind a trusted proxy. 0 applies a default of
+// 20; a negative value disables the limit. Excess is refused with 429.
 //
 //	Example: MaxConnsPerIP: 20.
-//	Example: MaxConnsPerIP: -1 disables the per-IP connection limit.
+//	Example: MaxConnsPerIP: -1 disables the per-IP limit.
 //
 // MaxConcurrentReqs is a server-wide concurrency cap; 0 means unlimited. Excess requests get 503.
 //
@@ -551,6 +555,7 @@ type Server struct {
 	perIPLimiter     *perIPRequestLimiter
 	perIPConnLimiter *perIPConnLimiter
 	maxConnsPerIP    int64
+	perIPInFlight    int64
 	trackedConnMu    sync.Mutex
 	trackedConns     map[*trackedHandoffConn]struct{}
 	onRequestHooks   []func(*Request, *Response) bool
@@ -561,9 +566,10 @@ type Server struct {
 
 type trackedHandoffConn struct {
 	net.Conn
-	server    *Server
-	ipKey     string
-	closeOnce sync.Once
+	server       *Server
+	ipKey        string
+	ipFromInFlig bool
+	closeOnce    sync.Once
 }
 
 type ipReqCounter struct {
@@ -680,7 +686,14 @@ func New(configs ...Config) *Server {
 	}
 	if maxConnsPerIP > 0 {
 		s.maxConnsPerIP = maxConnsPerIP
-		s.perIPConnLimiter = newPerIPConnLimiter()
+		if s.trustedProxies.active {
+			s.perIPInFlight = maxConnsPerIP
+			if s.perIPLimiter == nil {
+				s.perIPLimiter = newPerIPRequestLimiter()
+			}
+		} else {
+			s.perIPConnLimiter = newPerIPConnLimiter()
+		}
 	}
 
 	s.debug.Store(cfg.Debug)
@@ -921,7 +934,7 @@ func (s *Server) releaseTrackedConn() {
 	}
 }
 
-func (s *Server) trackHandoffConn(conn net.Conn, ipKey string) net.Conn {
+func (s *Server) trackHandoffConn(conn net.Conn, ipKey string, fromInFlight bool) net.Conn {
 	if conn == nil {
 		return nil
 	}
@@ -929,7 +942,7 @@ func (s *Server) trackHandoffConn(conn net.Conn, ipKey string) net.Conn {
 		_ = conn.Close()
 		return nil
 	}
-	tc := &trackedHandoffConn{Conn: conn, server: s, ipKey: ipKey}
+	tc := &trackedHandoffConn{Conn: conn, server: s, ipKey: ipKey, ipFromInFlig: fromInFlight}
 	s.trackedConnMu.Lock()
 	if s.trackedConns == nil {
 		s.trackedConns = make(map[*trackedHandoffConn]struct{})
@@ -948,8 +961,12 @@ func (s *Server) untrackHandoffConn(conn *trackedHandoffConn) {
 	delete(s.trackedConns, conn)
 	s.trackedConnMu.Unlock()
 	Stats.ActiveConns.Add(-1)
-	if conn.ipKey != "" && s.perIPConnLimiter != nil {
-		s.perIPConnLimiter.release(conn.ipKey)
+	if conn.ipKey != "" {
+		if conn.ipFromInFlig {
+			s.perIPLimiter.release(conn.ipKey)
+		} else if s.perIPConnLimiter != nil {
+			s.perIPConnLimiter.release(conn.ipKey)
+		}
 	}
 	s.releaseTrackedConn()
 }
@@ -1600,11 +1617,20 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 
 	clientIP := extractIP(req.RemoteAddr)
 	if s.perIPLimiter != nil {
-		if !s.perIPLimiter.acquire(clientIP, s.config.MaxRequestsPerIP) {
+		limit := s.config.MaxRequestsPerIP
+		if limit <= 0 {
+			limit = s.perIPInFlight
+		}
+		if !s.perIPLimiter.acquire(clientIP, limit) {
 			resp.Status(429).String("Too Many Requests")
 			return
 		}
-		defer s.perIPLimiter.release(clientIP)
+		defer func() {
+			if req.connTakenOver && s.trustedProxies.active {
+				return
+			}
+			s.perIPLimiter.release(clientIP)
+		}()
 	}
 
 	for _, hook := range s.onRequestHooks {

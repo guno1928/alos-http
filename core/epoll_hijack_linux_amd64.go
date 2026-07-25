@@ -66,7 +66,8 @@ func (w *epollWorker) tlsH1Attacher(c *epollConn, consumed int) func(*Request) n
 		if len(rawPrefix) > 0 {
 			handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(rawPrefix), nc)}
 		}
-		tracked := w.server.trackHandoffConn(handed, c.ipKey)
+		ipKey, fromInFlight := w.handoffIPSlot(c, req)
+		tracked := w.server.trackHandoffConn(handed, ipKey, fromInFlight)
 		if tracked == nil {
 			_ = nc.Close()
 			return nil
@@ -78,6 +79,16 @@ func (w *epollWorker) tlsH1Attacher(c *epollConn, consumed int) func(*Request) n
 		req.conn = tracked
 		return tracked
 	}
+}
+
+func (w *epollWorker) handoffIPSlot(c *epollConn, req *Request) (string, bool) {
+	if w.server.trustedProxies.active {
+		if w.server.perIPLimiter == nil {
+			return "", false
+		}
+		return extractIP(req.RemoteAddr), true
+	}
+	return c.ipKey, false
 }
 
 func (w *epollWorker) plainH1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
@@ -100,7 +111,8 @@ func (w *epollWorker) plainH1Attacher(c *epollConn, gen uint32) func(*Request) n
 			if len(prefix) > 0 {
 				handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(prefix), nc)}
 			}
-			tracked := w.server.trackHandoffConn(handed, c.ipKey)
+			ipKey, fromInFlight := w.handoffIPSlot(c, req)
+			tracked := w.server.trackHandoffConn(handed, ipKey, fromInFlight)
 			if tracked == nil {
 				_ = nc.Close()
 				return

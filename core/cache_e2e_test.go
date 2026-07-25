@@ -152,59 +152,21 @@ func TestE2E_PerIPConnLimit_ProxyMode(t *testing.T) {
 	}
 
 	var held []net.Conn
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 12; i++ {
 		conn, err := net.Dial("tcp", "127.0.0.1:18093")
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
 		line, err := e2eStatusLine(conn, "203.0.113.5")
 		if err != nil || !strings.Contains(line, "200") {
-			t.Fatalf("held conn %d expected 200, got %q err=%v", i, line, err)
+			t.Fatalf("conn %d from same real IP expected 200 (no per-conn limit behind a trusted proxy), got %q err=%v", i, line, err)
 		}
 		held = append(held, conn)
 	}
-
-	over, err := net.Dial("tcp", "127.0.0.1:18093")
-	if err != nil {
-		t.Fatal(err)
-	}
-	line, _ := e2eStatusLine(over, "203.0.113.5")
-	if !strings.Contains(line, "429") {
-		t.Fatalf("6th connection from same real IP expected 429, got %q", line)
-	}
-	over.Close()
-
-	other, err := net.Dial("tcp", "127.0.0.1:18093")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lineO, _ := e2eStatusLine(other, "203.0.113.99")
-	if !strings.Contains(lineO, "200") {
-		t.Fatalf("different real IP expected 200, got %q", lineO)
-	}
-	other.Close()
-
-	held[0].Close()
-	got200 := false
-	for attempt := 0; attempt < 5 && !got200; attempt++ {
-		time.Sleep(250 * time.Millisecond)
-		reopen, err := net.Dial("tcp", "127.0.0.1:18093")
-		if err != nil {
-			continue
-		}
-		lineR, _ := e2eStatusLine(reopen, "203.0.113.5")
-		reopen.Close()
-		if strings.Contains(lineR, "200") {
-			got200 = true
-		}
-	}
-	if !got200 {
-		t.Fatal("after releasing a slot, a new connection from the same real IP should be allowed (200)")
-	}
-	for _, c := range held[1:] {
+	for _, c := range held {
 		c.Close()
 	}
-	fmt.Printf("E2E per-IP conn limit (ProxyMode): 5 held, 6th=429, other real IP=200, slot freed on close=200\n")
+	fmt.Printf("E2E per-IP limit (ProxyMode): limit applies to in-flight requests per real IP; 12 pooled conns from one real IP all 200\n")
 }
 
 func TestE2E_PerIPConnLimit_NonProxyAtAccept(t *testing.T) {

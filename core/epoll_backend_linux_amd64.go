@@ -920,16 +920,9 @@ func (w *epollWorker) closeConn(c *epollConn) {
 }
 
 func (c *epollConn) acquireIPConn(srv *Server, req *Request) bool {
-	if srv.perIPConnLimiter == nil || c.ipHeld || !srv.trustedProxies.active {
-		return true
+	if srv.trustedProxies.active {
+		applyTrustedRealIP(req, srv.trustedProxies)
 	}
-	applyTrustedRealIP(req, srv.trustedProxies)
-	key := extractIP(req.RemoteAddr)
-	if !srv.perIPConnLimiter.acquire(key, srv.maxConnsPerIP) {
-		return false
-	}
-	c.ipHeld = true
-	c.ipKey = key
 	return true
 }
 

@@ -12,7 +12,7 @@ func xffReq(port, realIP string) *Request {
 }
 
 func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
-	s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
+	s := New(Config{MaxConnsPerIP: 1})
 	defer s.perIPConnLimiter.Stop()
 
 	if !s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
@@ -20,7 +20,7 @@ func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
 	}
 
 	_, srvSide := net.Pipe()
-	tracked := s.trackHandoffConn(srvSide, "203.0.113.5")
+	tracked := s.trackHandoffConn(srvSide, "203.0.113.5", false)
 	if tracked == nil {
 		t.Fatal("trackHandoffConn returned nil")
 	}
@@ -36,28 +36,23 @@ func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
 	}
 }
 
-func TestAcquireIPConn_ProxyModeUsesRealIP(t *testing.T) {
+func TestAcquireIPConn_ProxyModeRewritesRealIPNoLimit(t *testing.T) {
 	s := New(Config{ProxyMode: true, MaxConnsPerIP: 2})
 	defer s.perIPConnLimiter.Stop()
 
+	req := xffReq("1", "203.0.113.9")
 	c1 := &epollConn{}
-	if !c1.acquireIPConn(s, xffReq("1", "203.0.113.9")) {
+	if !c1.acquireIPConn(s, req) {
 		t.Fatal("conn1 should acquire")
 	}
-	if c1.ipKey != "203.0.113.9" {
-		t.Fatalf("c1.ipKey=%q want the rewritten real IP 203.0.113.9", c1.ipKey)
+	if req.RemoteAddr != "203.0.113.9" {
+		t.Fatalf("RemoteAddr=%q want rewritten real IP 203.0.113.9", req.RemoteAddr)
 	}
-	c2 := &epollConn{}
-	if !c2.acquireIPConn(s, xffReq("2", "203.0.113.9")) {
-		t.Fatal("conn2 should acquire (limit 2)")
-	}
-	c3 := &epollConn{}
-	if c3.acquireIPConn(s, xffReq("3", "203.0.113.9")) {
-		t.Fatal("conn3 from same real IP must be rejected at limit 2")
-	}
-	c4 := &epollConn{}
-	if !c4.acquireIPConn(s, xffReq("4", "203.0.113.10")) {
-		t.Fatal("a different real IP must have its own budget")
+	for i := 0; i < 10; i++ {
+		c := &epollConn{}
+		if !c.acquireIPConn(s, xffReq("2", "203.0.113.9")) {
+			t.Fatalf("conn %d from same real IP must acquire; the per-conn limit is not enforced behind a trusted proxy", i)
+		}
 	}
 }
 
@@ -73,7 +68,7 @@ func TestAcquireIPConn_NonProxyDeferredToAccept(t *testing.T) {
 	}
 }
 
-func TestAcquireIPConn_IdempotentPerConn(t *testing.T) {
+func TestAcquireIPConn_ProxyModeNoLimitAcrossConns(t *testing.T) {
 	s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
 	defer s.perIPConnLimiter.Stop()
 	c := &epollConn{}
@@ -81,11 +76,11 @@ func TestAcquireIPConn_IdempotentPerConn(t *testing.T) {
 		t.Fatal("first acquire should succeed")
 	}
 	if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
-		t.Fatal("second call on same conn should return true without double-counting")
+		t.Fatal("second call on same conn should return true")
 	}
 	c2 := &epollConn{}
-	if c2.acquireIPConn(s, xffReq("2", "203.0.113.1")) {
-		t.Fatal("a new conn from same real IP must be rejected (idempotency did not double-count)")
+	if !c2.acquireIPConn(s, xffReq("2", "203.0.113.1")) {
+		t.Fatal("a new conn from the same real IP must also acquire (no per-conn limit behind a trusted proxy)")
 	}
 }
 

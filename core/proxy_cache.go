@@ -32,9 +32,9 @@ import (
 //
 //	Example: MaxBytes: 1 << 20.
 //
-// StatusOnly restricts this rule to specific response status codes; empty matches any status eligible for caching (2xx, 301, or 308).
+// StatusOnly restricts this rule to specific response status codes; empty matches any status eligible for caching (only 200).
 //
-//	Example: StatusOnly: []int{200, 301}.
+//	Example: StatusOnly: []int{200}.
 type CacheRule struct {
 	PathPrefix string
 	MaxAge     time.Duration
@@ -48,7 +48,7 @@ type CacheRule struct {
 //
 // Rules lists path-specific caching rules, consulted in order; the first rule whose
 // PathPrefix, Methods, and StatusOnly all match supplies the TTL. Only GET/HEAD
-// responses with a 2xx, 301, or 308 status are ever eligible. An empty Rules caches
+// responses with a 200 status are ever eligible. An empty Rules caches
 // every eligible response using DefaultMaxAge; a non-empty Rules that matches nothing
 // skips caching.
 //
@@ -390,10 +390,8 @@ func (pc *ProxyCache) shouldCache(cfg *ProxyCacheConfig, method, path string, st
 	if method != "GET" && method != "HEAD" {
 		return 0, false
 	}
-	if statusCode < 200 || statusCode >= 400 {
-		if statusCode != 301 && statusCode != 308 {
-			return 0, false
-		}
+	if statusCode != 200 {
+		return 0, false
 	}
 
 	for i := range cfg.Rules {
