@@ -131,7 +131,7 @@ func pickRetryBackend(ds *domainState, clientIP string, tried []bool) int {
 	return -1
 }
 
-func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
+func (pe *ProxyEngine) forwardRequestStdnet(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
 	if isWebSocket(req) {
 		return pe.forwardWebSocket(req, resp, b, cfg)
 	}
@@ -609,20 +609,6 @@ func isProxyFilteredHeaderFold(name string) bool {
 	return false
 }
 
-func isProxyFilteredHeader(name string) bool {
-	if len(name) > 0 && name[0] == ':' {
-		return true
-	}
-	switch name {
-	case "host", "content-length", "accept-encoding",
-		"keep-alive", "proxy-authenticate", "proxy-authorization",
-		"te", "trailer", "transfer-encoding",
-		"x-forwarded-for", "x-real-ip", "forwarded":
-		return true
-	}
-	return false
-}
-
 func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]string, error) {
 	bp := SmallBufPool.Get().(*[]byte)
 	lineBuf := (*bp)[:0]
@@ -835,15 +821,6 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 	return nil
 }
 
-func isHopByHop(name string) bool {
-	switch name {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-		"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	}
-	return false
-}
-
 func isHopByHopFold(name string) bool {
 	switch len(name) {
 	case 2:
@@ -915,4 +892,23 @@ func stripPort(host string) string {
 		return host[:lastColon]
 	}
 	return host
+}
+
+// matchProxyTarget resolves a request to the proxy domain that should serve it.
+// A host-matched proxy domain wins; failing that a port-80 path route is tried,
+// which is how ACME HTTP-01 challenges are forwarded. Both return a domainState
+// so the one in-loop engine serves them, rather than the path routes going
+// through a second implementation that dialled the backend per request.
+func (s *Server) matchProxyTarget(req *Request) (*ProxyEngine, *domainState) {
+	if pe := s.proxy.Load(); pe != nil && req.Host != "" {
+		if ds := pe.Lookup(stripPort(req.Host)); ds != nil {
+			return pe, ds
+		}
+	}
+	if s.httpRouter != nil {
+		if route := s.httpRouter.match(req.Path); route != nil && route.ds != nil {
+			return httpRouteEngine, route.ds
+		}
+	}
+	return nil, nil
 }

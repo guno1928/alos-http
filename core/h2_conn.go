@@ -865,10 +865,22 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 		return
 	}
 
-	stream.Body = append(stream.Body, payload...)
+	if len(payload) > 0 {
+		if !hc.server.tryReserveBodyBytes(len(payload)) {
+			hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrEnhanceYourCalm))
+			hc.streams.Delete(int64(f.StreamID))
+			hc.activeStreams.Add(-1)
+			stream.Reset()
+			StreamPool.Put(stream)
+			return
+		}
+		stream.bodyOwner = hc.server
+		stream.bodyAccounted += int64(len(payload))
+		stream.Body = append(stream.Body, payload...)
+	}
 
 	maxBody := hc.server.config.MaxBodySize
-	if maxBody > 0 && int64(len(stream.Body)) > maxBody {
+	if hc.server.requestBodyTooLarge(len(stream.Body)) {
 		hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrCancel))
 		hc.streams.Delete(int64(f.StreamID))
 		hc.activeStreams.Add(-1)
@@ -960,8 +972,8 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 		if sw, ok := req.StreamWriter.(*H2StreamWriter); ok {
 			H2StreamWriterPool.Put(sw)
 		}
-		RequestPool.Put(req)
-		ResponsePool.Put(resp)
+		releaseRequestToPool(req)
+		releaseResponseToPool(resp)
 		return
 	}
 
@@ -980,8 +992,8 @@ func (hc *H2Conn) finishResponse(stream *H2Stream, req *Request, resp *Response)
 	if sw, ok := req.StreamWriter.(*H2StreamWriter); ok {
 		H2StreamWriterPool.Put(sw)
 	}
-	RequestPool.Put(req)
-	ResponsePool.Put(resp)
+	releaseRequestToPool(req)
+	releaseResponseToPool(resp)
 }
 
 func (hc *H2Conn) writeFastH2RootResponse(streamID uint32) {

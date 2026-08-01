@@ -702,14 +702,14 @@ func Timeout(d time.Duration) MiddlewareFunc {
 						resp.SetStreamer(tmpResp.Streamer())
 					}
 					tmpResp.Reset()
-					ResponsePool.Put(tmpResp)
+					releaseResponseToPool(tmpResp)
 				}
 			case <-ctx.Done():
 				timedOut.Store(true)
 				go func() {
 					<-done
 					tmpResp.Reset()
-					ResponsePool.Put(tmpResp)
+					releaseResponseToPool(tmpResp)
 				}()
 				resp.Status(504).String("Gateway Timeout")
 			}

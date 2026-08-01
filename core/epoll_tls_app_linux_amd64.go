@@ -62,6 +62,14 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			return epollActionCloseAfterFlush
 		}
 		if chunked {
+			if !c.reserveH1BodyBudget(srv, h1ChunkedBodyReservation(srv)) {
+				c.resp.Reset()
+				c.resp.Status(503).String("Request Body Capacity Exhausted")
+				scratch = appendPlainResponse(&c.resp, scratch)
+				c.plainBuf = scratch[:0]
+				c.epollTLSEncryptResponse(srv, scratch)
+				return epollActionCloseAfterFlush
+			}
 			scanFrom := headerEnd
 			if c.chunkScanPos > headerEnd && c.chunkScanPos <= len(data) {
 				scanFrom = c.chunkScanPos
@@ -119,6 +127,14 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				c.epollTLSEncryptResponse(srv, scratch)
 				return epollActionCloseAfterFlush
 			}
+			if !c.reserveH1BodyBudget(srv, contentLength) {
+				c.resp.Reset()
+				c.resp.Status(503).String("Request Body Capacity Exhausted")
+				scratch = appendPlainResponse(&c.resp, scratch)
+				c.plainBuf = scratch[:0]
+				c.epollTLSEncryptResponse(srv, scratch)
+				return epollActionCloseAfterFlush
+			}
 			bodyEnd := headerEnd + contentLength
 			if bodyEnd < headerEnd {
 				c.resp.Reset()
@@ -133,15 +149,6 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			}
 			c.req.Body = data[headerEnd:bodyEnd]
 			consumed = bodyEnd
-		}
-
-		if proxyActive {
-			if route := srv.httpRouter.match(c.req.Path); route != nil {
-				respBytes := srv.proxyFetchRaw(route, data[:consumed])
-				scratch = append(scratch, respBytes...)
-				c.appBufOff += consumed
-				continue
-			}
 		}
 
 		Stats.TotalReqs.Add(1)
@@ -166,6 +173,36 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			c.epollTLSEncryptResponse(srv, scratch)
 			scratch = c.plainBuf[:0]
 		}
+		// A proxied request is driven in this loop, exactly as on the plaintext
+		// path. Previously it called dispatch synchronously and blocked the
+		// worker on the backend, stalling every other TLS connection it owns.
+		// Pending plaintext has already been sealed above, so the relayed
+		// response can be written straight into the connection in order.
+		if pe, ds := srv.matchProxyTarget(&c.req); ds != nil {
+			{
+				w := c.worker
+				c.appBufOff += consumed
+				c.dispatching = true
+				c.inFlight++
+				if w.beginProxy(pe, ds, c, closeConn) == proxyStartPending {
+					c.plainBuf = scratch[:0]
+					return epollActionProxyInFlight
+				}
+				c.releaseH1BodyBudget()
+				c.dispatching = false
+				if c.inFlight > 0 {
+					c.inFlight--
+				}
+				scratch = appendPlainResponse(&c.resp, scratch)
+				if closeConn {
+					c.plainBuf = scratch[:0]
+					c.epollTLSEncryptResponse(srv, scratch)
+					return epollActionCloseAfterFlush
+				}
+				continue
+			}
+		}
+
 		c.req.connTakenOver = false
 		c.req.attachConn = c.worker.tlsH1Attacher(c, consumed)
 		if srv.fastDispatch.Load() {
@@ -195,6 +232,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		}
 		scratch = appendPlainResponse(&c.resp, scratch)
 		c.appBufOff += consumed
+		c.releaseH1BodyBudget()
 		if closeConn {
 			c.plainBuf = scratch[:0]
 			c.epollTLSEncryptResponse(srv, scratch)

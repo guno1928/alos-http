@@ -8,6 +8,16 @@
 !/go.sum
 !/core/
 
+# Keep the memory-flood audit and its bounded reproduction harness.
+!/docs/
+/docs/*
+!/docs/MEMORY_FLOOD_AUDIT.md
+!/cmd/
+/cmd/*
+!/cmd/memflood/
+/cmd/memflood/*
+!/cmd/memflood/main.go
+
 # Within core/, keep build artifacts and local junk out.
 core/*.exe
 core/*.test

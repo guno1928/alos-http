@@ -55,6 +55,22 @@ var ResponsePool = sync.Pool{
 	},
 }
 
+func releaseRequestToPool(r *Request) {
+	if r == nil {
+		return
+	}
+	r.Reset()
+	RequestPool.Put(r)
+}
+
+func releaseResponseToPool(r *Response) {
+	if r == nil {
+		return
+	}
+	r.Reset()
+	ResponsePool.Put(r)
+}
+
 // WriteBufPool pools byte slices sized for a maximum-size TLS record, used for outgoing writes.
 var WriteBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, MaxRecordSize); return &b },

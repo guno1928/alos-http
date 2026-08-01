@@ -51,12 +51,21 @@ var timeNow = time.Now
 //	Example: MaxBodySize: -1 allows unlimited bodies.
 //
 // MaxReadSize caps the per-connection read buffer in bytes; 0 applies a 2 MiB default cap, -1 disables the cap (unsafe).
+// This limit is independent from MaxBodySize: applications that intentionally accept bodies larger
+// than 2 MiB must opt in by setting both limits. Keeping the limits independent prevents a large body
+// allowance from silently multiplying the memory available to every unauthenticated connection.
 //
 //	Example: MaxReadSize: 1 << 20.
 //
 // MaxWriteSize caps total response bytes per connection; 0 means unlimited. Oversized responses are replaced with 500.
 //
 //	Example: MaxWriteSize: 5 << 20.
+
+// MaxInFlightBodyBytes caps aggregate request-body bytes buffered by multiplexed
+// HTTP/2 and HTTP/3 streams. 0 applies a 64 MiB default; -1 disables the budget
+// (unsafe on an Internet-facing server). Streams that would exceed it are reset.
+//
+//	Example: MaxInFlightBodyBytes: 32 << 20.
 //
 // MaxHeaderSize is the maximum header block in bytes; defaults to 8192.
 //
@@ -82,6 +91,11 @@ var timeNow = time.Now
 // MaxConcurrentReqs is a server-wide concurrency cap; 0 means unlimited. Excess requests get 503.
 //
 //	Example: MaxConcurrentReqs: 10000.
+
+// MaxConns caps all active TCP and QUIC connections owned by the server. 0
+// applies an 8192-connection default; -1 explicitly disables the cap.
+//
+//	Example: MaxConns: 4096.
 //
 // TLSCertFile and TLSKeyFile point to a PEM certificate/key pair used when Certs and ACME are unset.
 //
@@ -129,14 +143,14 @@ var timeNow = time.Now
 //
 // MinPrealloc is the number of connection objects kept preallocated (and
 // page-faulted) and ready to accept traffic instantly across all epoll
-// workers; the minimum is 15000. The pool prewarms this many, grows on
+// workers; the minimum is 1024. The pool prewarms this many, grows on
 // demand in PreallocBatch-sized steps, and shrinks fully-idle batches under
 // low load but never below the floor. This is the knob for "keep N
 // connections ready"; it does NOT bound memory under load — use MaxConns
 // for that.
 //
 //	Example: MinPrealloc: 20000 keeps 20000 connections ready to go.
-//	Example: MinPrealloc: 0 uses the 15000 minimum.
+//	Example: MinPrealloc: 0 uses the 1024 minimum.
 //
 // PreallocBatch is the number of slots added (or reclaimed) per pool growth step
 // — the slab size. 0 defaults to 128.
@@ -204,15 +218,16 @@ type Config struct {
 	IdleTimeout       time.Duration
 	HandshakeTimeout  time.Duration
 
-	MaxBodySize       int64
-	MaxReadSize       int64
-	MaxWriteSize      int64
-	MaxHeaderSize     int
-	MaxHeaderCount    int
-	MaxRequestsPerIP  int64
-	MaxConnsPerIP     int64
-	MaxConcurrentReqs int64
-	MaxConns          int64
+	MaxBodySize          int64
+	MaxReadSize          int64
+	MaxWriteSize         int64
+	MaxInFlightBodyBytes int64
+	MaxHeaderSize        int
+	MaxHeaderCount       int
+	MaxRequestsPerIP     int64
+	MaxConnsPerIP        int64
+	MaxConcurrentReqs    int64
+	MaxConns             int64
 
 	H2MaxConcurrentStreams uint32
 	H2InitialWindowSize    uint32
@@ -253,34 +268,34 @@ type Config struct {
 	WSWriteTimeout          time.Duration
 	WebSocketOriginMode     WSOriginMode
 	WebSocketAllowedOrigins []string
-
-	ProxyEpoll bool
 }
 
-const minPreallocFloor = 15_000
+const minPreallocFloor = 1_024
 
 // DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
 func DefaultConfig() Config {
 	return Config{
-		Addr:              ":8443",
-		MinPrealloc:       minPreallocFloor,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		HandshakeTimeout:  30 * time.Second,
-		MaxBodySize:       4 << 20,
-		MaxReadSize:       0,
-		MaxWriteSize:      0,
-		MaxHeaderSize:     8192,
-		MaxConcurrentReqs: 0,
-		ServerName:        "ALOS",
-		CompressLevel:     6,
-		CompressMinSize:   256,
-		WorkerCount:       0,
-		Listeners:         0,
-		Debug:             false,
-		LogRequests:       true,
-		ShutdownTimeout:   30 * time.Second,
+		Addr:                 ":8443",
+		MinPrealloc:          minPreallocFloor,
+		ReadTimeout:          30 * time.Second,
+		WriteTimeout:         30 * time.Second,
+		IdleTimeout:          120 * time.Second,
+		HandshakeTimeout:     30 * time.Second,
+		MaxBodySize:          4 << 20,
+		MaxReadSize:          0,
+		MaxWriteSize:         0,
+		MaxInFlightBodyBytes: 64 << 20,
+		MaxHeaderSize:        8192,
+		MaxConcurrentReqs:    0,
+		MaxConns:             8192,
+		ServerName:           "ALOS",
+		CompressLevel:        6,
+		CompressMinSize:      256,
+		WorkerCount:          0,
+		Listeners:            0,
+		Debug:                false,
+		LogRequests:          true,
+		ShutdownTimeout:      30 * time.Second,
 	}
 }
 
@@ -312,13 +327,18 @@ func resolveReadCap(v int64) int {
 }
 
 func (s *Server) effectiveReadCap() int {
-	rc := resolveReadCap(s.config.MaxReadSize)
-	if s.config.MaxReadSize == 0 && s.config.MaxBodySize > 0 {
-		if want := int(s.config.MaxBodySize) + (1 << 16); want > rc {
-			rc = want
-		}
+	return resolveReadCap(s.config.MaxReadSize)
+}
+
+func (s *Server) requestBodyTooLarge(n int) bool {
+	if n < 0 {
+		return true
 	}
-	return rc
+	if s.config.MaxBodySize > 0 && int64(n) > s.config.MaxBodySize {
+		return true
+	}
+	readCap := s.effectiveReadCap()
+	return readCap > 0 && readCap != readCapUnlimited && n > readCap
 }
 
 func (s *Server) h2MaxStreams() uint32 {
@@ -400,7 +420,7 @@ func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
 	c, ok := l.m.Load(ip)
 	if !ok {
 		if l.m.Len() >= maxTrackedIPs {
-			return true
+			return false
 		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
@@ -474,7 +494,7 @@ func (l *perIPConnLimiter) Stop() {
 	}
 }
 
-const maxTrackedIPs = 1_000_000
+const maxTrackedIPs = 65_536
 
 func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
@@ -483,7 +503,7 @@ func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
 	c, ok := l.m.Load(ip)
 	if !ok {
 		if l.m.Len() >= maxTrackedIPs {
-			return true
+			return false
 		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
@@ -521,47 +541,48 @@ type Server struct {
 	debug       atomic.Bool
 	logRequests atomic.Bool
 
-	config           Config
-	caps             Capabilities
-	capsLogOnce      sync.Once
-	Router           *Router
-	CORS             *CORSEngine
-	RateLimit        *RateLimitEngine
-	certStore        *CertStore
-	fallbackTLS      atomic.Pointer[tls.Config]
-	proxy            atomic.Pointer[ProxyEngine]
-	proxyDomains     []DomainConfig
-	httpRouter       *HTTPRouter
-	acme             *acmeIntegration
-	listeners        []net.Listener
-	done             chan struct{}
-	tlsRuntimeOnce   sync.Once
-	routerInitOnce   sync.Once
-	certInitOnce     sync.Once
-	certInitErr      error
-	x25519Pool       *x25519KeyPool
-	activeConns      atomic.Int64
-	shuttingDown     atomic.Bool
-	drainDone        chan struct{}
-	drainOnce        sync.Once
-	shutdownOnce     sync.Once
-	connLimiter      *ConnectionLimiter
-	globalLimiter    *GlobalLimiter
-	activeReqs       atomic.Int64
-	fastDispatch     atomic.Bool
-	plainRootFast    plainRootFastResponse
-	h2RootFast       h2RootFastResponse
-	trustedProxies   trustedProxyMatcher
-	perIPLimiter     *perIPRequestLimiter
-	perIPConnLimiter *perIPConnLimiter
-	maxConnsPerIP    int64
-	perIPInFlight    int64
-	trackedConnMu    sync.Mutex
-	trackedConns     map[*trackedHandoffConn]struct{}
-	onRequestHooks   []func(*Request, *Response) bool
-	onResponseHooks  []func(*Request, *Response)
-	srvKeepAlive     []byte
-	srvClose         []byte
+	config            Config
+	caps              Capabilities
+	capsLogOnce       sync.Once
+	Router            *Router
+	CORS              *CORSEngine
+	RateLimit         *RateLimitEngine
+	certStore         *CertStore
+	fallbackTLS       atomic.Pointer[tls.Config]
+	proxy             atomic.Pointer[ProxyEngine]
+	proxyDomains      []DomainConfig
+	httpRouter        *HTTPRouter
+	acme              *acmeIntegration
+	listeners         []net.Listener
+	done              chan struct{}
+	tlsRuntimeOnce    sync.Once
+	routerInitOnce    sync.Once
+	certInitOnce      sync.Once
+	certInitErr       error
+	x25519Pool        *x25519KeyPool
+	activeConns       atomic.Int64
+	shuttingDown      atomic.Bool
+	drainDone         chan struct{}
+	drainOnce         sync.Once
+	shutdownOnce      sync.Once
+	connLimiter       *ConnectionLimiter
+	globalLimiter     *GlobalLimiter
+	activeReqs        atomic.Int64
+	inFlightBodyBytes atomic.Int64
+	fastDispatch      atomic.Bool
+	plainRootFast     plainRootFastResponse
+	h2RootFast        h2RootFastResponse
+	trustedProxies    trustedProxyMatcher
+	perIPLimiter      *perIPRequestLimiter
+	perIPConnLimiter  *perIPConnLimiter
+	maxConnsPerIP     int64
+	perIPInFlight     int64
+	trackedConnMu     sync.Mutex
+	trackedConns      map[*trackedHandoffConn]struct{}
+	onRequestHooks    []func(*Request, *Response) bool
+	onResponseHooks   []func(*Request, *Response)
+	srvKeepAlive      []byte
+	srvClose          []byte
 }
 
 type trackedHandoffConn struct {
@@ -636,6 +657,12 @@ func New(configs ...Config) *Server {
 	if cfg.MaxBodySize == 0 {
 		cfg.MaxBodySize = 4 << 20
 	}
+	if cfg.MaxInFlightBodyBytes == 0 {
+		cfg.MaxInFlightBodyBytes = 64 << 20
+	}
+	if cfg.MaxConns == 0 {
+		cfg.MaxConns = 8192
+	}
 	cfg.ServerName = sanitizeHeaderValue(cfg.ServerName)
 	if cfg.ServerName == "" {
 		cfg.ServerName = "ALOS"
@@ -654,6 +681,9 @@ func New(configs ...Config) *Server {
 	}
 	if cfg.MinPrealloc < minPreallocFloor {
 		cfg.MinPrealloc = minPreallocFloor
+	}
+	if cfg.MaxConns > 0 && int64(cfg.MinPrealloc) > cfg.MaxConns {
+		cfg.MinPrealloc = int(cfg.MaxConns)
 	}
 
 	s := &Server{
@@ -899,12 +929,6 @@ func (s *Server) ListenAndServe() error {
 	addr := s.config.Addr
 	if addr == "" {
 		addr = ":80"
-	}
-
-	if s.config.ProxyEpoll && len(s.proxyDomains) > 0 {
-		if handled, err := s.serveEpollProxy(addr); handled {
-			return err
-		}
 	}
 
 	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge | epoll) ===")
@@ -1260,6 +1284,31 @@ func (s *Server) tryAcquireRequestSlot() bool {
 func (s *Server) releaseRequestSlot() {
 	if s.config.MaxConcurrentReqs > 0 {
 		s.activeReqs.Add(-1)
+	}
+}
+
+func (s *Server) tryReserveBodyBytes(n int) bool {
+	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
+		return true
+	}
+	limit := s.config.MaxInFlightBodyBytes
+	for {
+		used := s.inFlightBodyBytes.Load()
+		if int64(n) > limit-used {
+			return false
+		}
+		if s.inFlightBodyBytes.CompareAndSwap(used, used+int64(n)) {
+			return true
+		}
+	}
+}
+
+func (s *Server) releaseBodyBytes(n int64) {
+	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
+		return
+	}
+	if s.inFlightBodyBytes.Add(-n) < 0 {
+		s.inFlightBodyBytes.Add(n)
 	}
 }
 

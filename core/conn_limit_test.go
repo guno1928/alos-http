@@ -15,7 +15,7 @@ func TestConfig_MinPrealloc_DefaultFloor(t *testing.T) {
 		{30000, 30000},
 	}
 	for _, c := range cases {
-		s := New(Config{MinPrealloc: c.set, MaxConnsPerIP: -1})
+		s := New(Config{MinPrealloc: c.set, MaxConns: -1, MaxConnsPerIP: -1})
 		if s.config.MinPrealloc != c.want {
 			t.Fatalf("MinPrealloc set=%d => %d, want %d", c.set, s.config.MinPrealloc, c.want)
 		}

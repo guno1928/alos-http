@@ -113,13 +113,13 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 				if debugFlag.Load() {
 					log.Printf("[H3] QPACK decode error: %v", decErr)
 				}
-				RequestPool.Put(req)
+				releaseRequestToPool(req)
 				return
 			}
 		case h3FrameData:
 			req.Body = append(req.Body, payload...)
 			if max := h3.server.config.MaxBodySize; max > 0 && int64(len(req.Body)) > max {
-				RequestPool.Put(req)
+				releaseRequestToPool(req)
 				return
 			}
 		}
@@ -147,7 +147,7 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	req.Headers = req.Headers[:n]
 
 	if method == "" || path == "" {
-		RequestPool.Put(req)
+		releaseRequestToPool(req)
 		return
 	}
 	_ = scheme
@@ -177,8 +177,8 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 
 	h3.writeResponse(s, resp)
 
-	RequestPool.Put(req)
-	ResponsePool.Put(resp)
+	releaseRequestToPool(req)
+	releaseResponseToPool(resp)
 }
 
 func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {

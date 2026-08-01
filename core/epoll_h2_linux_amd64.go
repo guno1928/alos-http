@@ -375,8 +375,17 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 		return true
 	}
 
-	stream.Body = append(stream.Body, payload...)
-	if srv.config.MaxBodySize > 0 && int64(len(stream.Body)) > srv.config.MaxBodySize {
+	if len(payload) > 0 {
+		if !srv.tryReserveBodyBytes(len(payload)) {
+			c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrEnhanceYourCalm)
+			epollReleaseH2Stream(st, streamID)
+			return false
+		}
+		stream.bodyOwner = srv
+		stream.bodyAccounted += int64(len(payload))
+		stream.Body = append(stream.Body, payload...)
+	}
+	if srv.requestBodyTooLarge(len(stream.Body)) {
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrCancel)
 		epollReleaseH2Stream(st, streamID)
 		return false
@@ -501,6 +510,20 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 	w := c.worker
 	cc := c
 	sid := streamID
+
+	// A proxied stream is driven in this loop. Previously it parked a goroutine
+	// on the backend, which also meant per-domain timeouts were ignored because
+	// the blocking path used one process-global upstream client.
+	if pe, ds := srv.matchProxyTarget(&stream.req); ds != nil {
+		{
+			if w.beginProxyH2(pe, ds, c, stream, streamID) == proxyStartPending {
+				return false
+			}
+			c.finishH2Dispatch(w, gen, sid, stream)
+			return false
+		}
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -509,13 +532,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 			}
 			w.postTask(func(w *epollWorker) { cc.finishH2Dispatch(w, gen, sid, stream) })
 		}()
-		var proxyRoute *httpRouteEntry
-		if srv.httpRouter != nil {
-			proxyRoute = srv.httpRouter.match(stream.req.Path)
-		}
-		if proxyRoute != nil {
-			srv.proxyFetchIntoResponse(proxyRoute, &stream.req, &stream.resp)
-		} else if srv.fastDispatch.Load() {
+		if srv.fastDispatch.Load() {
 			handler := srv.Router.Lookup(stream.req.Method, stream.req.Path, &stream.req)
 			handler(&stream.req, &stream.resp)
 		} else {

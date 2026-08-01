@@ -90,7 +90,7 @@ func (h *h2Proto) connReady(c *backendConn) error {
 	c.send(h2WindowUpdateFrame(0, h2ConnWindowBump-h2DefaultWindow))
 	hc.prefaceSent = true
 	h.flushPending(c)
-	c.loop.flushWrites(c)
+	c.be.flushWrites(c)
 	return nil
 }
 
@@ -117,7 +117,7 @@ func (h *h2Proto) openStream(c *backendConn, ex *Exchange) {
 	st := &h2Stream{id: id, ex: ex, sendWindow: hc.peerInitWindow}
 	hc.streams[id] = st
 
-	hc.enc.reset(c.loop.serBuf[:0])
+	hc.enc.reset(c.be.serBuf[:0])
 	req := ex.req
 	scheme := req.Scheme
 	if scheme == "" {
@@ -139,13 +139,13 @@ func (h *h2Proto) openStream(c *backendConn, ex *Exchange) {
 		hc.enc.field(hd[0], hd[1])
 	}
 	block := hc.enc.buf
-	c.loop.serBuf = block
+	c.be.serBuf = block
 
 	endStream := len(req.Body) == 0
 	h2WriteHeaders(c, id, block, endStream)
 	st.bodyRem = req.Body
 	h.pumpBody(c, st)
-	c.loop.flushWrites(c)
+	c.be.flushWrites(c)
 }
 
 func (h *h2Proto) pumpBody(c *backendConn, st *h2Stream) {
@@ -213,7 +213,7 @@ func (h *h2Proto) handleFrame(c *backendConn, ftype, flags byte, streamID uint32
 			return err
 		}
 		c.send(h2SettingsAck())
-		c.loop.flushWrites(c)
+		c.be.flushWrites(c)
 	case h2FrameWindowUpdate:
 		if len(payload) != 4 {
 			return fpErrBadResponse
@@ -236,7 +236,7 @@ func (h *h2Proto) handleFrame(c *backendConn, ftype, flags byte, streamID uint32
 	case h2FramePing:
 		if flags&h2FlagAck == 0 {
 			c.send(h2PingAck(payload))
-			c.loop.flushWrites(c)
+			c.be.flushWrites(c)
 		}
 	case h2FrameGoAway:
 		hc.goAway = true
@@ -274,7 +274,7 @@ func (h *h2Proto) applySettings(c *backendConn, payload []byte) error {
 			st.sendWindow += delta
 		}
 	}
-	c.loop.h2proto.flushPending(c)
+	c.be.h2proto.flushPending(c)
 	h.resumeBodies(c)
 	return nil
 }
@@ -292,7 +292,7 @@ func (h *h2Proto) resumeBodies(c *backendConn) {
 		}
 	}
 	if wrote {
-		c.loop.flushWrites(c)
+		c.be.flushWrites(c)
 	}
 }
 
@@ -382,7 +382,7 @@ func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, paylo
 	st := hc.streams[streamID]
 	if len(payload) > 0 {
 		if st != nil {
-			if len(st.body)+len(payload) > c.loop.cfg.MaxResponseBody {
+			if len(st.body)+len(payload) > c.be.cfg.MaxResponseBody {
 				return fpErrBodyTooLarge
 			}
 			st.body = append(st.body, payload...)
@@ -391,7 +391,7 @@ func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, paylo
 		if st != nil {
 			c.send(h2WindowUpdateFrame(streamID, int32(len(payload))))
 		}
-		c.loop.flushWrites(c)
+		c.be.flushWrites(c)
 	}
 	if flags&h2FlagEndStream != 0 && st != nil {
 		h.finishStream(c, st)
@@ -409,12 +409,15 @@ func (h *h2Proto) finishStream(c *backendConn, st *h2Stream) {
 	ex := st.ex
 	ex.resp.Status = st.status
 	ex.resp.Headers = st.headers
+	// HPACK already produced strings, and a reused exchange may still be
+	// carrying an H1 parser's refs from an earlier response.
+	ex.resp.hdrRaw = nil
 	ex.resp.Body = st.body
-	c.loop.finish(ex, nil)
+	c.be.finish(ex, nil)
 	h.flushPending(c)
 	if len(hc.streams) == 0 && len(hc.pending) == 0 && !hc.goAway {
-		if c.loop.h2conns[c.key] != c {
-			c.loop.closeConn(c, nil)
+		if c.be.h2conns[c.key] != c {
+			c.be.closeConn(c, nil)
 		}
 	}
 }
@@ -428,7 +431,7 @@ func (h *h2Proto) closeStream(c *backendConn, streamID uint32, err error) {
 	delete(hc.streams, streamID)
 	if !st.ended {
 		st.ended = true
-		c.loop.failOrRetry(st.ex, err, c)
+		c.be.failOrRetry(st.ex, err, c)
 	}
 }
 
@@ -439,7 +442,7 @@ func (h *h2Proto) canIdle(c *backendConn) bool {
 	return false
 }
 
-func (hc *h2Conn) failAll(l *eventLoop, c *backendConn, err error) {
+func (hc *h2Conn) failAll(l *beLoop, c *backendConn, err error) {
 	for _, st := range hc.streams {
 		if !st.ended {
 			st.ended = true

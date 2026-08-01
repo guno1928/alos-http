@@ -70,8 +70,13 @@ func (st *tlsWorkerH2State) init() {
 	st.expectContinuation = 0
 	st.headerEndStream = false
 	st.appBufOff = 0
-	st.headerAccum = st.headerAccum[:0]
-	st.headersBuf = st.headersBuf[:0]
+	st.headerAccum = shrinkBuffer(st.headerAccum, 4096)
+	clear(st.headersBuf)
+	if cap(st.headersBuf) > 128 {
+		st.headersBuf = nil
+	} else {
+		st.headersBuf = st.headersBuf[:0]
+	}
 	st.rstCount = 0
 	st.rstWindow = 0
 	st.sendingBytes = 0
@@ -123,8 +128,13 @@ func (st *tlsWorkerH2State) reset() {
 	st.expectContinuation = 0
 	st.headerEndStream = false
 	st.appBufOff = 0
-	st.headerAccum = st.headerAccum[:0]
-	st.headersBuf = st.headersBuf[:0]
+	st.headerAccum = shrinkBuffer(st.headerAccum, 4096)
+	clear(st.headersBuf)
+	if cap(st.headersBuf) > 128 {
+		st.headersBuf = nil
+	} else {
+		st.headersBuf = st.headersBuf[:0]
+	}
 }
 
 func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {

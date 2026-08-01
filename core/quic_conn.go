@@ -23,7 +23,9 @@ const (
 	quicSpaceHandshake = 1
 	quicSpaceAppData   = 2
 
-	quicPktBufCap = 33280
+	quicPktBufCap        = 2048
+	quicMaxPktBufCap     = 33280
+	quicInboundQueueSize = 32
 
 	quicDefaultIdleTimeout      = 30 * time.Second
 	quicMaxPacketSize           = 1200
@@ -207,7 +209,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	qc.workShard = uint8(connShardCounter.Add(1) % reqStreamShards)
 	qc.pktBudget = quicCoalesceBudget
 	qc.lastActive.Store(turbo.UnixNano())
-	qc.inbound = make(chan quicInboundPkt, 256)
+	qc.inbound = make(chan quicInboundPkt, quicInboundQueueSize)
 	qc.recvLargest[0] = -1
 	qc.recvLargest[1] = -1
 	qc.recvLargest[2] = -1
@@ -620,9 +622,9 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 	s.refCount.Add(1)
 	qc.streamsMu.Unlock()
 
-	s.handleStreamFrame(f)
+	accepted := s.handleStreamFrame(f)
 
-	if f.fin && qc.h3 != nil && quicStreamIsBidi(f.streamID) && !quicStreamIsLocal(f.streamID, true) {
+	if accepted && f.fin && qc.h3 != nil && quicStreamIsBidi(f.streamID) && !quicStreamIsLocal(f.streamID, true) {
 		if qc.activeReqStreams.Add(1) > quicMaxConcurrentReqStreams {
 			qc.activeReqStreams.Add(-1)
 		} else if !s.dispatched.CompareAndSwap(false, true) {
@@ -927,8 +929,8 @@ func (qc *QUICConn) applyPeerTransportParams(ch *ParsedClientHello) {
 		if peer < limit {
 			limit = peer
 		}
-		if limit > quicPktBufCap-256 {
-			limit = quicPktBufCap - 256
+		if limit > quicMaxPktBufCap-256 {
+			limit = quicMaxPktBufCap - 256
 		}
 		if limit > quicMaxPacketSize {
 			qc.pktBudget = int(limit) - 100

@@ -145,10 +145,18 @@ func (r *Request) Reset() {
 	r.Proto = ""
 	r.Host = ""
 	r.RemoteAddr = ""
-	r.Headers = r.Headers[:0]
-	r.Body = r.Body[:0]
+	clear(r.Headers)
+	if cap(r.Headers) > 128 {
+		r.Headers = make([][2]string, 0, 16)
+	} else {
+		r.Headers = r.Headers[:0]
+	}
+	r.Body = shrinkBuffer(r.Body, 1024)
 	r.StreamID = 0
 	r.IsH2 = false
+	for i := 0; i < r.ParamCount && i < len(r.Params); i++ {
+		r.Params[i] = Param{}
+	}
 	r.ParamCount = 0
 	r.StreamWriter = nil
 	r.conn = nil
@@ -186,6 +194,7 @@ func (r *Request) Reset() {
 		delete(r.filesCache, k)
 	}
 	r.cookiesParsed = false
+	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
 	for k := range r.store {
@@ -194,8 +203,12 @@ func (r *Request) Reset() {
 }
 
 func (r *Request) resetFastH1() {
+	clear(r.Headers)
 	r.Headers = r.Headers[:0]
-	r.Body = r.Body[:0]
+	r.Body = shrinkBuffer(r.Body, 1024)
+	for i := 0; i < r.ParamCount && i < len(r.Params); i++ {
+		r.Params[i] = Param{}
+	}
 	r.ParamCount = 0
 	r.RawPath = ""
 	r.Query = ""
@@ -255,6 +268,7 @@ func (r *Request) resetFastH1() {
 		delete(r.filesCache, k)
 	}
 	r.cookiesParsed = false
+	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
 	for k := range r.store {

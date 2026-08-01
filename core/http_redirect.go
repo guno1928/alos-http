@@ -27,6 +27,33 @@ type httpRouteEntry struct {
 	pathPrefix string
 	addr       string
 	hostHeader string
+	// ds lets a port-80 route be served by the unified proxy engine instead of
+	// a second implementation that dialled the backend on every request.
+	ds *domainState
+}
+
+// httpRouteEngine carries no cache and no hooks: a port-80 route has none of
+// that configuration, but the in-loop proxy path expects a ProxyEngine to ask.
+var httpRouteEngine = &ProxyEngine{}
+
+// newHTTPRouteDomain wraps one path-prefix route as a single-backend domain so
+// beginProxy can serve it, which brings connection pooling, per-request
+// timeouts and non-blocking relaying to a path that had none.
+func newHTTPRouteDomain(addr, hostHeader string) *domainState {
+	cfg := DomainConfig{
+		Domain:     addr,
+		HostHeader: hostHeader,
+		Backends:   []BackendConfig{{Addr: addr}},
+	}
+	cfg.normalize()
+	b := &backend{Addr: addr}
+	b.Healthy.Store(true)
+	backends := []*backend{b}
+	return &domainState{
+		config:   cfg,
+		backends: backends,
+		balancer: newBalancer(cfg.LoadBalancer, backends),
+	}
 }
 
 type httpRoutesSnapshot struct {
@@ -80,10 +107,12 @@ func normalizeRouteAddr(addr string) string {
 func (hr *HTTPRouter) SetRoutes(routes []HTTPRoute) {
 	entries := make([]httpRouteEntry, len(routes))
 	for i, r := range routes {
+		addr := normalizeRouteAddr(r.Backend)
 		entries[i] = httpRouteEntry{
 			pathPrefix: r.PathPrefix,
-			addr:       normalizeRouteAddr(r.Backend),
+			addr:       addr,
 			hostHeader: r.HostHeader,
+			ds:         newHTTPRouteDomain(addr, r.HostHeader),
 		}
 	}
 	hr.snapshot.Store(&httpRoutesSnapshot{routes: entries})
@@ -95,10 +124,12 @@ func (hr *HTTPRouter) SetRoutes(routes []HTTPRoute) {
 func (hr *HTTPRouter) AddRoute(route HTTPRoute) {
 	hr.mu.Lock()
 	old := hr.snapshot.Load()
+	addr := normalizeRouteAddr(route.Backend)
 	entry := httpRouteEntry{
 		pathPrefix: route.PathPrefix,
-		addr:       normalizeRouteAddr(route.Backend),
+		addr:       addr,
 		hostHeader: route.HostHeader,
+		ds:         newHTTPRouteDomain(addr, route.HostHeader),
 	}
 	newRoutes := make([]httpRouteEntry, len(old.routes)+1)
 	copy(newRoutes, old.routes)

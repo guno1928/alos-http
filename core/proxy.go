@@ -180,6 +180,7 @@ type ProxyResponse struct {
 	Headers    [][2]string
 
 	cacheRequested   bool
+	cacheSuppressed  bool
 	cacheTTL         time.Duration
 	cacheMaxHits     uint64
 	cacheCompress    bool
@@ -243,6 +244,7 @@ func (pr *ProxyResponse) CacheThis(ttl time.Duration, maxHits uint64, opts ...Ca
 		fn(&o)
 	}
 	pr.cacheRequested = true
+	pr.cacheSuppressed = false
 	pr.cacheTTL = ttl
 	pr.cacheMaxHits = maxHits
 	pr.cacheCompress = o.preCompress
@@ -258,6 +260,7 @@ func (pr *ProxyResponse) CacheThis(ttl time.Duration, maxHits uint64, opts ...Ca
 //	}
 func (pr *ProxyResponse) DontCache() {
 	pr.cacheRequested = false
+	pr.cacheSuppressed = true
 	pr.cacheTTL = 0
 }
 
@@ -280,7 +283,12 @@ type ProxyResponseFunc func(pr *ProxyResponse)
 //
 //   - MaxRetries: 2
 //
-//   - MaxIdleConns: 32
+//   - MaxIdleConns: 256, counted per event-loop worker per backend rather than
+//     per domain, so total idle capacity is this value times the worker count.
+//     It caps retention, not creation: a larger value never opens a connection
+//     that would not otherwise be opened, it only stops one that just finished
+//     being closed. Sizing it below the requests a single worker has in flight
+//     forces the surplus to be redialled on every request.
 //
 //   - IdleTimeout: 90s
 //
@@ -333,7 +341,7 @@ func (dc *DomainConfig) normalize() {
 		dc.MaxRetries = 2
 	}
 	if dc.MaxIdleConns <= 0 {
-		dc.MaxIdleConns = 32
+		dc.MaxIdleConns = 256
 	}
 	if dc.IdleTimeout <= 0 {
 		dc.IdleTimeout = 90 * time.Second
@@ -490,7 +498,9 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 			TLSSkipVerify: bc.TLSSkipVerify,
 		}
 		b.Healthy.Store(true)
-		b.pool = newConnPool(bc.Addr, bc.TLS, bc.TLSSkipVerify, cfg.MaxIdleConns, cfg.IdleTimeout, cfg.ConnectTimeout)
+		if backendPoolRequired {
+			b.pool = newConnPool(bc.Addr, bc.TLS, bc.TLSSkipVerify, cfg.MaxIdleConns, cfg.IdleTimeout, cfg.ConnectTimeout)
+		}
 		backends[i] = b
 	}
 

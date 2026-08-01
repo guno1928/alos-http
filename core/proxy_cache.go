@@ -944,3 +944,16 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 	r.pos += n
 	return n, nil
 }
+
+// maxCacheableSize reports the largest body this cache will store, so the proxy
+// can decide whether a response is worth buffering in order to cache it.
+func (pc *ProxyCache) maxCacheableSize() int64 {
+	if pc == nil {
+		return 0
+	}
+	cfg := pc.config.Load()
+	if cfg == nil {
+		return 0
+	}
+	return cfg.MaxEntrySize
+}

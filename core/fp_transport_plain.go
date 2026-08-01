@@ -7,7 +7,7 @@ type plainTransport struct {
 }
 
 func (t *plainTransport) start(c *backendConn) error {
-	c.loop.onTransportReady(c)
+	c.be.onTransportReady(c)
 	return nil
 }
 

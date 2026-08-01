@@ -3,10 +3,14 @@
 package core
 
 import (
+	"crypto"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -44,36 +48,37 @@ const (
 )
 
 type tlsTransport struct {
-	state       tlsState
-	version     uint16
-	priv        *ecdh.PrivateKey
-	clientRandom [32]byte
-	serverRandom [32]byte
-	suite       uint16
-	hashFn      func() hash.Hash
-	hashLen     int
-	transcript  []byte
-	handshakeSecret []byte
-	savedClientHS []byte
-	savedServerHS []byte
-	clientHSKey aeadKey
-	serverHSKey aeadKey
-	clientAppKey aeadKey
-	serverAppKey aeadKey
-	inHS        []byte
-	recBuf      []byte
-	serverName  string
-	alpnH2      bool
-	skipVerify  bool
-	certs       [][]byte
-	negALPN     string
-	sentFinished bool
-	alpnNegotiatedH2 bool
-	client12    aead12
-	server12    aead12
-	serverCipherActive bool
-	serverPub12 []byte
-	master12    []byte
+	state                     tlsState
+	version                   uint16
+	priv                      *ecdh.PrivateKey
+	clientRandom              [32]byte
+	serverRandom              [32]byte
+	suite                     uint16
+	hashFn                    func() hash.Hash
+	hashLen                   int
+	transcript                []byte
+	handshakeSecret           []byte
+	savedClientHS             []byte
+	savedServerHS             []byte
+	clientHSKey               aeadKey
+	serverHSKey               aeadKey
+	clientAppKey              aeadKey
+	serverAppKey              aeadKey
+	inHS                      []byte
+	recBuf                    []byte
+	serverName                string
+	alpnH2                    bool
+	skipVerify                bool
+	certs                     [][]byte
+	serverProvedKeyPossession bool
+	negALPN                   string
+	sentFinished              bool
+	alpnNegotiatedH2          bool
+	client12                  aead12
+	server12                  aead12
+	serverCipherActive        bool
+	serverPub12               []byte
+	master12                  []byte
 }
 
 type aeadKey struct {
@@ -200,7 +205,7 @@ func (t *tlsTransport) feed(c *backendConn, raw []byte) error {
 		}
 		t.recBuf = t.recBuf[5+length:]
 		if t.state == tlsDone {
-			c.loop.onTransportReady(c)
+			c.be.onTransportReady(c)
 		}
 	}
 }
@@ -333,6 +338,14 @@ func (t *tlsTransport) handleEncryptedHandshake(c *backendConn, data []byte) err
 		if mtype == tlsHSCertificate {
 			t.parseCertificate(msg[4:])
 		}
+		if mtype == tlsHSCertVerify {
+			if !t.skipVerify {
+				if err := t.verifyCertificateVerify(msg[4:]); err != nil {
+					return err
+				}
+			}
+			t.serverProvedKeyPossession = true
+		}
 		if mtype == tlsHSEncryptedExts {
 			t.parseEncryptedExtensions(msg[4:])
 		}
@@ -349,6 +362,9 @@ func (t *tlsTransport) verifyServerFinished(msg []byte) error {
 		return errTLS
 	}
 	if !t.skipVerify {
+		if !t.serverProvedKeyPossession {
+			return errTLS
+		}
 		if err := t.verifyCerts(); err != nil {
 			return err
 		}
@@ -409,6 +425,82 @@ func (t *tlsTransport) verifyCerts() error {
 	}
 	_, err = leaf.Verify(x509.VerifyOptions{DNSName: t.serverName, Intermediates: pool})
 	return err
+}
+
+func (t *tlsTransport) verifyCertificateVerify(body []byte) error {
+	if len(body) < 4 {
+		return errTLS
+	}
+	scheme := uint16(body[0])<<8 | uint16(body[1])
+	sigLen := int(body[2])<<8 | int(body[3])
+	if 4+sigLen > len(body) {
+		return errTLS
+	}
+	if len(t.certs) == 0 {
+		return errTLS
+	}
+	leaf, err := x509.ParseCertificate(t.certs[0])
+	if err != nil {
+		return err
+	}
+	return verifyHandshakeSignature(leaf.PublicKey, scheme, t.certVerifyContent(), body[4:4+sigLen])
+}
+
+func (t *tlsTransport) certVerifyContent() []byte {
+	transcriptHash := t.hashOf(t.transcript)
+	signed := make([]byte, 0, len(cvPrefix)+len(cvContext)+1+len(transcriptHash))
+	signed = append(signed, cvPrefix[:]...)
+	signed = append(signed, cvContext...)
+	signed = append(signed, 0x00)
+	signed = append(signed, transcriptHash...)
+	return signed
+}
+
+func verifyHandshakeSignature(pub any, scheme uint16, signed, sig []byte) error {
+	switch scheme {
+	case 0x0804, 0x0805, 0x0806:
+		key, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return errTLS
+		}
+		h, id := signatureHash(scheme)
+		h.Write(signed)
+		return rsa.VerifyPSS(key, id, h.Sum(nil), sig,
+			&rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: id})
+	case 0x0403, 0x0503, 0x0603:
+		key, ok := pub.(*ecdsa.PublicKey)
+		if !ok {
+			return errTLS
+		}
+		h, _ := signatureHash(scheme)
+		h.Write(signed)
+		if !ecdsa.VerifyASN1(key, h.Sum(nil), sig) {
+			return errTLS
+		}
+		return nil
+	case 0x0807:
+		key, ok := pub.(ed25519.PublicKey)
+		if !ok {
+			return errTLS
+		}
+		if !ed25519.Verify(key, signed, sig) {
+			return errTLS
+		}
+		return nil
+	default:
+		return errTLS
+	}
+}
+
+func signatureHash(scheme uint16) (hash.Hash, crypto.Hash) {
+	switch scheme {
+	case 0x0805, 0x0503:
+		return sha512.New384(), crypto.SHA384
+	case 0x0806, 0x0603:
+		return sha512.New(), crypto.SHA512
+	default:
+		return sha256.New(), crypto.SHA256
+	}
 }
 
 func (t *tlsTransport) parseCertificate(body []byte) {

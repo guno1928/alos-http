@@ -44,6 +44,12 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 			return epollActionCloseAfterFlush
 		}
 		if chunked {
+			if !c.reserveH1BodyBudget(srv, h1ChunkedBodyReservation(srv)) {
+				c.resp.Reset()
+				c.resp.Status(503).String("Request Body Capacity Exhausted")
+				c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
+				return epollActionCloseAfterFlush
+			}
 			scanFrom := headerEnd
 			if c.chunkScanPos > headerEnd && c.chunkScanPos <= len(data) {
 				scanFrom = c.chunkScanPos
@@ -98,6 +104,12 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 				c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
 				return epollActionCloseAfterFlush
 			}
+			if !c.reserveH1BodyBudget(srv, contentLength) {
+				c.resp.Reset()
+				c.resp.Status(503).String("Request Body Capacity Exhausted")
+				c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
+				return epollActionCloseAfterFlush
+			}
 			bodyEnd := headerEnd + contentLength
 			if bodyEnd < headerEnd {
 				c.resp.Reset()
@@ -114,15 +126,6 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 			}
 			c.req.Body = data[headerEnd:bodyEnd]
 			consumed = bodyEnd
-		}
-
-		if proxyActive {
-			if route := srv.httpRouter.match(c.req.Path); route != nil {
-				c.proxyRoute = route
-				c.proxyRawReq = append(c.proxyRawReq[:0], data[:consumed]...)
-				c.h1Off += consumed
-				return epollActionProxyDetach
-			}
 		}
 
 		Stats.TotalReqs.Add(1)
@@ -150,6 +153,28 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 		c.inFlight++
 		gen := c.generation
 		w := c.worker
+
+		// A proxied request never leaves this thread: the backend socket joins
+		// the same epoll set, so no goroutine, wake-up or hand-off is involved.
+		// An upgrade answered with 101 turns the same pair into a byte tunnel.
+		if pe, ds := srv.matchProxyTarget(&c.req); ds != nil {
+			{
+				c.req.RemoteAddr = c.remoteAddr
+				if w.beginProxy(pe, ds, c, closeConn) == proxyStartPending {
+					return epollActionProxyInFlight
+				}
+				c.releaseH1BodyBudget()
+				c.dispatching = false
+				if c.inFlight > 0 {
+					c.inFlight--
+				}
+				c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
+				if closeConn {
+					return epollActionCloseAfterFlush
+				}
+				continue
+			}
+		}
 		c.req.connTakenOver = false
 		c.req.attachConn = w.plainH1Attacher(c, gen)
 		cc := c
@@ -177,6 +202,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 }
 
 func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) {
+	c.releaseH1BodyBudget()
 	if c.inFlight > 0 {
 		c.inFlight--
 	}

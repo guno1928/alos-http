@@ -95,6 +95,8 @@ type RateLimitEngine struct {
 	OnLimit RateLimitFunc
 }
 
+const maxRateLimitEntries = 65_536
+
 // NewRateLimitEngine creates a new rate limiter with an empty rule set and starts
 // the background cleanup goroutine. Call Stop when the engine is no longer needed.
 func NewRateLimitEngine() *RateLimitEngine {
@@ -245,6 +247,13 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 
 	entry, ok := rle.clients.Load(key)
 	if !ok {
+		if rle.clients.Len() >= maxRateLimitEntries {
+			blockFor := cr.rule.BlockFor
+			if blockFor <= 0 {
+				blockFor = cr.rule.Window
+			}
+			return false, cr, blockFor
+		}
 		newEntry := &rlEntry{}
 		newEntry.reset.Store(now + cr.rule.Window.Nanoseconds())
 		entry, _ = rle.clients.LoadOrStore(key, newEntry)

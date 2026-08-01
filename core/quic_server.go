@@ -156,8 +156,12 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	if quicHandshakingConns.Load() >= quicMaxHandshaking {
 		return nil
 	}
+	if !s.tryTrackConn() {
+		return nil
+	}
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
+		s.releaseTrackedConn()
 		if debugFlag.Load() {
 			log.Printf("[QUIC] derive initial keys: %v", err)
 		}
@@ -181,6 +185,7 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 
 	quicActiveConns.Add(1)
 	quicHandshakingConns.Add(1)
+	Stats.ActiveConns.Add(1)
 	qc.handshakeCounted.Store(true)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
@@ -191,6 +196,8 @@ func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, sc
 	go func() {
 		<-qc.done
 		quicActiveConns.Add(-1)
+		Stats.ActiveConns.Add(-1)
+		s.releaseTrackedConn()
 		qc.clearHandshaking()
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)

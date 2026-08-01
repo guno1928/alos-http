@@ -3,11 +3,9 @@
 package core
 
 import (
-	"runtime"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/guno1928/turbo"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,26 +16,13 @@ const (
 )
 
 type eventLoop struct {
-	ep          int
+	beLoop
 	wakeFd      int
 	q           mpscQueue
 	sleeping    atomic.Int32
-	cfg         *fpConfig
-	conns       []*backendConn
-	inconns     []*inConn
-	listenFd    int
-	proxyRoutes *routeTable
-	idle        map[poolKey][]*backendConn
-	h2conns     map[poolKey]*backendConn
-	lastSweep   int64
-	liveConns   int
-	liveInconns int
+	quit        atomic.Int32
 	exFree      *Exchange
 	events      []unix.EpollEvent
-	scratch     []byte
-	serBuf      []byte
-	h1proto     h1Proto
-	h2proto     h2Proto
 	wakeBuf     [8]byte
 }
 
@@ -52,15 +37,10 @@ func newEventLoop(cfg *fpConfig) (*eventLoop, error) {
 		return nil, err
 	}
 	l := &eventLoop{
-		ep:       ep,
-		wakeFd:   wakeFd,
-		listenFd: -1,
-		cfg:      cfg,
-		idle:     make(map[poolKey][]*backendConn),
-		h2conns:  make(map[poolKey]*backendConn),
-		events:   make([]unix.EpollEvent, loopEventBatch),
-		scratch:  make([]byte, loopScratchSize),
+		wakeFd: wakeFd,
+		events: make([]unix.EpollEvent, loopEventBatch),
 	}
+	l.beLoop.init(ep, cfg, l)
 	l.q.init()
 	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(wakeFd)}
 	if err := unix.EpollCtl(ep, unix.EPOLL_CTL_ADD, wakeFd, &ev); err != nil {
@@ -69,10 +49,6 @@ func newEventLoop(cfg *fpConfig) (*eventLoop, error) {
 		return nil, err
 	}
 	return l, nil
-}
-
-func (l *eventLoop) nowNano() int64 {
-	return turbo.UnixNano()
 }
 
 func (l *eventLoop) submit(ex *Exchange) {
@@ -87,9 +63,30 @@ func exchangeFromNode(n *mpscNode) *Exchange {
 	return (*Exchange)(unsafe.Pointer(n))
 }
 
+// stop asks the loop to exit and wakes it so it notices promptly.
+func (l *eventLoop) stop() {
+	l.quit.Store(1)
+	var one = [8]byte{1, 0, 0, 0, 0, 0, 0, 0}
+	_, _ = unix.Write(l.wakeFd, one[:])
+}
+
+// release closes the connections this loop owns along with its epoll and wake
+// descriptors, so a closed client does not leak a thread and two fds per loop.
+func (l *eventLoop) release() {
+	l.closeAll()
+	_ = unix.Close(l.ep)
+	_ = unix.Close(l.wakeFd)
+}
+
+// run drives this loop's epoll set. The loop keeps no thread affine state, so
+// it deliberately does not lock an OS thread: letting the scheduler place it
+// measured faster and avoids oversubscribing cores when loops outnumber them.
 func (l *eventLoop) run() {
-	runtime.LockOSThread()
 	for {
+		if l.quit.Load() == 1 {
+			l.release()
+			return
+		}
 		drained := false
 		for {
 			n := l.q.pop()
@@ -108,6 +105,7 @@ func (l *eventLoop) run() {
 				timeout = 0
 			}
 		}
+		l.seq++
 		nev, err := unix.EpollWait(l.ep, l.events, timeout)
 		l.sleeping.Store(0)
 		if err != nil && err != unix.EINTR {
@@ -120,26 +118,11 @@ func (l *eventLoop) run() {
 				_, _ = unix.Read(l.wakeFd, l.wakeBuf[:])
 				continue
 			}
-			if fd == l.listenFd {
-				l.acceptLoop()
-				continue
-			}
-			if fd >= 0 && fd < len(l.inconns) {
-				if ic := l.inconns[fd]; ic != nil {
-					if evs&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP) != 0 {
-						l.inboundReadable(ic)
-					}
-					if !ic.closed && evs&unix.EPOLLOUT != 0 {
-						l.inboundWritable(ic)
-					}
-					continue
-				}
-			}
 			if fd < 0 || fd >= len(l.conns) {
 				continue
 			}
 			c := l.conns[fd]
-			if c == nil || c.state == connClosed {
+			if c == nil || c.state == connClosed || l.staleInBatch(c) {
 				continue
 			}
 			if evs&unix.EPOLLERR != 0 {
@@ -173,97 +156,70 @@ func (l *eventLoop) run() {
 	}
 }
 
-func (l *eventLoop) ensureFD(fd int) {
-	for fd >= len(l.conns) {
-		l.conns = append(l.conns, nil)
-	}
+// exchangeDone is the beSink terminal callback. This loop is an outbound
+// client, so a finished exchange with no waiter simply returns to the freelist.
+func (l *eventLoop) exchangeDone(ex *Exchange) {
+	l.exPut(ex)
 }
 
-func (l *eventLoop) startExchange(ex *Exchange) {
-	now := l.nowNano()
-	if now >= ex.deadline {
-		l.finish(ex, fpErrTimeout)
-		return
+func (l *eventLoop) exGet() *Exchange {
+	ex := l.exFree
+	if ex != nil {
+		l.exFree = ex.pnext
+		*ex = Exchange{req: ex.req}
+		return ex
 	}
-	if ex.key.h2 {
-		if c := l.h2conns[ex.key]; c != nil && c.state != connClosed && !c.h2.goAway {
-			l.assign(c, ex)
-			return
-		}
-		l.newConn(ex)
-		return
-	}
-	list := l.idle[ex.key]
-	for len(list) > 0 {
-		c := list[len(list)-1]
-		list = list[:len(list)-1]
-		l.idle[ex.key] = list
-		c.inIdle = false
-		if c.state != connReady {
-			continue
-		}
-		if now > c.idleDeadline {
-			l.closeConn(c, nil)
-			continue
-		}
-		c.reused = true
-		l.assign(c, ex)
-		return
-	}
-	l.newConn(ex)
+	return &Exchange{req: &fpRequest{}}
 }
 
-func (l *eventLoop) newTransport(ex *Exchange) transport {
-	if ex.key.tls {
-		return newTLSTransport(ex)
-	}
-	return &plainTransport{h2: ex.key.h2}
+func (l *eventLoop) exPut(ex *Exchange) {
+	req := ex.req
+	*req = fpRequest{}
+	*ex = Exchange{req: req}
+	ex.pnext = l.exFree
+	l.exFree = ex
 }
 
-func (l *eventLoop) removeIdle(c *backendConn) {
-	if !c.inIdle {
-		return
-	}
-	c.inIdle = false
-	list := l.idle[c.key]
-	for i, v := range list {
-		if v == c {
-			list[i] = list[len(list)-1]
-			list[len(list)-1] = nil
-			l.idle[c.key] = list[:len(list)-1]
-			return
-		}
-	}
+// The remaining sink methods describe where a response goes. This loop serves
+// the outbound client, so a caller that supplied an UpstreamStream receives the
+// response as it arrives and everything else gets it buffered.
+
+func (l *eventLoop) shouldStreamResponse(c *backendConn, contentLen int64) bool {
+	return c.cur != nil && c.cur.sink != nil
 }
 
-func (l *eventLoop) idlePut(c *backendConn) {
-	list := l.idle[c.key]
-	if len(list) >= l.cfg.MaxIdlePerBackend {
-		l.closeConn(c, nil)
-		return
-	}
-	c.inIdle = true
-	c.reused = false
-	c.idleDeadline = l.nowNano() + l.cfg.IdleTimeout.Nanoseconds()
-	l.idle[c.key] = append(list, c)
-}
-
-func (l *eventLoop) completeH1(c *backendConn) {
+func (l *eventLoop) beginStreamResponse(c *backendConn, p *h1Parser, contentLen int64) {
 	ex := c.cur
-	c.cur = nil
-	p := &c.h1
-	ex.resp.Status = p.status
-	if ex.inbound != nil {
-		ex.resp.Headers = p.headers
-	} else {
-		ex.resp.Headers = append([][2]string(nil), p.headers...)
-	}
-	ex.resp.Body = p.body
-	p.body = nil
-	l.finish(ex, nil)
-	if c.proto.canIdle(c) {
-		l.idlePut(c)
+	if ex == nil || ex.sink == nil || ex.sink.OnHeaders == nil {
 		return
 	}
-	l.closeConn(c, nil)
+	if err := ex.sink.OnHeaders(p.status, p.stringHeaders()); err != nil {
+		l.closeConn(c, err)
+	}
 }
+
+func (l *eventLoop) streamResponseChunk(c *backendConn, data []byte) {
+	ex := c.cur
+	if ex == nil || ex.sink == nil || ex.sink.OnBody == nil {
+		return
+	}
+	if err := ex.sink.OnBody(data); err != nil {
+		l.closeConn(c, err)
+	}
+}
+
+func (l *eventLoop) endStreamResponse(ex *Exchange) {
+	if ex.done != nil {
+		close(ex.done)
+		return
+	}
+	l.exPut(ex)
+}
+
+// Upgrades are not part of the outbound client contract, so a 101 here is a
+// protocol error rather than a tunnel.
+func (l *eventLoop) beginTunnel(c *backendConn, p *h1Parser) bool { return false }
+
+func (l *eventLoop) tunnelToClient(c *backendConn, data []byte) {}
+
+func (l *eventLoop) closeTunnelPeer(c *backendConn) {}

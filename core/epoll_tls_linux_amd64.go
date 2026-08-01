@@ -280,6 +280,9 @@ func (c *epollConn) epollTLSDecryptToApp(srv *Server) (int, bool) {
 				c.compactCipher(totalLen)
 				return epollActionCloseAfterFlush, false
 			case 0x17:
+				if len(appContent) > srv.effectiveReadCap()-len(c.appBuf) {
+					return epollActionCloseAfterFlush, false
+				}
 				c.appBuf = append(c.appBuf, appContent...)
 				c.compactCipher(totalLen)
 				return epollTLSContinue, true
@@ -440,6 +443,9 @@ func (c *epollConn) epollTLS12DecryptToApp(srv *Server) (int, bool) {
 		case 0x17:
 			_, pt, ook := st.reader.open(c.readBuf[:totalLen])
 			if !ook {
+				return epollActionCloseAfterFlush, false
+			}
+			if len(pt) > srv.effectiveReadCap()-len(c.appBuf) {
 				return epollActionCloseAfterFlush, false
 			}
 			c.appBuf = append(c.appBuf, pt...)

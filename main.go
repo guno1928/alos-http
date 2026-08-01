@@ -20,35 +20,47 @@ type User struct {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	plainHTTP := false
+	plainHTTP := os.Getenv("ALOS_PLAIN_HTTP") == "1"
 	autoFineTune := os.Getenv("ALOS_FINE_TUNE") == "1"
 	defaultDomain := getenvDefault("ALOS_DOMAIN", "localhost")
 	tlsCertFile := os.Getenv("ALOS_TLS_CERT_FILE")
 	tlsKeyFile := os.Getenv("ALOS_TLS_KEY_FILE")
 	useACME := os.Getenv("ALOS_USE_ACME") == "1"
+	proxyDebug := os.Getenv("ALOS_PROXY_LOG") == "1"
 
 	var s *core.Server
 	if plainHTTP {
 		s = core.New(core.Config{
-			Addr:        ":80",
-			IdleTimeout: 120 * time.Second,
-			Listeners:   4,
-			Debug:       false,
-			LogRequests: false,
-			PlainHTTP:   true,
+			Addr:         ":80",
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
+			IdleTimeout:  15 * time.Second,
+			Listeners:    4,
+			Debug:        false,
+			LogRequests:  false,
+			PlainHTTP:    true,
 
-			MaxBodySize:       10 << 20,
-			MaxReadSize:       16 << 20,
-			MaxWriteSize:      64 << 20,
-			MaxHeaderSize:     8192,
-			MaxConcurrentReqs: 10000,
-			ServerName:        "ALOS",
+			MaxBodySize:            1 << 20,
+			MaxReadSize:            2 << 20,
+			MaxWriteSize:           4 << 20,
+			MaxInFlightBodyBytes:   32 << 20,
+			MaxHeaderSize:          8192,
+			MaxHeaderCount:         64,
+			MaxRequestsPerIP:       256,
+			MaxConnsPerIP:          24,
+			MaxConcurrentReqs:      2048,
+			MaxConns:               8192,
+			H2MaxConcurrentStreams: 64,
+			MinPrealloc:            1024,
+			ServerName:             "ALOS",
 		})
 	} else {
 		cfg := core.Config{
 			Addr:             ":443",
-			IdleTimeout:      120 * time.Second,
-			HandshakeTimeout: 30 * time.Second,
+			ReadTimeout:      5 * time.Second,
+			WriteTimeout:     5 * time.Second,
+			IdleTimeout:      15 * time.Second,
+			HandshakeTimeout: 5 * time.Second,
 			Listeners:        10,
 			WorkerCount:      30,
 			Debug:            false,
@@ -57,12 +69,21 @@ func main() {
 			TLSCertFile:      tlsCertFile,
 			TLSKeyFile:       tlsKeyFile,
 
-			MaxBodySize:       10 << 20,
-			MaxReadSize:       16 << 20,
-			MaxWriteSize:      64 << 20,
-			MaxHeaderSize:     8192,
-			MaxConcurrentReqs: 99999999,
-			ServerName:        "ALOS",
+			MaxBodySize:            1 << 20,
+			MaxReadSize:            2 << 20,
+			MaxWriteSize:           4 << 20,
+			MaxInFlightBodyBytes:   32 << 20,
+			MaxHeaderSize:          8192,
+			MaxHeaderCount:         64,
+			MaxRequestsPerIP:       256,
+			MaxConnsPerIP:          24,
+			MaxConcurrentReqs:      2048,
+			MaxConns:               8192,
+			H2MaxConcurrentStreams: 64,
+			QUICMaxData:            4 << 20,
+			QUICMaxStreamData:      1 << 20,
+			MinPrealloc:            1024,
+			ServerName:             "ALOS",
 		}
 		if useACME {
 			cfg.ACME = &core.ACMEConfig{
@@ -84,23 +105,31 @@ func main() {
 	})
 
 	s.OnProxyError(func(pe core.ProxyError) {
-		log.Printf("[PROXY-ERR] domain=%s backend=%s client=%s attempt=%d err=%v",
-			pe.Domain, pe.Backend, pe.ClientAddr, pe.Attempt, pe.Err)
+		if proxyDebug {
+			log.Printf("[PROXY-ERR] domain=%s backend=%s client=%s attempt=%d err=%v",
+				pe.Domain, pe.Backend, pe.ClientAddr, pe.Attempt, pe.Err)
+		}
 	})
 
-	s.OnProxyRequest(func(pr *core.ProxyRequest) bool {
-		log.Printf("[PROXY-REQ] %s %s from real_ip=%s -> %s (%s)",
-			pr.Method, pr.Path, pr.ClientAddr, pr.Backend, pr.Domain)
-		return true
-	})
+	if proxyDebug {
+		s.OnProxyRequest(func(pr *core.ProxyRequest) bool {
+			log.Printf("[PROXY-REQ] %s %s from real_ip=%s -> %s (%s)",
+				pr.Method, pr.Path, pr.ClientAddr, pr.Backend, pr.Domain)
+			return true
+		})
+	}
 
 	s.OnProxyResponse(func(pr *core.ProxyResponse) {
-		log.Printf("[PROXY-RESP] %d from %s -> %s (%s)",
-			pr.StatusCode, pr.ClientAddr, pr.Backend, pr.Domain)
+		if proxyDebug {
+			log.Printf("[PROXY-RESP] %d from %s -> %s (%s)",
+				pr.StatusCode, pr.ClientAddr, pr.Backend, pr.Domain)
+		}
 		pr.Headers = append(pr.Headers, [2]string{"X-Proxy-By", "ALOS"})
 
 		if pr.Backend == "cache" {
-			log.Printf("[PROXY-RESP] cache hit for %s%s, skipping CacheThis()", pr.Domain, pr.Path)
+			if proxyDebug {
+				log.Printf("[PROXY-RESP] cache hit for %s%s, skipping CacheThis()", pr.Domain, pr.Path)
+			}
 			return
 		}
 	})

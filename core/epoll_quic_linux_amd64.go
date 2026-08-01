@@ -31,6 +31,7 @@ func sortSendBatchByAddr(batch []quicSendReq) {
 const (
 	epollQUICRecvBatch = 64
 	epollQUICDgramSize = 2048
+	epollQUICSendQueue = 1024
 )
 
 type mmsghdr struct {
@@ -208,7 +209,7 @@ func createEpollQUICListeners(addr string, count int) ([]*epollUDPConn, error) {
 			_ = unix.Close(fd)
 			return nil, fmt.Errorf("bind: %w", err)
 		}
-		conns = append(conns, &epollUDPConn{fd: fd, done: make(chan struct{}), sendCh: make(chan quicSendReq, 16384)})
+		conns = append(conns, &epollUDPConn{fd: fd, done: make(chan struct{}), sendCh: make(chan quicSendReq, epollQUICSendQueue)})
 	}
 	return conns, nil
 }

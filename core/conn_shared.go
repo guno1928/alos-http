@@ -4,6 +4,9 @@ const (
 	plainConnProtoUnknown = 0
 	plainConnProtoH1      = 1
 	plainConnProtoH2      = 2
+	// plainConnProtoTunnel means the connection has been upgraded and its
+	// bytes are relayed verbatim to a backend rather than parsed.
+	plainConnProtoTunnel = 3
 
 	plainReadMinFree = 4096
 )

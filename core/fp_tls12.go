@@ -271,7 +271,7 @@ func (t *tlsTransport) handle12Finished(c *backendConn, plain []byte) error {
 		t.negALPN = "h2"
 	}
 	t.state = tlsDone
-	c.loop.onTransportReady(c)
+	c.be.onTransportReady(c)
 	return nil
 }
 

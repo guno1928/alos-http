@@ -28,8 +28,10 @@ const (
 const (
 	epollActionNeedRead = iota
 	epollActionCloseAfterFlush
-	epollActionProxyDetach
 	epollActionDetached
+	// epollActionProxyInFlight means an upstream exchange owns this connection
+	// until it completes: nothing may flush, recycle or close it meanwhile.
+	epollActionProxyInFlight
 )
 
 type epollConn struct {
@@ -68,10 +70,16 @@ type epollConn struct {
 	expectedFinN int
 	tls12        *tls12State
 
-	proxyRoute  *httpRouteEntry
-	proxyRawReq []byte
-	reqBodyCopy []byte
-	chunkScanPos int
+	reqBodyCopy     []byte
+	h1BodyAccounted int64
+	chunkScanPos    int
+
+	// proxyEx is the in-flight upstream exchange for this connection, and
+	// pausedBackend the backend socket whose reads were disarmed because this
+	// client fell behind while a response was being relayed.
+	proxyEx       *proxyExchange
+	pausedBackend *backendConn
+	tunnelBE      *backendConn
 
 	worker *epollWorker
 }
@@ -168,7 +176,7 @@ func (p *epollConnPool) put(c *epollConn) {
 	releaseIOBuf(c.plainBuf)
 	c.plainBuf = nil
 	c.reqBodyCopy = shrinkEpollBuf(c.reqBodyCopy)
-	c.proxyRawReq = shrinkEpollBuf(c.proxyRawReq)
+	c.releaseH1BodyBudget()
 	c.req.Body = nil
 	c.resp.resetFastH1()
 	if c.h2.decoder != nil {
@@ -182,6 +190,35 @@ func (p *epollConnPool) put(c *epollConn) {
 	if len(p.slabs) > p.floorSlabs && len(p.free) >= p.slabSize()*epollShrinkSlackSlabs {
 		p.shrinkOne()
 	}
+}
+
+func (c *epollConn) reserveH1BodyBudget(srv *Server, n int) bool {
+	if n <= 0 || c.h1BodyAccounted > 0 {
+		return true
+	}
+	if !srv.tryReserveBodyBytes(n) {
+		return false
+	}
+	c.h1BodyAccounted = int64(n)
+	return true
+}
+
+func (c *epollConn) releaseH1BodyBudget() {
+	if c.h1BodyAccounted <= 0 {
+		return
+	}
+	if c.worker != nil && c.worker.server != nil {
+		c.worker.server.releaseBodyBytes(c.h1BodyAccounted)
+	}
+	c.h1BodyAccounted = 0
+}
+
+func h1ChunkedBodyReservation(srv *Server) int {
+	limit := srv.effectiveReadCap()
+	if srv.config.MaxBodySize > 0 && (limit == readCapUnlimited || srv.config.MaxBodySize < int64(limit)) {
+		limit = int(srv.config.MaxBodySize)
+	}
+	return limit
 }
 
 func (p *epollConnPool) shrinkOne() {
@@ -229,6 +266,12 @@ type epollWorker struct {
 	writeTO         int64
 	idleTO          int64
 	lastSweep       int64
+	be              beLoop
+	beCfg           fpConfig
+	exFree          *Exchange
+	pxFree          *proxyExchange
+	beScratch       []byte
+	hdrStrings      [][2]string
 }
 
 // ListenAndServeEpollH2 listens on addr and serves plain HTTP/1.1 and
@@ -374,6 +417,7 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 	w.writeTO = int64(s.config.WriteTimeout)
 	w.idleTO = int64(s.config.IdleTimeout)
 	w.pool.prewarm(minPrealloc)
+	w.initBackendLoop()
 	return w, nil
 }
 
@@ -444,6 +488,7 @@ func (w *epollWorker) run() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	for {
+		w.be.seq++
 		n, err := unix.EpollWait(w.epfd, w.events, epollSweepIntervalMs)
 		if err != nil {
 			if err == unix.EINTR {
@@ -461,6 +506,10 @@ func (w *epollWorker) run() error {
 			}
 			if fd == w.wakeFd {
 				tasksPending = true
+				continue
+			}
+			if w.events[i].Pad == epollFDClassBackend {
+				w.backendEvent(fd, w.events[i].Events)
 				continue
 			}
 			if fd < 0 || fd >= len(w.conns) {
@@ -499,7 +548,7 @@ func (w *epollWorker) run() error {
 const epollSweepIntervalMs = 1000
 
 func (w *epollWorker) sweepDeadlines() {
-	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 {
+	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 && w.be.liveConns == 0 {
 		return
 	}
 	now := turbo.UnixNano()
@@ -507,6 +556,12 @@ func (w *epollWorker) sweepDeadlines() {
 		return
 	}
 	w.lastSweep = now
+	if w.be.liveConns > 0 {
+		w.be.sweepBackends(now)
+	}
+	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 {
+		return
+	}
 	for fd := 0; fd < len(w.conns); fd++ {
 		c := w.conns[fd]
 		if c == nil || c.fd < 0 {
@@ -567,7 +622,7 @@ func (w *epollWorker) acceptLoop() {
 		c.readN = 0
 		c.writeSent = 0
 		c.h1Off = 0
-	c.chunkScanPos = 0
+		c.chunkScanPos = 0
 		c.deadline = deadlineFrom(w.readTO)
 		c.remoteAddr = epollRemoteAddr(sa)
 		c.ipHeld = false
@@ -676,12 +731,18 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 		} else {
 			action = c.epollProcess(w.server)
 		}
-		if action == epollActionProxyDetach {
-			w.detachProxy(c)
-			return
-		}
 		if action == epollActionDetached {
 			w.recycleConn(c)
+			return
+		}
+		if action == epollActionProxyInFlight {
+			// The upstream exchange owns this connection now. Only a client
+			// that actually went away may tear it down here.
+			if closed {
+				w.closeConn(c)
+				return
+			}
+			c.deadline = 0
 			return
 		}
 		if action == epollActionCloseAfterFlush {
@@ -725,20 +786,6 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 		c.resp.resetFastH1()
 		c.deadline = deadlineFrom(w.idleTO)
 	}
-}
-
-func (w *epollWorker) detachProxy(c *epollConn) {
-	fd := c.fd
-	route := c.proxyRoute
-	rawReq := append([]byte(nil), c.proxyRawReq...)
-	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_DEL, fd, nil)
-	if fd < len(w.conns) {
-		w.conns[fd] = nil
-	}
-	c.fd = -1
-	c.proxyRoute = nil
-	w.recycleConn(c)
-	go w.server.epollProxyForward(fd, rawReq, route)
 }
 
 func (w *epollWorker) recycleConn(c *epollConn) {
@@ -800,6 +847,10 @@ func (c *epollConn) epollProcess(srv *Server) int {
 			Stats.H1Conns.Add(1)
 		}
 	}
+	if c.protocol == plainConnProtoTunnel {
+		c.worker.tunnelToBackend(c)
+		return epollActionNeedRead
+	}
 	if c.protocol == plainConnProtoH1 {
 		return c.epollProcessH1(srv)
 	}
@@ -823,6 +874,7 @@ func (w *epollWorker) flush(c *epollConn) bool {
 				w.closeConn(c)
 				return false
 			}
+			w.resumeRelayIfDrained(c)
 			w.armOut(c)
 			return true
 		}
@@ -834,6 +886,7 @@ func (w *epollWorker) flush(c *epollConn) bool {
 	if c.outArmed {
 		w.disarmOut(c)
 	}
+	w.resumeRelayIfDrained(c)
 	if c.closeAfter {
 		w.closeConn(c)
 		return false
@@ -873,6 +926,11 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	}
 	c.fd = -1
 	c.generation++
+	c.releaseH1BodyBudget()
+	w.abortProxyExchange(c)
+	if c.tunnelBE != nil {
+		w.closeTunnelFromClient(c)
+	}
 	delete(w.flushSet, c)
 	for id, stream := range c.h2.streams {
 		if stream.asyncBusy {

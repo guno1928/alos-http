@@ -56,15 +56,24 @@ type QUICStream struct {
 	maxSend         uint64
 	blockedSent     uint64
 	awaitingCleanup bool
+	recvAccounted   int64
 }
 
 func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 	return &QUICStream{
 		id:      id,
 		conn:    conn,
-		maxRecv: 1 << 20,
+		maxRecv: quicStreamRecvLimit(conn),
 		maxSend: 1 << 20,
 	}
+}
+
+func quicStreamRecvLimit(conn *QUICConn) uint64 {
+	limit := uint64(1 << 18)
+	if conn != nil && conn.server != nil && conn.server.config.QUICMaxStreamData > 0 {
+		limit = uint64(conn.server.config.QUICMaxStreamData)
+	}
+	return limit
 }
 
 var quicStreamPool = sync.Pool{
@@ -85,7 +94,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s.recvFin = false
 	s.recvFinOff = 0
 	s.recvClosed = false
-	s.maxRecv = 1 << 20
+	s.maxRecv = quicStreamRecvLimit(conn)
 	s.recvReady = nil
 	s.sendBuf = nil
 	s.sendOff = 0
@@ -97,6 +106,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	}
 	s.blockedSent = 0
 	s.awaitingCleanup = false
+	s.recvAccounted = 0
 	s.refCount.Store(0)
 	s.dispatched.Store(false)
 	s.cleanupDone.Store(false)
@@ -105,6 +115,10 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 
 func (qc *QUICConn) releaseStream(s *QUICStream) {
 	if s.refCount.Add(-1) == 0 {
+		if s.conn != nil && s.recvAccounted > 0 {
+			s.conn.server.releaseBodyBytes(s.recvAccounted)
+			s.recvAccounted = 0
+		}
 		if s.recvBufP != nil {
 			quicRecvDataPool.Put(s.recvBufP)
 			s.recvBufP = nil
@@ -116,12 +130,12 @@ func (qc *QUICConn) releaseStream(s *QUICStream) {
 	}
 }
 
-func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
+func (s *QUICStream) handleStreamFrame(f quicStreamFrame) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.recvClosed {
-		return
+		return false
 	}
 
 	if s.recvBufP == nil {
@@ -131,16 +145,25 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 
 	if f.offset == s.recvOff {
 		if uint64(len(s.recvBuf))+uint64(len(f.data)) > s.maxRecv {
-			return
+			return false
 		}
+		if len(f.data) > 0 && !s.conn.server.tryReserveBodyBytes(len(f.data)) {
+			return false
+		}
+		s.recvAccounted += int64(len(f.data))
 		s.recvBuf = append(s.recvBuf, f.data...)
 		s.recvOff += uint64(len(f.data))
 	} else if f.offset > s.recvOff {
 		needed := f.offset - s.recvOff + uint64(len(f.data))
 		if needed > s.maxRecv {
-			return
+			return false
 		}
 		if uint64(len(s.recvBuf)) < needed {
+			delta := int(needed) - len(s.recvBuf)
+			if !s.conn.server.tryReserveBodyBytes(delta) {
+				return false
+			}
+			s.recvAccounted += int64(delta)
 			grown := make([]byte, needed)
 			copy(grown, s.recvBuf)
 			s.recvBuf = grown
@@ -159,6 +182,7 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) {
 		default:
 		}
 	}
+	return true
 }
 
 // Read copies received stream data into p, blocking until data arrives,
