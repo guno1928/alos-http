@@ -419,9 +419,6 @@ func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
 	}
 	c, ok := l.m.Load(ip)
 	if !ok {
-		if l.m.Len() >= maxTrackedIPs {
-			return false
-		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
 	for {
@@ -494,17 +491,12 @@ func (l *perIPConnLimiter) Stop() {
 	}
 }
 
-const maxTrackedIPs = 65_536
-
 func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
 		return true
 	}
 	c, ok := l.m.Load(ip)
 	if !ok {
-		if l.m.Len() >= maxTrackedIPs {
-			return false
-		}
 		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 	}
 	for {
