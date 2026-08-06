@@ -34,13 +34,13 @@ type tlsWorkerH2State struct {
 	ctrlWindow   int64
 }
 
-func (st *tlsWorkerH2State) init() {
+func (st *tlsWorkerH2State) init(tableSize uint32) {
 	if st.decoder == nil {
 		st.decoder = HpackDecoderPool.Get().(*HpackDecoder)
 	}
 	*st.decoder = HpackDecoder{
-		maxTableSize:    H2HeaderTableSize,
-		protocolMaxSize: H2HeaderTableSize,
+		maxTableSize:    int(tableSize),
+		protocolMaxSize: int(tableSize),
 	}
 	if st.streams == nil {
 		st.streams = make(map[uint32]*H2Stream, 4)
@@ -139,7 +139,7 @@ func (st *tlsWorkerH2State) reset() {
 
 func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	settings := [5][2]uint32{
-		{uint32(H2SettingHeaderTableSize), 0},
+		{uint32(H2SettingHeaderTableSize), s.h2HeaderTableSize()},
 		{uint32(H2SettingMaxConcurrentStreams), s.h2MaxStreams()},
 		{uint32(H2SettingInitialWindowSize), s.h2InitialWindow()},
 		{uint32(H2SettingMaxFrameSize), s.h2MaxFrameSize()},

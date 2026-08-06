@@ -136,11 +136,14 @@ type cacheEntry struct {
 }
 
 func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) {
-	if entry.deleted.CompareAndSwap(false, true) {
-		pc.entries.Delete(key)
-		pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
-		pc.totalEntries.Add(-1)
+	if !entry.deleted.CompareAndSwap(false, true) {
+		return
 	}
+	if cur, ok := pc.entries.Load(key); ok && cur == entry {
+		pc.entries.Delete(key)
+	}
+	pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
+	pc.totalEntries.Add(-1)
 }
 
 // ProxyCache stores and serves cached upstream responses keyed by method, host, and
@@ -157,6 +160,7 @@ type ProxyCache struct {
 	totalHits    atomic.Uint64
 	totalMisses  atomic.Uint64
 	stopCh       chan struct{}
+	evicting     atomic.Bool
 	gzipPool     sync.Pool
 }
 
@@ -567,13 +571,16 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 	key := pc.buildKey(method, host, path)
 
-	if old, exists := pc.entries.Load(key); exists {
-		pc.totalBytes.Add(-int64(old.bodyLen) - int64(old.gzipLen))
+	if prev, loaded := pc.entries.LoadOrStore(key, entry); loaded {
+		if prev.deleted.CompareAndSwap(false, true) {
+			pc.totalBytes.Add(-int64(prev.bodyLen) - int64(prev.gzipLen))
+		} else {
+			pc.totalEntries.Add(1)
+		}
+		pc.entries.Store(key, entry)
 	} else {
 		pc.totalEntries.Add(1)
 	}
-
-	pc.entries.Store(key, entry)
 	pc.totalBytes.Add(bodyLen)
 
 	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
@@ -693,8 +700,24 @@ func (pc *ProxyCache) evictExpired() {
 }
 
 func (pc *ProxyCache) evictOldest() {
+	if !pc.evicting.CompareAndSwap(false, true) {
+		return
+	}
+	defer pc.evicting.Store(false)
+
 	cfg := pc.config.Load()
-	target := cfg.MaxTotalBytes * 90 / 100
+	byteTarget := int64(-1)
+	if cfg.MaxTotalBytes > 0 {
+		byteTarget = cfg.MaxTotalBytes * 90 / 100
+	}
+	entryTarget := int64(-1)
+	if cfg.MaxEntries > 0 {
+		headroom := cfg.MaxEntries / 10
+		if headroom < 1 {
+			headroom = 1
+		}
+		entryTarget = cfg.MaxEntries - headroom
+	}
 
 	type candidate struct {
 		key       string
@@ -714,7 +737,9 @@ func (pc *ProxyCache) evictOldest() {
 	})
 
 	for _, c := range candidates {
-		if pc.totalBytes.Load() <= target {
+		overBytes := byteTarget >= 0 && pc.totalBytes.Load() > byteTarget
+		overEntries := entryTarget >= 0 && pc.totalEntries.Load() > entryTarget
+		if !overBytes && !overEntries {
 			break
 		}
 		if entry, ok := pc.entries.Load(c.key); ok {

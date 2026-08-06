@@ -60,10 +60,10 @@ func asyncChunkedComplete(buf []byte, pos int) (bodyEnd int, status int, resume 
 				}
 			}
 		}
-		pos += int(size) + 2
-		if pos > len(buf) {
-			return 0, 0, pos
+		if size > int64(len(buf)-pos-2) {
+			return 0, 0, chunkStart
 		}
+		pos += int(size) + 2
 	}
 }
 

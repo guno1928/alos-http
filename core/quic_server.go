@@ -150,12 +150,6 @@ func (s *Server) handleQUICShortPacket(pc net.PacketConn, remoteAddr net.Addr, d
 }
 
 func (s *Server) createQUICConn(pc net.PacketConn, remoteAddr net.Addr, dcid, scid []byte, connMap *quicConnMap) *QUICConn {
-	if quicActiveConns.Load() >= quicMaxConns {
-		return nil
-	}
-	if quicHandshakingConns.Load() >= quicMaxHandshaking {
-		return nil
-	}
 	if !s.tryTrackConn() {
 		return nil
 	}

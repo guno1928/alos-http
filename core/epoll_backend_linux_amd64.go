@@ -263,6 +263,8 @@ type epollWorker struct {
 	flushSet        map[*epollConn]struct{}
 	h2FinishScratch []byte
 	readTO          int64
+	headerTO        int64
+	handshakeTO     int64
 	writeTO         int64
 	idleTO          int64
 	lastSweep       int64
@@ -335,6 +337,11 @@ func (s *Server) epollScavenger() {
 	var reclaims int
 	var ms runtime.MemStats
 	for {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
 		turbo.Sleep(2 * time.Second)
 		now := turbo.UnixNano()
 		cur := s.activeConns.Load()
@@ -414,6 +421,8 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
 	w.readTO = int64(s.config.ReadTimeout)
+	w.headerTO = int64(s.readHeaderTimeout())
+	w.handshakeTO = int64(optionalDuration(s.config.HandshakeTimeout, 30*time.Second))
 	w.writeTO = int64(s.config.WriteTimeout)
 	w.idleTO = int64(s.config.IdleTimeout)
 	w.pool.prewarm(minPrealloc)
@@ -458,6 +467,27 @@ func (w *epollWorker) runTask(fn func(*epollWorker)) {
 	fn(w)
 }
 
+func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[EPOLL-PANIC] worker %d conn recovered: %v", w.coreID, r)
+			w.closeConn(c)
+		}
+	}()
+	if evs&(unix.EPOLLERR|unix.EPOLLHUP) != 0 && evs&unix.EPOLLIN == 0 {
+		w.closeConn(c)
+		return
+	}
+	if evs&unix.EPOLLOUT != 0 {
+		if !w.flush(c) {
+			return
+		}
+	}
+	if evs&(unix.EPOLLIN|unix.EPOLLRDHUP) != 0 {
+		w.readable(c, evs&unix.EPOLLRDHUP != 0)
+	}
+}
+
 func epollListen(addr string) (int, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", addr)
 	if err != nil {
@@ -487,7 +517,23 @@ func epollListen(addr string) (int, error) {
 func (w *epollWorker) run() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	defer unix.Close(w.epfd)
+	defer unix.Close(w.wakeFd)
+	accepting := true
 	for {
+		if accepting {
+			select {
+			case <-w.server.done:
+				_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_DEL, w.listenerFD, nil)
+				_ = unix.Close(w.listenerFD)
+				w.listenerFD = -1
+				accepting = false
+			default:
+			}
+		}
+		if !accepting && !w.hasClientConns() {
+			return nil
+		}
 		w.be.seq++
 		n, err := unix.EpollWait(w.epfd, w.events, epollSweepIntervalMs)
 		if err != nil {
@@ -519,19 +565,7 @@ func (w *epollWorker) run() error {
 			if c == nil {
 				continue
 			}
-			evs := w.events[i].Events
-			if evs&(unix.EPOLLERR|unix.EPOLLHUP) != 0 && evs&unix.EPOLLIN == 0 {
-				w.closeConn(c)
-				continue
-			}
-			if evs&unix.EPOLLOUT != 0 {
-				if !w.flush(c) {
-					continue
-				}
-			}
-			if evs&(unix.EPOLLIN|unix.EPOLLRDHUP) != 0 {
-				w.readable(c, evs&unix.EPOLLRDHUP != 0)
-			}
+			w.serviceConn(c, w.events[i].Events)
 		}
 		if tasksPending {
 			_, _ = unix.Read(w.wakeFd, w.wakeBuf[:])
@@ -543,6 +577,15 @@ func (w *epollWorker) run() error {
 		}
 		w.sweepDeadlines()
 	}
+}
+
+func (w *epollWorker) hasClientConns() bool {
+	for _, c := range w.conns {
+		if c != nil && c.fd >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 const epollSweepIntervalMs = 1000
@@ -580,6 +623,16 @@ func deadlineFrom(to int64) int64 {
 	return turbo.UnixNano() + to
 }
 
+func (w *epollWorker) nextReadTimeout(c *epollConn) int64 {
+	if c.tls && c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native {
+		return w.handshakeTO
+	}
+	if c.h1BodyAccounted > 0 || c.protocol == plainConnProtoH2 || c.phase == tlsConnPhaseH2Native {
+		return w.readTO
+	}
+	return w.headerTO
+}
+
 func (w *epollWorker) markFlush(c *epollConn) {
 	w.flushSet[c] = struct{}{}
 }
@@ -595,6 +648,9 @@ func (w *epollWorker) flushPending() {
 
 func (w *epollWorker) acceptLoop() {
 	for {
+		if w.server.shuttingDown.Load() {
+			return
+		}
 		nfd, sa, err := unix.Accept4(w.listenerFD, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 		if err != nil {
 			if err == unix.EINTR {
@@ -623,7 +679,11 @@ func (w *epollWorker) acceptLoop() {
 		c.writeSent = 0
 		c.h1Off = 0
 		c.chunkScanPos = 0
-		c.deadline = deadlineFrom(w.readTO)
+		if w.tlsMode {
+			c.deadline = deadlineFrom(w.handshakeTO)
+		} else {
+			c.deadline = deadlineFrom(w.headerTO)
+		}
 		c.remoteAddr = epollRemoteAddr(sa)
 		c.ipHeld = false
 		c.ipKey = ""
@@ -721,8 +781,11 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 		w.closeConn(c)
 		return
 	}
-	if prevReadN == 0 && c.readN > 0 && w.readTO > 0 {
-		c.deadline = deadlineFrom(w.readTO)
+	if prevReadN == 0 && c.readN > 0 {
+		keepDeadline := c.tls && c.deadline != 0 && (c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native || len(c.appBuf) > 0)
+		if !keepDeadline {
+			c.deadline = deadlineFrom(w.nextReadTimeout(c))
+		}
 	}
 	if c.readN > 0 {
 		var action int
@@ -834,12 +897,13 @@ func (c *epollConn) epollProcess(srv *Server) int {
 				break
 			}
 		}
-		if isPreface {
+		if isPreface && srv.http2Enabled() {
 			if avail < H2PrefaceLen {
 				return epollActionNeedRead
 			}
 			c.protocol = plainConnProtoH2
-			c.h2.init()
+			c.h2.init(srv.h2HeaderTableSize())
+			c.deadline = deadlineFrom(c.worker.readTO)
 			c.writeBuf = appendH2ServerSettingsFlight(c.writeBuf, srv)
 			Stats.H2Conns.Add(1)
 		} else {

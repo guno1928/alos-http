@@ -31,8 +31,11 @@ func urlDecode(s string) string {
 	return string(buf)
 }
 
+const maxQueryParams = 1000
+
 func parseQueryString(query string) map[string][]string {
 	m := make(map[string][]string)
+	count := 0
 	for len(query) > 0 {
 		var pair string
 		idx := indexByte(query, '&')
@@ -46,6 +49,10 @@ func parseQueryString(query string) map[string][]string {
 		if pair == "" {
 			continue
 		}
+		if count >= maxQueryParams {
+			break
+		}
+		count++
 		var key, val string
 		eq := indexByte(pair, '=')
 		if eq >= 0 {

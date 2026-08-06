@@ -160,12 +160,6 @@ func newQUICConnIOUring(server *Server, uc uringUDPSender, remoteAddr *net.UDPAd
 }
 
 func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *quicConnMap) *QUICConn {
-	if quicActiveConns.Load() >= quicMaxConns {
-		return nil
-	}
-	if quicHandshakingConns.Load() >= quicMaxHandshaking {
-		return nil
-	}
 	if !s.tryTrackConn() {
 		return nil
 	}

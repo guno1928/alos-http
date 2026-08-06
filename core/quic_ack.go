@@ -6,12 +6,12 @@ type pnRange struct {
 	lo, hi uint64
 }
 
-func (qc *QUICConn) recordRecvPN(space int, pn uint64) {
+func (qc *QUICConn) recordRecvPN(space int, pn uint64) bool {
 	rs := qc.ackRanges[space]
 	idx := len(rs)
 	for i := range rs {
 		if pn >= rs[i].lo && pn <= rs[i].hi {
-			return
+			return false
 		}
 		if pn > rs[i].hi {
 			idx = i
@@ -37,6 +37,7 @@ func (qc *QUICConn) recordRecvPN(space int, pn uint64) {
 		merged = merged[:maxAckRanges]
 	}
 	qc.ackRanges[space] = merged
+	return true
 }
 
 func quicAppendACKFrameRanges(dst []byte, ackDelay uint64, ranges []pnRange) []byte {

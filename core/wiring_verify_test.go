@@ -307,7 +307,7 @@ func decodeH2Settings(frame []byte) map[uint16]uint32 {
 
 func h2SettingsFor(s *Server) map[uint16]uint32 {
 	settings := [][2]uint32{
-		{uint32(H2SettingHeaderTableSize), 0},
+		{uint32(H2SettingHeaderTableSize), s.h2HeaderTableSize()},
 		{uint32(H2SettingMaxConcurrentStreams), s.h2MaxStreams()},
 		{uint32(H2SettingInitialWindowSize), s.h2InitialWindow()},
 		{uint32(H2SettingMaxFrameSize), s.h2MaxFrameSize()},
@@ -492,6 +492,12 @@ func TestQUICConnConfig(t *testing.T) {
 		qc := newTestQUIC(New(Config{IdleTimeout: 15 * time.Second}))
 		if qc.idleTimeout != 15*time.Second {
 			t.Fatalf("idle = %v, want 15s", qc.idleTimeout)
+		}
+	})
+	t.Run("idle-disabled", func(t *testing.T) {
+		qc := newTestQUIC(New(Config{IdleTimeout: -1}))
+		if qc.idleTimeout != 0 {
+			t.Fatalf("idle = %v, want disabled", qc.idleTimeout)
 		}
 	})
 	t.Run("maxdata-default", func(t *testing.T) {

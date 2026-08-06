@@ -560,7 +560,8 @@ func (e *hpackHuffmanDecodeCacheEntry) store(hash uint64, data []byte, value str
 type HpackDecoder struct {
 	maxTableSize     int
 	protocolMaxSize  int
-	dynRing          [128]hpackDynEntry
+	dynInline        [128]hpackDynEntry
+	dynRing          []hpackDynEntry
 	dynHead          int
 	dynLen           int
 	dynSize          int
@@ -576,10 +577,12 @@ type HpackDecoder struct {
 // NewHpackDecoder returns an HpackDecoder initialized with the connection's
 // default HPACK table size.
 func NewHpackDecoder() *HpackDecoder {
-	return &HpackDecoder{
-		maxTableSize:    H2HeaderTableSize,
-		protocolMaxSize: H2HeaderTableSize,
-	}
+	return newHpackDecoder(H2HeaderTableSize)
+}
+
+func newHpackDecoder(tableSize uint32) *HpackDecoder {
+	limit := int(tableSize)
+	return &HpackDecoder{maxTableSize: limit, protocolMaxSize: limit}
 }
 
 func (d *HpackDecoder) snapshot() hpackDecoderSnapshot {
@@ -608,8 +611,11 @@ func (d *HpackDecoder) restore(snap hpackDecoderSnapshot) {
 	}
 	d.huffmanCache = cache
 	d.huffmanCacheNext = cacheNext
+	if len(snap.entries) > len(d.dynInline) {
+		d.dynRing = make([]hpackDynEntry, len(snap.entries))
+	}
 	for i := range snap.entries {
-		d.dynRing[i] = snap.entries[i]
+		*d.dynGet(i) = snap.entries[i]
 	}
 }
 
@@ -632,7 +638,10 @@ func (d *HpackDecoder) decodeString(data []byte) (string, int) {
 			return d.huffmanCache[i].value, n + int(sLen)
 		}
 	}
-	decoded := hpackHuffmanDecode(raw)
+	decoded, ok := hpackHuffmanDecode(raw)
+	if !ok {
+		return "", 0
+	}
 	slot := int(d.huffmanCacheNext) % len(d.huffmanCache)
 	d.huffmanCacheNext++
 	d.huffmanCache[slot].store(hash, raw, decoded)
@@ -640,7 +649,35 @@ func (d *HpackDecoder) decodeString(data []byte) (string, int) {
 }
 
 func (d *HpackDecoder) dynGet(i int) *hpackDynEntry {
-	return &d.dynRing[(d.dynHead+i)%len(d.dynRing)]
+	if len(d.dynRing) > 0 {
+		return &d.dynRing[(d.dynHead+i)%len(d.dynRing)]
+	}
+	return &d.dynInline[(d.dynHead+i)%len(d.dynInline)]
+}
+
+func (d *HpackDecoder) dynCapacity() int {
+	if len(d.dynRing) > 0 {
+		return len(d.dynRing)
+	}
+	return len(d.dynInline)
+}
+
+func (d *HpackDecoder) growDynRing() {
+	oldCapacity := d.dynCapacity()
+	maxEntries := d.maxTableSize / 32
+	if maxEntries <= oldCapacity {
+		return
+	}
+	newCapacity := oldCapacity * 2
+	if newCapacity < oldCapacity || newCapacity > maxEntries {
+		newCapacity = maxEntries
+	}
+	next := make([]hpackDynEntry, newCapacity)
+	for i := 0; i < d.dynLen; i++ {
+		next[i] = *d.dynGet(i)
+	}
+	d.dynRing = next
+	d.dynHead = 0
 }
 
 func (d *HpackDecoder) lookupIndex(idx uint64) (string, string, bool) {
@@ -682,9 +719,13 @@ func (d *HpackDecoder) addEntry(name, value string) {
 		*tail = hpackDynEntry{}
 		d.dynLen--
 	}
-	if entrySize <= d.maxTableSize && d.dynLen < len(d.dynRing) {
-		d.dynHead = (d.dynHead - 1 + len(d.dynRing)) % len(d.dynRing)
-		d.dynRing[d.dynHead] = hpackDynEntry{name: name, value: value, size: entrySize}
+	if entrySize <= d.maxTableSize && d.dynLen == d.dynCapacity() {
+		d.growDynRing()
+	}
+	if entrySize <= d.maxTableSize && d.dynLen < d.dynCapacity() {
+		capacity := d.dynCapacity()
+		d.dynHead = (d.dynHead - 1 + capacity) % capacity
+		*d.dynGet(0) = hpackDynEntry{name: name, value: value, size: entrySize}
 		d.dynLen++
 		d.dynSize += entrySize
 	}
@@ -773,7 +814,7 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 				return nil, ErrH2BadHeader
 			}
 			pos += n
-			if int(maxSize) > d.protocolMaxSize {
+			if maxSize > uint64(d.protocolMaxSize) {
 				return nil, ErrHpackTableSizeExceeded
 			}
 			d.setMaxSize(int(maxSize))
@@ -882,7 +923,7 @@ func (d *HpackDecoder) DecodeIntoRequest(headers [][2]string, data []byte) ([][2
 				return nil, meta, ErrH2BadHeader
 			}
 			pos += n
-			if int(maxSize) > d.protocolMaxSize {
+			if maxSize > uint64(d.protocolMaxSize) {
 				return nil, meta, ErrHpackTableSizeExceeded
 			}
 			d.setMaxSize(int(maxSize))
@@ -1194,7 +1235,7 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 				return meta, ErrH2BadHeader
 			}
 			pos += n
-			if int(maxSize) > d.protocolMaxSize {
+			if maxSize > uint64(d.protocolMaxSize) {
 				return meta, ErrHpackTableSizeExceeded
 			}
 			d.setMaxSize(int(maxSize))
@@ -1330,13 +1371,16 @@ func HpackDecodeString(data []byte) (string, int) {
 	}
 	raw := data[n : n+int(sLen)]
 	if huffman {
-		decoded := hpackHuffmanDecode(raw)
+		decoded, ok := hpackHuffmanDecode(raw)
+		if !ok {
+			return "", 0
+		}
 		return decoded, n + int(sLen)
 	}
 	return string(raw), n + int(sLen)
 }
 
-func hpackHuffmanDecodeInto(dst, src []byte) []byte {
+func hpackHuffmanDecodeInto(dst, src []byte) ([]byte, bool) {
 	var bits uint64
 	var nbits uint8
 	for _, b := range src {
@@ -1352,10 +1396,13 @@ func hpackHuffmanDecodeInto(dst, src []byte) []byte {
 			bits &= (1 << nbits) - 1
 		}
 	}
-	return dst
+	if nbits > 7 || (nbits > 0 && bits != (uint64(1)<<nbits)-1) {
+		return dst, false
+	}
+	return dst, true
 }
 
-func hpackHuffmanDecode(src []byte) string {
+func hpackHuffmanDecode(src []byte) (string, bool) {
 	var stackBuf [256]byte
 	var dst []byte
 	if len(src)*2 <= len(stackBuf) {
@@ -1385,7 +1432,10 @@ func hpackHuffmanDecode(src []byte) string {
 		}
 	}
 
-	return string(dst)
+	if nbits > 7 || (nbits > 0 && bits != (uint64(1)<<nbits)-1) {
+		return "", false
+	}
+	return string(dst), true
 }
 
 var huffmanCodes = [257]struct {

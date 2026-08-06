@@ -39,8 +39,6 @@ const (
 	quicMaxBidiStreams          = 1024
 	quicMaxUniStreams           = 128
 	quicMaxTrackedStreams       = 2048
-	quicMaxConns                = 1 << 16
-	quicMaxHandshaking          = 8192
 	quicCoalesceBudget          = 1100
 	quicMinInitialDatagram      = 1200
 )
@@ -196,7 +194,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 		done:            make(chan struct{}),
 		streams:         make(map[uint64]*QUICStream),
 		loss:            newQuicLossState(),
-		idleTimeout:     defaultDuration(server.config.IdleTimeout, quicDefaultIdleTimeout),
+		idleTimeout:     optionalDuration(server.config.IdleTimeout, quicDefaultIdleTimeout),
 		maxDataLocal:    maxData,
 		maxDataRemote:   maxData,
 		dataRecvGranted: maxData,
@@ -286,6 +284,9 @@ func (qc *QUICConn) recvLoop() {
 
 func (qc *QUICConn) processPacket(data []byte) {
 	qc.bytesReceived.Add(uint64(len(data)))
+	if len(data) == 0 {
+		return
+	}
 	if debugFlag.Load() {
 		log.Printf("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
 	}
@@ -456,7 +457,16 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	if int64(pn) > qc.recvLargest[space] {
 		qc.recvLargest[space] = int64(pn)
 	}
-	qc.recordRecvPN(space, pn)
+	if !qc.recordRecvPN(space, pn) {
+		if space != quicSpaceInitial || qc.handshakeDone.Load() {
+			if space == quicSpaceAppData {
+				qc.stashAck(space)
+			} else {
+				qc.sendACK(space)
+			}
+		}
+		return
+	}
 	needsAck := false
 
 	visitor := &quicFrameVisitor{
@@ -1160,6 +1170,11 @@ func (qc *QUICConn) sendConnectionClose(errorCode uint64, reason string) {
 }
 
 func (qc *QUICConn) runIdleTimer() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[QUIC-PANIC] runIdleTimer panic: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1176,6 +1191,11 @@ func (qc *QUICConn) runIdleTimer() {
 }
 
 func (qc *QUICConn) runLossTimer() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[QUIC-PANIC] runLossTimer panic: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	for {

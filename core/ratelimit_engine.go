@@ -78,10 +78,41 @@ type compiledRule struct {
 }
 
 type rlEntry struct {
-	count   atomic.Int64
+	state   atomic.Uint64
 	reset   atomic.Int64
 	blocked atomic.Int64
 	_       [CacheLineSize - 24]byte
+}
+
+const rlEpochShift = 40
+const rlCountMask uint64 = (1 << rlEpochShift) - 1
+const rlEpochMask uint64 = (1 << 24) - 1
+
+func rlEpochOf(now, windowNanos int64) uint64 {
+	if windowNanos <= 0 {
+		windowNanos = 1
+	}
+	return (uint64(now/windowNanos) & rlEpochMask) << rlEpochShift
+}
+
+func rlBumpCount(state *atomic.Uint64, now, windowNanos int64) int64 {
+	epoch := rlEpochOf(now, windowNanos)
+	for {
+		cur := state.Load()
+		var next uint64
+		if cur&^rlCountMask != epoch {
+			next = epoch | 1
+		} else {
+			c := cur & rlCountMask
+			if c >= rlCountMask {
+				return int64(c)
+			}
+			next = epoch | (c + 1)
+		}
+		if state.CompareAndSwap(cur, next) {
+			return int64(next & rlCountMask)
+		}
+	}
 }
 
 // RateLimitEngine tracks per-client request counts against configured rules.
@@ -255,20 +286,17 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 		remaining := time.Duration(blockedUntil - now)
 		return false, cr, remaining
 	}
+	windowNanos := cr.rule.Window.Nanoseconds()
 	if blockedUntil > 0 && now >= blockedUntil {
 		entry.blocked.Store(0)
-		entry.count.Store(0)
-		entry.reset.Store(now + cr.rule.Window.Nanoseconds())
+		entry.state.Store(rlEpochOf(now, windowNanos))
+		entry.reset.Store(now + windowNanos)
 	}
 
-	resetAt := entry.reset.Load()
-	if now >= resetAt {
-		if entry.reset.CompareAndSwap(resetAt, now+cr.rule.Window.Nanoseconds()) {
-			entry.count.Store(0)
-		}
+	count := rlBumpCount(&entry.state, now, windowNanos)
+	if count == 1 {
+		entry.reset.Store(now + windowNanos)
 	}
-
-	count := entry.count.Add(1)
 	if count > cr.rule.MaxReqs {
 		blockDur := cr.rule.BlockFor
 		if blockDur <= 0 {

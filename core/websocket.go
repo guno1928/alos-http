@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -184,8 +185,8 @@ func UpgradeWebSocket(req *Request, resp *Response) *WSConn {
 
 	rt, wt := wsDefaultReadTimeout, wsDefaultWriteTimeout
 	if req.server != nil {
-		rt = defaultDuration(req.server.config.WSReadTimeout, wsDefaultReadTimeout)
-		wt = defaultDuration(req.server.config.WSWriteTimeout, wsDefaultWriteTimeout)
+		rt = optionalDuration(req.server.config.WSReadTimeout, wsDefaultReadTimeout)
+		wt = optionalDuration(req.server.config.WSWriteTimeout, wsDefaultWriteTimeout)
 	}
 	return &WSConn{conn: conn, readTimeout: rt, writeTimeout: wt, MaxMessageSize: wsDefaultMaxMessageSize}
 }
@@ -200,7 +201,12 @@ func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 		return false
 	}
 	go func() {
-		defer ws.Close()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[WS-PANIC] handler recovered: %v", r)
+			}
+			ws.Close()
+		}()
 		fn(ws)
 	}()
 	return true
@@ -283,6 +289,11 @@ func (ws *WSConn) ReadMessage() (byte, []byte, error) {
 				ws.WriteMessage(wsOpPong, payload)
 			}
 			continue
+		}
+
+		if opcode > wsOpBinary {
+			ws.closeWithStatus(wsStatusProtocolError)
+			return 0, nil, ErrWebSocketProtocol
 		}
 
 		if assembled == nil {

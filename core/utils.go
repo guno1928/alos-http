@@ -229,6 +229,8 @@ func UnsafeBytes(s string) []byte {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
+const maxParsedLength = 1 << 50
+
 func parseUint(s string) (int, bool) {
 	if len(s) == 0 {
 		return 0, false
@@ -240,7 +242,7 @@ func parseUint(s string) (int, bool) {
 			return 0, false
 		}
 		n = n*10 + int(d)
-		if n < 0 {
+		if n < 0 || n > maxParsedLength {
 			return 0, false
 		}
 	}
@@ -272,7 +274,7 @@ func parseHex64(s string) (int64, bool) {
 			return 0, false
 		}
 		n = n<<4 | int64(hexLookup[c])
-		if n < 0 {
+		if n < 0 || n > maxParsedLength {
 			return 0, false
 		}
 	}
@@ -289,7 +291,7 @@ func parseHex64Bytes(b []byte) (int64, bool) {
 			return 0, false
 		}
 		n = n<<4 | int64(hexLookup[c])
-		if n < 0 {
+		if n < 0 || n > maxParsedLength {
 			return 0, false
 		}
 	}
@@ -639,6 +641,7 @@ var coarseNow atomic.Int64
 func init() {
 	coarseNow.Store(time.Now().UnixNano())
 	go func() {
+		defer func() { _ = recover() }()
 		ticker := time.NewTicker(time.Millisecond)
 		for range ticker.C {
 			coarseNow.Store(time.Now().UnixNano())

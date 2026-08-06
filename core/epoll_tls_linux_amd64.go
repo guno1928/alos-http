@@ -236,13 +236,15 @@ func (c *epollConn) epollTLSClientFinished(srv *Server) int {
 		c.hsReader = nil
 		if c.selectedALPN == "h2" {
 			c.phase = tlsConnPhaseH2Native
-			c.h2.init()
+			c.h2.init(srv.h2HeaderTableSize())
+			c.deadline = deadlineFrom(c.worker.readTO)
 			plain := appendH2ServerSettingsFlight(nil, srv)
 			c.writeBuf = buildTLSAppDataRecords(c.writeBuf, c.appWriter, plain)
 			Stats.H2Conns.Add(1)
 			return epollTLSContinue
 		}
 		c.phase = tlsConnPhaseApplication
+		c.deadline = deadlineFrom(c.worker.headerTO)
 		Stats.H1Conns.Add(1)
 		return epollTLSContinue
 	}
@@ -414,13 +416,15 @@ func (c *epollConn) epollTLS12ClientFinish(srv *Server) int {
 			c.compactCipher(totalLen)
 			if c.selectedALPN == "h2" {
 				c.phase = tlsConnPhaseH2Native
-				c.h2.init()
+				c.h2.init(srv.h2HeaderTableSize())
+				c.deadline = deadlineFrom(c.worker.readTO)
 				plain := appendH2ServerSettingsFlight(nil, srv)
 				c.writeBuf = buildTLS12AppDataRecords(c.writeBuf, st.writer, plain)
 				Stats.H2Conns.Add(1)
 				return epollTLSContinue
 			}
 			c.phase = tlsConnPhaseApplication
+			c.deadline = deadlineFrom(c.worker.headerTO)
 			Stats.H1Conns.Add(1)
 			return epollTLSContinue
 		default:

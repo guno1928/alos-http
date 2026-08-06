@@ -120,6 +120,10 @@ func releaseWriteRequest(req *WriteRequest) {
 // decrypt and encrypt TLS application data records and hdrBuf as a scratch
 // buffer for record headers, until the connection closes.
 func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []byte) {
+	if !s.http2Enabled() {
+		_ = conn.Close()
+		return
+	}
 	bc := NewBufConn(conn)
 	hc := &H2Conn{
 		remoteAddr:        conn.RemoteAddr().String(),
@@ -128,7 +132,7 @@ func (s *Server) ServeH2(conn net.Conn, reader, writer *TrafficAEAD, hdrBuf []by
 		writer:            writer,
 		hdrBuf:            hdrBuf,
 		server:            s,
-		decoder:           NewHpackDecoder(),
+		decoder:           newHpackDecoder(s.h2HeaderTableSize()),
 		initialWindowSize: H2DefaultWindowSize,
 		streams:           alosmap.NewTypedSized[int64, *H2Stream](256, 0).Prealloc(256),
 		writeCh:           make(chan WriteRequest, 512),
@@ -311,7 +315,7 @@ func (hc *H2Conn) readAndValidatePreface() bool {
 
 func (hc *H2Conn) sendInitialSettingsAndWindowUpdate() {
 	settings := [5][2]uint32{
-		{uint32(H2SettingHeaderTableSize), 0},
+		{uint32(H2SettingHeaderTableSize), hc.server.h2HeaderTableSize()},
 		{uint32(H2SettingMaxConcurrentStreams), hc.server.h2MaxStreams()},
 		{uint32(H2SettingInitialWindowSize), hc.server.h2InitialWindow()},
 		{uint32(H2SettingMaxFrameSize), hc.server.h2MaxFrameSize()},
@@ -771,6 +775,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 	stream.Reset()
 	stream.ID = streamID
 	stream.Window.Store(int64(hc.initialWindowSize))
+	stream.RecvWindow = int64(hc.server.h2InitialWindow())
 	stream.Method = meta.method
 	stream.Path = meta.path
 	stream.RawPath = meta.rawPath
@@ -864,6 +869,15 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 		hc.sendGoAway(H2ErrFlowControl)
 		return
 	}
+	stream.RecvWindow -= consumed
+	if stream.RecvWindow < 0 {
+		hc.enqueueWrite(H2WriteRSTStream(nil, f.StreamID, H2ErrFlowControl))
+		hc.streams.Delete(int64(f.StreamID))
+		hc.activeStreams.Add(-1)
+		stream.Reset()
+		StreamPool.Put(stream)
+		return
+	}
 
 	if len(payload) > 0 {
 		if !hc.server.tryReserveBodyBytes(len(payload)) {
@@ -900,6 +914,7 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 		}
 	}
 	if maxBody <= 0 || int64(len(stream.Body)) < maxBody {
+		stream.RecvWindow += int64(connConsumed)
 		hc.sendWindowUpdate(f.StreamID, connConsumed)
 	}
 
@@ -1063,6 +1078,10 @@ func (hc *H2Conn) reserveWriteWindow(stream *H2Stream, desired int) int {
 			if int64(granted) > avail {
 				granted = int(avail)
 			}
+			hc.connWindow.Add(-int64(granted))
+			if stream != nil {
+				stream.Window.Add(-int64(granted))
+			}
 			break
 		}
 		select {
@@ -1086,10 +1105,6 @@ func (hc *H2Conn) reserveWriteWindow(stream *H2Stream, desired int) int {
 		hc.server.globalLimiter.Download.Wait(int64(granted))
 	}
 
-	hc.connWindow.Add(-int64(granted))
-	if stream != nil {
-		stream.Window.Add(-int64(granted))
-	}
 	return granted
 }
 

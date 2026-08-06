@@ -381,6 +381,9 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	}
 	sidLen := int(ch[pos])
 	pos++
+	if sidLen > len(result.sessionIDBuf) {
+		return ErrSessionIDTruncated
+	}
 	if pos+sidLen > len(ch) {
 		return ErrSessionIDTruncated
 	}

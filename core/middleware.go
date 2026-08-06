@@ -639,6 +639,36 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 // Example: app.Use(Timeout(5 * time.Second))
 // Example: app.Use(Timeout(100 * time.Millisecond))
 // Example: app.Use(Timeout(time.Minute))
+func cloneDetachedStrings(r *Request) {
+	r.Method = strings.Clone(r.Method)
+	r.Path = strings.Clone(r.Path)
+	r.RawPath = strings.Clone(r.RawPath)
+	r.Query = strings.Clone(r.Query)
+	r.Proto = strings.Clone(r.Proto)
+	r.Host = strings.Clone(r.Host)
+	r.RemoteAddr = strings.Clone(r.RemoteAddr)
+	r.cachedCL = strings.Clone(r.cachedCL)
+	r.cachedConn = strings.Clone(r.cachedConn)
+	r.cachedTE = strings.Clone(r.cachedTE)
+	r.cachedHost = strings.Clone(r.cachedHost)
+	r.cachedAE = strings.Clone(r.cachedAE)
+	r.cachedOrigin = strings.Clone(r.cachedOrigin)
+	r.cachedXFF = strings.Clone(r.cachedXFF)
+	r.cachedXRI = strings.Clone(r.cachedXRI)
+	r.cachedAuth = strings.Clone(r.cachedAuth)
+	r.cachedUpgrade = strings.Clone(r.cachedUpgrade)
+	r.cachedWSKey = strings.Clone(r.cachedWSKey)
+	r.cachedWSVer = strings.Clone(r.cachedWSVer)
+	for i := range r.Headers {
+		r.Headers[i][0] = strings.Clone(r.Headers[i][0])
+		r.Headers[i][1] = strings.Clone(r.Headers[i][1])
+	}
+	for i := 0; i < r.ParamCount && i < len(r.Params); i++ {
+		r.Params[i].Key = strings.Clone(r.Params[i].Key)
+		r.Params[i].Value = strings.Clone(r.Params[i].Value)
+	}
+}
+
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -656,6 +686,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			} else {
 				tmpReq.Body = nil
 			}
+			cloneDetachedStrings(&tmpReq)
 			if len(req.store) > 0 {
 				clonedStore := make(map[string]any, len(req.store))
 				for k, v := range req.store {

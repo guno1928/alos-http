@@ -19,6 +19,7 @@ type H2Stream struct {
 	ID            uint32
 	State         atomic.Uint32
 	Window        atomic.Int64
+	RecvWindow    int64
 	Method        string
 	Path          string
 	RawPath       string
@@ -51,6 +52,7 @@ func (s *H2Stream) Reset() {
 	s.ID = 0
 	s.State.Store(StreamIdle)
 	s.Window.Store(0)
+	s.RecvWindow = 0
 	s.Method = ""
 	s.Path = ""
 	s.RawPath = ""

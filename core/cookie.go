@@ -74,6 +74,8 @@ type Cookie struct {
 	SameSite SameSite
 }
 
+const maxCookiePairs = 1000
+
 func parseCookieHeader(header string) []Cookie {
 	var cookies []Cookie
 	for len(header) > 0 {
@@ -89,6 +91,9 @@ func parseCookieHeader(header string) []Cookie {
 		pair = trimASCIISpace(pair)
 		if pair == "" {
 			continue
+		}
+		if len(cookies) >= maxCookiePairs {
+			break
 		}
 		eq := strings.IndexByte(pair, '=')
 		if eq < 0 {

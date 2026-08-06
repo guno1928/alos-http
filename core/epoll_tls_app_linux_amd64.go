@@ -94,6 +94,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 					c.epollTLSEncryptResponse(srv, scratch)
 					return epollActionCloseAfterFlush
 				}
+				c.deadline = deadlineFrom(c.worker.readTO)
 				break
 			}
 			c.chunkScanPos = 0
@@ -145,6 +146,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				return epollActionCloseAfterFlush
 			}
 			if bodyEnd > len(data) {
+				c.deadline = deadlineFrom(c.worker.readTO)
 				break
 			}
 			c.req.Body = data[headerEnd:bodyEnd]

@@ -2,9 +2,15 @@ package core
 
 import (
 	"io"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
+
+type quicOOOSegment struct {
+	off  uint64
+	data []byte
+}
 
 const (
 	quicStreamBidiClient = 0x00
@@ -42,6 +48,7 @@ type QUICStream struct {
 
 	recvBuf    []byte
 	recvBufP   *[]byte
+	recvOOO    []quicOOOSegment
 	recvOff    uint64
 	recvFin    bool
 	recvFinOff uint64
@@ -90,6 +97,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s.conn = conn
 	s.recvBuf = nil
 	s.recvBufP = nil
+	s.recvOOO = nil
 	s.recvOff = 0
 	s.recvFin = false
 	s.recvFinOff = 0
@@ -125,6 +133,7 @@ func (qc *QUICConn) releaseStream(s *QUICStream) {
 		}
 		s.conn = nil
 		s.recvBuf = nil
+		s.recvOOO = nil
 		s.sendBuf = nil
 		quicStreamPool.Put(s)
 	}
@@ -143,37 +152,28 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) bool {
 		s.recvBuf = (*s.recvBufP)[:0]
 	}
 
-	if f.offset == s.recvOff {
-		if uint64(len(s.recvBuf))+uint64(len(f.data)) > s.maxRecv {
-			return false
+	end := f.offset + uint64(len(f.data))
+	if len(f.data) > 0 && end > s.recvOff {
+		if f.offset < s.recvOff {
+			trim := s.recvOff - f.offset
+			f.data = f.data[trim:]
+			f.offset = s.recvOff
 		}
-		if len(f.data) > 0 && !s.conn.server.tryReserveBodyBytes(len(f.data)) {
-			return false
-		}
-		s.recvAccounted += int64(len(f.data))
-		s.recvBuf = append(s.recvBuf, f.data...)
-		s.recvOff += uint64(len(f.data))
-	} else if f.offset > s.recvOff {
-		needed := f.offset - s.recvOff + uint64(len(f.data))
-		if needed > s.maxRecv {
-			return false
-		}
-		if uint64(len(s.recvBuf)) < needed {
-			delta := int(needed) - len(s.recvBuf)
-			if !s.conn.server.tryReserveBodyBytes(delta) {
+		if f.offset == s.recvOff {
+			if !s.appendContig(f.data) {
 				return false
 			}
-			s.recvAccounted += int64(delta)
-			grown := make([]byte, needed)
-			copy(grown, s.recvBuf)
-			s.recvBuf = grown
+			s.coalesceOOO()
+		} else {
+			if !s.insertOOO(f.offset, f.data) {
+				return false
+			}
 		}
-		copy(s.recvBuf[f.offset-s.recvOff:], f.data)
 	}
 
 	if f.fin {
 		s.recvFin = true
-		s.recvFinOff = f.offset + uint64(len(f.data))
+		s.recvFinOff = end
 	}
 
 	if s.recvReady != nil {
@@ -183,6 +183,114 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) bool {
 		}
 	}
 	return true
+}
+
+func (s *QUICStream) outstanding() uint64 {
+	total := uint64(len(s.recvBuf))
+	for i := range s.recvOOO {
+		total += uint64(len(s.recvOOO[i].data))
+	}
+	return total
+}
+
+func (s *QUICStream) reserve(n int) bool {
+	if n <= 0 {
+		return true
+	}
+	if s.outstanding()+uint64(n) > s.maxRecv {
+		return false
+	}
+	if s.conn != nil && s.conn.server != nil && !s.conn.server.tryReserveBodyBytes(n) {
+		return false
+	}
+	s.recvAccounted += int64(n)
+	return true
+}
+
+func (s *QUICStream) releaseReserved(n int) {
+	if n <= 0 {
+		return
+	}
+	if s.conn != nil && s.conn.server != nil {
+		s.conn.server.releaseBodyBytes(int64(n))
+	}
+	s.recvAccounted -= int64(n)
+	if s.recvAccounted < 0 {
+		s.recvAccounted = 0
+	}
+}
+
+func (s *QUICStream) appendContig(data []byte) bool {
+	if !s.reserve(len(data)) {
+		return false
+	}
+	s.recvBuf = append(s.recvBuf, data...)
+	s.recvOff += uint64(len(data))
+	return true
+}
+
+func (s *QUICStream) insertOOO(off uint64, data []byte) bool {
+	end := off + uint64(len(data))
+	pos := off
+	var additions []quicOOOSegment
+	for i := range s.recvOOO {
+		seg := s.recvOOO[i]
+		if pos >= end || seg.off >= end {
+			break
+		}
+		segEnd := seg.off + uint64(len(seg.data))
+		if segEnd <= pos {
+			continue
+		}
+		if seg.off > pos {
+			additions = append(additions, quicOOOSegment{off: pos, data: data[pos-off : seg.off-off]})
+		}
+		if segEnd > pos {
+			pos = segEnd
+		}
+	}
+	if pos < end {
+		additions = append(additions, quicOOOSegment{off: pos, data: data[pos-off:]})
+	}
+	total := 0
+	for i := range additions {
+		total += len(additions[i].data)
+	}
+	if total == 0 {
+		return true
+	}
+	if !s.reserve(total) {
+		return false
+	}
+	for i := range additions {
+		s.recvOOO = append(s.recvOOO, quicOOOSegment{off: additions[i].off, data: append([]byte(nil), additions[i].data...)})
+	}
+	sort.Slice(s.recvOOO, func(a, b int) bool { return s.recvOOO[a].off < s.recvOOO[b].off })
+	return true
+}
+
+func (s *QUICStream) coalesceOOO() {
+	i := 0
+	for i < len(s.recvOOO) {
+		seg := s.recvOOO[i]
+		if seg.off > s.recvOff {
+			break
+		}
+		segEnd := seg.off + uint64(len(seg.data))
+		if segEnd <= s.recvOff {
+			s.releaseReserved(len(seg.data))
+			i++
+			continue
+		}
+		start := s.recvOff - seg.off
+		s.releaseReserved(int(start))
+		s.recvBuf = append(s.recvBuf, seg.data[start:]...)
+		s.recvOff = segEnd
+		i++
+	}
+	if i > 0 {
+		s.recvOOO = append(s.recvOOO[:0], s.recvOOO[i:]...)
+	}
 }
 
 // Read copies received stream data into p, blocking until data arrives,

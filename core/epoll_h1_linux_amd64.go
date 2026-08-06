@@ -70,6 +70,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 					c.writeBuf = appendPlainResponse(&c.resp, c.writeBuf)
 					return epollActionCloseAfterFlush
 				}
+				c.deadline = deadlineFrom(c.worker.readTO)
 				c.compactH1ReadBuffer()
 				return epollActionNeedRead
 			}
@@ -121,6 +122,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 				if c.h1Off+bodyEnd > cap(c.readBuf) && !c.growReadBuf(c.h1Off+bodyEnd, maxRead) {
 					return epollActionCloseAfterFlush
 				}
+				c.deadline = deadlineFrom(c.worker.readTO)
 				c.compactH1ReadBuffer()
 				return epollActionNeedRead
 			}
@@ -293,10 +295,10 @@ func decodeChunkedInto(dst, src []byte) ([]byte, bool) {
 		if size == 0 {
 			return dst, true
 		}
-		end := pos + int(size)
-		if end > len(src) {
+		if size > int64(len(src)-pos) {
 			return nil, false
 		}
+		end := pos + int(size)
 		dst = append(dst, src[pos:end]...)
 		pos = end
 		nl2 := indexByteFrom(src, '\n', pos)

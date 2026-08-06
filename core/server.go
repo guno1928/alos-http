@@ -24,24 +24,28 @@ var timeNow = time.Now
 //	Example: Addr: ":443" listens on the standard HTTPS port.
 //	Example: Addr: "0.0.0.0:8443" listens on all interfaces.
 //
-// HTTPAddr is the listen address for the HTTP-to-HTTPS redirect (or plain HTTP routes); defaults to ":80" when Addr uses port 443, otherwise disabled.
+// HTTPAddr is the listen address for the HTTP-to-HTTPS redirect (or plain HTTP routes); an empty value uses ":80" when Addr uses port 443 and otherwise disables the listener. Use "-" to disable it explicitly.
 //
 //	Example: HTTPAddr: ":80" enables the redirect listener.
-//	Example: HTTPAddr: "" disables it.
+//	Example: HTTPAddr: "-" disables it.
 //
-// ReadTimeout bounds how long a full request read may take; 0 disables it.
+// ReadTimeout bounds how long a full request read may take; 0 applies a 30s default and a negative value disables it.
 //
 //	Example: ReadTimeout: 10 * time.Second.
 //
-// WriteTimeout bounds how long a response write may take; 0 disables it.
+// WriteTimeout bounds how long a response write may take; 0 applies a 30s default and a negative value disables it.
 //
 //	Example: WriteTimeout: 10 * time.Second.
 //
-// IdleTimeout is how long an idle keep-alive connection stays open; defaults to 120s.
+// ReadHeaderTimeout bounds how long HTTP/1 clients may take to send a complete request header; 0 uses ReadTimeout and a negative value disables it.
+//
+//	Example: ReadHeaderTimeout: 5 * time.Second.
+//
+// IdleTimeout is how long an idle connection stays open; 0 applies a 120s default and a negative value disables it.
 //
 //	Example: IdleTimeout: 30 * time.Second.
 //
-// HandshakeTimeout is the deadline for the TLS handshake; defaults to 30s.
+// HandshakeTimeout is the deadline for the TLS handshake; 0 applies a 30s default and a negative value disables it.
 //
 //	Example: HandshakeTimeout: 5 * time.Second.
 //
@@ -71,6 +75,10 @@ var timeNow = time.Now
 //
 //	Example: MaxHeaderSize: 16384.
 //
+// MaxHeaderCount is the maximum number of HTTP/1 header fields; 0 applies a default of 128.
+//
+//	Example: MaxHeaderCount: 64.
+//
 // MaxRequestsPerIP caps concurrent in-flight requests per client IP; 0 disables the per-IP limiter.
 //
 //	Example: MaxRequestsPerIP: 100.
@@ -96,6 +104,20 @@ var timeNow = time.Now
 // applies an 8192-connection default; -1 explicitly disables the cap.
 //
 //	Example: MaxConns: 4096.
+//
+// H2MaxConcurrentStreams is the maximum number of concurrently active streams on one HTTP/2 connection; 0 uses the protocol default.
+//
+// H2InitialWindowSize is the HTTP/2 per-stream receive window advertised to clients; 0 uses the protocol default.
+//
+// H2MaxFrameSize is the largest HTTP/2 frame accepted from clients; 0 uses the protocol default.
+//
+// H2HeaderTableSize is the HPACK dynamic table size advertised to HTTP/2 clients; 0 uses the 4096-byte protocol default.
+//
+// QUICMaxData is the HTTP/3 connection receive window; 0 uses the protocol default.
+//
+// QUICMaxStreamData is the HTTP/3 per-stream receive window; 0 uses the protocol default.
+//
+// QUICMaxUDPPayload is the largest QUIC UDP payload the server will use after peer negotiation; 0 uses the safe protocol default.
 //
 // TLSCertFile and TLSKeyFile point to a PEM certificate/key pair used when Certs and ACME are unset.
 //
@@ -186,7 +208,7 @@ var timeNow = time.Now
 //
 //	Example: LogRequests: false silences per-connection logs.
 //
-// ShutdownTimeout bounds graceful shutdown; defaults to 30s.
+// ShutdownTimeout bounds graceful shutdown when the caller's context has no deadline; 0 applies a 30s default and a negative value leaves the caller's context as the only bound.
 //
 //	Example: ShutdownTimeout: 10 * time.Second.
 //
@@ -194,7 +216,7 @@ var timeNow = time.Now
 //
 //	Example: PlainHTTP: true.
 //
-// DisableHTTP2 serves only HTTP/1.1 over TLS, never negotiating HTTP/2.
+// DisableHTTP2 disables HTTP/2 over TLS and plain-text prior knowledge. HTTP/3 is unaffected.
 //
 //	Example: DisableHTTP2: true.
 //
@@ -209,6 +231,10 @@ var timeNow = time.Now
 // WebSocketAllowedOrigins lists origins accepted when WebSocketOriginMode is WSOriginAllowlist.
 //
 //	Example: WebSocketAllowedOrigins: []string{"https://example.com"}.
+//
+// WSReadTimeout is the WebSocket idle read timeout; 0 uses 120s and a negative value disables it.
+//
+// WSWriteTimeout is the WebSocket frame write timeout; 0 uses 30s and a negative value disables it.
 type Config struct {
 	Addr              string
 	HTTPAddr          string
@@ -346,11 +372,37 @@ func (s *Server) h2MaxStreams() uint32 {
 }
 
 func (s *Server) h2InitialWindow() uint32 {
-	return defaultUint32(s.config.H2InitialWindowSize, H2StreamWindowSize)
+	value := defaultUint32(s.config.H2InitialWindowSize, H2StreamWindowSize)
+	if value > 1<<31-1 {
+		return 1<<31 - 1
+	}
+	return value
 }
 
 func (s *Server) h2MaxFrameSize() uint32 {
-	return defaultUint32(s.config.H2MaxFrameSize, H2DefaultMaxFrameSize)
+	value := defaultUint32(s.config.H2MaxFrameSize, H2DefaultMaxFrameSize)
+	if value < H2DefaultMaxFrameSize || value > H2MaxFrameSize {
+		return H2DefaultMaxFrameSize
+	}
+	return value
+}
+
+func (s *Server) h2HeaderTableSize() uint32 {
+	return defaultUint32(s.config.H2HeaderTableSize, H2HeaderTableSize)
+}
+
+func optionalDuration(value, fallback time.Duration) time.Duration {
+	if value == 0 {
+		return fallback
+	}
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func (s *Server) readHeaderTimeout() time.Duration {
+	return optionalDuration(s.config.ReadHeaderTimeout, optionalDuration(s.config.ReadTimeout, 30*time.Second))
 }
 
 func respServerName(resp *Response) string {
@@ -825,11 +877,20 @@ func (s *Server) ensureStartInit() error {
 	return nil
 }
 
-// ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack: it loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
+// ListenAndServeTLS starts the HTTPS server using ALOS's built-in TLS 1.3/1.2 stack, or delegates to plain HTTP when Config.PlainHTTP is true. It loads certificates (self-signed, manual PEM, or ACME), opens the configured number of SO_REUSEPORT listeners, optionally advertises HTTP/2 (subject to Config.DisableHTTP2), starts the HTTP-to-HTTPS redirect listener, and blocks until Shutdown is called or an unrecoverable error occurs.
 //
 // Example: log.Fatal(s.ListenAndServeTLS())
 func (s *Server) ListenAndServeTLS() error {
+	if s.config.PlainHTTP {
+		return s.ListenAndServe()
+	}
 	s.logCapabilities()
+	workers := s.config.WorkerCount
+	if workers < 1 {
+		workers = autoWorkerCount()
+	}
+	prevProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(prevProcs)
 	maybeRaiseProcessFileLimit()
 	if err := s.ensureStartInit(); err != nil {
 		return err
@@ -901,7 +962,7 @@ func (s *Server) logCapabilities() {
 	})
 }
 
-// ListenAndServe starts a plain HTTP/1.1 (and HTTP/2 prior-knowledge) server with no TLS. Use it when Config.PlainHTTP is true or TLS is terminated upstream; it blocks until Shutdown is called or an unrecoverable error occurs.
+// ListenAndServe starts a plain HTTP/1.1 server, plus HTTP/2 prior knowledge unless Config.DisableHTTP2 is set, with no TLS. Use it when Config.PlainHTTP is true or TLS is terminated upstream; it blocks until Shutdown is called or an unrecoverable error occurs.
 //
 // Example: log.Fatal(s.ListenAndServe())
 func (s *Server) ListenAndServe() error {
@@ -923,7 +984,11 @@ func (s *Server) ListenAndServe() error {
 		addr = ":80"
 	}
 
-	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge | epoll) ===")
+	protocols := "HTTP/1.1 + HTTP/2 prior knowledge"
+	if !s.http2Enabled() {
+		protocols = "HTTP/1.1"
+	}
+	log.Printf("=== ALOS HTTP Server (Plain %s | epoll) ===", protocols)
 	log.Printf("Listening on http://%s (epoll listeners=%d)", addr, s.config.Listeners)
 	return s.ListenAndServeEpollH2(addr)
 }
@@ -1129,6 +1194,11 @@ func (s *Server) rebuildFallbackTLSConfig() {
 // Example: ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second); defer cancel(); s.Shutdown(ctx)
 // Example: s.Shutdown(context.Background())
 func (s *Server) Shutdown(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok && s.config.ShutdownTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.config.ShutdownTimeout)
+		defer cancel()
+	}
 	s.shutdownOnce.Do(func() {
 		s.shuttingDown.Store(true)
 		close(s.done)

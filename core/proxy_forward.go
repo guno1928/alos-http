@@ -470,7 +470,10 @@ func readChunkedBody(br io.Reader, maxSize int64) ([]byte, bool) {
 			readLine(br, lineBuf[:0])
 			return body, true
 		}
-		if maxSize > 0 && int64(len(body))+size > maxSize {
+		if size < 0 || size > int64(maxParsedLength) {
+			return nil, false
+		}
+		if maxSize > 0 && size > maxSize-int64(len(body)) {
 			return nil, false
 		}
 		start := len(body)

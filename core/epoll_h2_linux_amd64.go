@@ -316,6 +316,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 	stream.Reset()
 	stream.ID = streamID
 	stream.Window.Store(int64(st.initialWindowSize))
+	stream.RecvWindow = int64(srv.h2InitialWindow())
 	stream.Method = meta.method
 	stream.Path = meta.path
 	stream.RawPath = meta.rawPath
@@ -374,6 +375,12 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrFlowControl)
 		return true
 	}
+	stream.RecvWindow -= consumed
+	if stream.RecvWindow < 0 {
+		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrFlowControl)
+		epollReleaseH2Stream(st, streamID)
+		return false
+	}
 
 	if len(payload) > 0 {
 		if !srv.tryReserveBodyBytes(len(payload)) {
@@ -400,6 +407,7 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 		c.writeBuf = appendH2WindowUpdateFrame(c.writeBuf, 0, connUpdate)
 	}
 	c.writeBuf = appendH2WindowUpdateFrame(c.writeBuf, streamID, consumedWindow)
+	stream.RecvWindow += int64(consumedWindow)
 
 	if frameFlags&H2FlagEndStream == 0 {
 		return false

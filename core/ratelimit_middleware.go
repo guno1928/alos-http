@@ -34,12 +34,13 @@ type RateLimitMiddlewareConfig struct {
 	Window      time.Duration
 	KeyFunc     func(*Request) string
 	OnLimit     RateLimitFunc
+	StopCh      <-chan struct{}
 }
 
 const rateLimitBlockFor = 30 * time.Second
 
 type rateLimitMWEntry struct {
-	count        atomic.Int64
+	state        atomic.Uint64
 	resetAt      atomic.Int64
 	blockedUntil atomic.Int64
 }
@@ -100,10 +101,16 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 	blockSecs := int64(rateLimitBlockFor / time.Second)
 	entries := alosmap.NewTypedSized[string, *rateLimitMWEntry](1024, 0).Prealloc(256)
 
+	stopCh := cfg.StopCh
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+			}
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -168,19 +175,15 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 					return
 				}
 				if entry.blockedUntil.CompareAndSwap(blockedUntil, 0) {
+					entry.state.Store(rlEpochOf(now, windowNanos))
 					entry.resetAt.Store(now + windowNanos)
-					entry.count.Store(0)
 				}
 			}
 
-			resetAt := entry.resetAt.Load()
-			if resetAt == 0 || now >= resetAt {
-				if entry.resetAt.CompareAndSwap(resetAt, now+windowNanos) {
-					entry.count.Store(0)
-				}
+			count := rlBumpCount(&entry.state, now, windowNanos)
+			if count == 1 {
+				entry.resetAt.Store(now + windowNanos)
 			}
-
-			count := entry.count.Add(1)
 			if count > cfg.MaxRequests {
 				entry.blockedUntil.Store(now + blockNanos)
 				reject(req, resp, key, blockSecs)

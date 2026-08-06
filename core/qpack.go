@@ -415,7 +415,11 @@ func (d *QPACKDecoder) DecodeAppend(data []byte, headers [][2]string) ([][2]stri
 			var name string
 			start := len(arena)
 			if huffName {
-				arena = hpackHuffmanDecodeInto(arena, nameRaw)
+				decoded, ok := hpackHuffmanDecodeInto(arena, nameRaw)
+				if !ok {
+					return nil, ap, ErrTruncated
+				}
+				arena = decoded
 			} else {
 				arena = append(arena, nameRaw...)
 			}
@@ -451,7 +455,11 @@ func qpackDecodeStringArena(data, arena []byte) (string, int, []byte) {
 	raw := data[n : n+int(sLen)]
 	start := len(arena)
 	if huffman {
-		arena = hpackHuffmanDecodeInto(arena, raw)
+		decoded, ok := hpackHuffmanDecodeInto(arena, raw)
+		if !ok {
+			return "", 0, arena
+		}
+		arena = decoded
 	} else {
 		arena = append(arena, raw...)
 	}

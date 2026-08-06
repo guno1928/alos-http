@@ -174,7 +174,6 @@ func asciiEqualFoldBytes(line []byte, value string) bool {
 	return true
 }
 
-
 func findHeaderTerminatorBytes(buf []byte, start int) int {
 	if start >= len(buf) {
 		return -1
@@ -203,6 +202,40 @@ func findCRLFBytes(buf []byte, start int) int {
 // connection should close, whether Transfer-Encoding was malformed or
 // chunked, whether the header block exceeded maxHeaderBytes or
 // maxHeaderCount, and whether a complete head was found.
+var h1TokenChar = func() [256]bool {
+	var t [256]bool
+	for c := 'a'; c <= 'z'; c++ {
+		t[c] = true
+	}
+	for c := 'A'; c <= 'Z'; c++ {
+		t[c] = true
+	}
+	for c := '0'; c <= '9'; c++ {
+		t[c] = true
+	}
+	for _, c := range []byte("!#$%&'*+-.^_`|~") {
+		t[c] = true
+	}
+	return t
+}()
+
+func isH1Token(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if !h1TokenChar[c] {
+			return false
+		}
+	}
+	return true
+}
+
+func validH1Version(v []byte) bool {
+	return len(v) == 8 && v[0] == 'H' && v[1] == 'T' && v[2] == 'T' && v[3] == 'P' &&
+		v[4] == '/' && v[5] == '1' && v[6] == '.' && (v[7] == '0' || v[7] == '1')
+}
+
 func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCount int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, tooLarge bool, ok bool) {
 	maxBytes := maxHeaderBytes
 	if maxBytes <= 0 {
@@ -227,11 +260,19 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 		return 0, 0, false, false, false, false, false, false
 	}
 	sp2 := bytes.IndexByte(rl[sp1+1:], ' ')
-	if sp2 >= 0 {
-		sp2 += sp1 + 1
+	if sp2 < 0 {
+		return 0, 0, false, false, true, false, false, true
+	}
+	sp2 += sp1 + 1
+
+	if !validH1Version(rl[sp2+1:]) {
+		return 0, 0, false, false, true, false, false, true
 	}
 
 	methodBytes := rl[:sp1]
+	if !isH1Token(methodBytes) {
+		return 0, 0, false, false, true, false, false, true
+	}
 	switch {
 	case len(methodBytes) == 3 && methodBytes[0] == 'G' && methodBytes[1] == 'E' && methodBytes[2] == 'T':
 		req.Method = "GET"
@@ -429,13 +470,17 @@ func findRequestEndFrom(data []byte, start int) int {
 // ServeH2Plain serves an HTTP/2 connection over conn without TLS, running the
 // H2Conn read and write loops until the connection closes.
 func (s *Server) ServeH2Plain(conn net.Conn) {
+	if !s.http2Enabled() {
+		_ = conn.Close()
+		return
+	}
 	hc := &H2Conn{
 		remoteAddr:        conn.RemoteAddr().String(),
 		conn:              conn,
 		plain:             true,
 		hdrBuf:            make([]byte, 5),
 		server:            s,
-		decoder:           NewHpackDecoder(),
+		decoder:           newHpackDecoder(s.h2HeaderTableSize()),
 		initialWindowSize: H2DefaultWindowSize,
 		streams:           alosmap.NewTypedSized[int64, *H2Stream](256, 0).Prealloc(256),
 		writeCh:           make(chan WriteRequest, 512),
