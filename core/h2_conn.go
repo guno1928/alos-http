@@ -705,6 +705,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 				log.Printf("[H2] stream %d: GET / (fast)", streamID)
 			}
 			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
 			hc.writeFastH2RootResponse(streamID)
 			hc.server.releaseRequestSlot()
 			return
@@ -724,6 +725,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 					log.Printf("[H2] stream %d: %s %s (fast meta)", streamID, meta.method, meta.path)
 				}
 				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
 				hc.writeFastH2RootResponse(streamID)
 				hc.server.releaseRequestSlot()
 				return
@@ -750,6 +752,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 				log.Printf("[H2] stream %d: %s %s (fast)", streamID, meta.method, meta.path)
 			}
 			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
 			hc.writeFastH2RootResponse(streamID)
 			hc.server.releaseRequestSlot()
 			return
@@ -939,6 +942,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 		}
 	}()
 	Stats.TotalReqs.Add(1)
+	Stats.RawReqs.Add(1)
 	if hc.server.logRequests.Load() {
 		log.Printf("[H2] stream %d: %s %s", stream.ID, stream.Method, stream.Path)
 	}

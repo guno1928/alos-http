@@ -1717,6 +1717,7 @@ func (s *Server) OnResponse(fn func(*Request, *Response)) {
 
 func (s *Server) dispatch(req *Request, resp *Response) {
 	if !s.tryAcquireRequestSlot() {
+		statsBlocked()
 		resp.Status(503).String("Service Unavailable")
 		return
 	}
@@ -1733,6 +1734,7 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 			limit = s.perIPInFlight
 		}
 		if !s.perIPLimiter.acquire(clientIP, limit) {
+			statsBlocked()
 			resp.Status(429).String("Too Many Requests")
 			return
 		}
@@ -1783,6 +1785,7 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		if clientIP != "" {
 			allowed, cr, retryAfter := s.RateLimit.Check(clientIP, req.Path)
 			if !allowed {
+				statsBlocked()
 				event := RateLimitEvent{
 					IP:         clientIP,
 					Path:       req.Path,

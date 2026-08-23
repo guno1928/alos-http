@@ -28,6 +28,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				break
 			}
 			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
 			srv.releaseRequestSlot()
 			scratch = append(scratch, resp...)
 			c.appBufOff += consumed
@@ -42,6 +43,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		c.req.resetFastH1()
 		headerEnd, contentLength, hasContentLength, closeConn, badTE, chunked, tooLarge, ok := ParseH1RequestHead(data, &c.req, srv.config.MaxHeaderSize, srv.config.MaxHeaderCount)
 		if tooLarge {
+			statsRawBlocked()
 			c.resp.Reset()
 			c.resp.Status(431).String("Request Header Fields Too Large")
 			scratch = appendPlainResponse(&c.resp, scratch)
@@ -54,6 +56,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		}
 		consumed := headerEnd
 		if badTE {
+			statsRawBlocked()
 			c.resp.Reset()
 			c.resp.Status(400).String("Bad Request")
 			scratch = appendPlainResponse(&c.resp, scratch)
@@ -63,6 +66,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		}
 		if chunked {
 			if !c.reserveH1BodyBudget(srv, h1ChunkedBodyReservation(srv)) {
+				statsRawBlocked()
 				c.resp.Reset()
 				c.resp.Status(503).String("Request Body Capacity Exhausted")
 				scratch = appendPlainResponse(&c.resp, scratch)
@@ -76,6 +80,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			}
 			bodyEnd, status, resume := asyncChunkedComplete(data, scanFrom)
 			if status == -1 {
+				statsRawBlocked()
 				c.chunkScanPos = 0
 				c.resp.Reset()
 				c.resp.Status(400).String("Bad Request")
@@ -87,6 +92,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			if status == 0 {
 				c.chunkScanPos = resume
 				if srv.config.MaxBodySize > 0 && int64(len(data)-headerEnd) > srv.config.MaxBodySize+chunkedFramingSlack {
+					statsRawBlocked()
 					c.resp.Reset()
 					c.resp.Status(413).String("Payload Too Large")
 					scratch = appendPlainResponse(&c.resp, scratch)
@@ -100,6 +106,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			c.chunkScanPos = 0
 			decoded, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
 			if !dok || (srv.config.MaxBodySize > 0 && int64(len(decoded)) > srv.config.MaxBodySize) {
+				statsRawBlocked()
 				c.resp.Reset()
 				if dok {
 					c.resp.Status(413).String("Payload Too Large")
@@ -117,6 +124,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		}
 		if hasContentLength {
 			if contentLength < 0 || (srv.config.MaxBodySize > 0 && int64(contentLength) > srv.config.MaxBodySize) {
+				statsRawBlocked()
 				c.resp.Reset()
 				if contentLength < 0 {
 					c.resp.Status(400).String("Bad Request")
@@ -129,6 +137,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 				return epollActionCloseAfterFlush
 			}
 			if !c.reserveH1BodyBudget(srv, contentLength) {
+				statsRawBlocked()
 				c.resp.Reset()
 				c.resp.Status(503).String("Request Body Capacity Exhausted")
 				scratch = appendPlainResponse(&c.resp, scratch)
@@ -138,6 +147,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 			}
 			bodyEnd := headerEnd + contentLength
 			if bodyEnd < headerEnd {
+				statsRawBlocked()
 				c.resp.Reset()
 				c.resp.Status(400).String("Bad Request")
 				scratch = appendPlainResponse(&c.resp, scratch)
@@ -154,12 +164,14 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		}
 
 		Stats.TotalReqs.Add(1)
+		Stats.RawReqs.Add(1)
 		c.req.StreamWriter = nil
 		c.req.conn = nil
 		c.req.server = srv
 		c.req.Host = c.req.cachedHost
 		c.req.RemoteAddr = c.remoteAddr
 		if !c.acquireIPConn(srv, &c.req) {
+			statsBlocked()
 			c.resp.Reset()
 			c.resp.Status(429).String("Your IP has too many connections open")
 			scratch = appendPlainResponse(&c.resp, scratch)

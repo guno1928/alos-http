@@ -152,6 +152,7 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	}
 	_ = scheme
 
+	Stats.RawReqs.Add(1)
 	req.Method = method
 	req.Path = path
 	req.RawPath = rawPath

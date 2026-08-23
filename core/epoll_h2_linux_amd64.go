@@ -256,6 +256,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		if srv.tryAcquireRequestSlot() {
 			st.lastStreamID = streamID
 			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
 			c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
 			srv.releaseRequestSlot()
 			return false
@@ -273,6 +274,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 				st.lastStreamID = streamID
 				_ = meta
 				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
 				c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
 				srv.releaseRequestSlot()
 				return false
@@ -290,6 +292,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		if srv.tryAcquireRequestSlot() {
 			st.lastStreamID = streamID
 			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
 			c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
 			srv.releaseRequestSlot()
 			return false
@@ -473,6 +476,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 	}
 
 	Stats.TotalReqs.Add(1)
+	Stats.RawReqs.Add(1)
 	if srv.logRequests.Load() {
 		log.Printf("[H2-EPOLL] stream %d: %s %s", stream.ID, stream.Method, stream.Path)
 	}
@@ -499,6 +503,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 	stream.req.hdrBuf = nil
 
 	if !c.acquireIPConn(srv, &stream.req) {
+		statsBlocked()
 		stream.Reset()
 		StreamPool.Put(stream)
 		delete(st.streams, streamID)
