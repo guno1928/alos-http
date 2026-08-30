@@ -68,6 +68,10 @@ type Request struct {
 	hijackReadBuf []byte
 	cookiesCache  []Cookie
 
+	promoteBuf     []byte
+	promoteOff     int
+	aliasesReadBuf bool
+
 	store      map[string]any
 	queryCache map[string][]string
 	formCache  map[string][]string
@@ -163,6 +167,9 @@ func (r *Request) Reset() {
 	r.tlsReader = nil
 	r.tlsWriter = nil
 	r.hdrBuf = nil
+	r.aliasesReadBuf = false
+	r.promoteBuf = nil
+	r.promoteOff = 0
 	r.hijacked = false
 	r.cachedCL = ""
 	r.cachedConn = ""
@@ -203,6 +210,7 @@ func (r *Request) Reset() {
 }
 
 func (r *Request) resetFastH1() {
+	r.aliasesReadBuf = false
 	clear(r.Headers)
 	r.Headers = r.Headers[:0]
 	r.Body = shrinkBuffer(r.Body, 1024)

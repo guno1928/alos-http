@@ -319,6 +319,7 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 			if hasContentLength && chunkedEncoding {
 				badTransferEncoding = true
 			}
+			req.aliasesReadBuf = true
 			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
 		}
 

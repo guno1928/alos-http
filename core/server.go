@@ -1821,6 +1821,7 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 			return
 		}
 	}
+	promoteRequestStrings(req)
 	handler := s.Router.Lookup(req.Method, req.Path, req)
 	handler(req, resp)
 }

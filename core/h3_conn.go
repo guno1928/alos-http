@@ -164,12 +164,14 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	req.RemoteAddr = h3.remoteAddr
 	req.IsH2 = false
 	req.server = h3.server
+	req.aliasesReadBuf = true
 
 	resp := ResponsePool.Get().(*Response)
 	resp.Reset()
 	resp.lazyReq = req
 
 	if h3.server.fastDispatch.Load() {
+		promoteRequestStrings(req)
 		handler := h3.server.Router.Lookup(req.Method, req.Path, req)
 		handler(req, resp)
 	} else {

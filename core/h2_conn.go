@@ -972,6 +972,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	resp.lazyReq = req
 
 	if hc.server.fastDispatch.Load() {
+		promoteRequestStrings(req)
 		handler := hc.server.Router.Lookup(req.Method, req.Path, req)
 		handler(req, resp)
 		if hc.server.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > hc.server.config.MaxWriteSize {

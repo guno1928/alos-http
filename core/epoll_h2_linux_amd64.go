@@ -546,6 +546,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 			w.postTask(func(w *epollWorker) { cc.finishH2Dispatch(w, gen, sid, stream) })
 		}()
 		if srv.fastDispatch.Load() {
+			promoteRequestStrings(&stream.req)
 			handler := srv.Router.Lookup(stream.req.Method, stream.req.Path, &stream.req)
 			handler(&stream.req, &stream.resp)
 		} else {

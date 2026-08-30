@@ -220,6 +220,7 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 		c.req.connTakenOver = false
 		c.req.attachConn = c.worker.tlsH1Attacher(c, consumed)
 		if srv.fastDispatch.Load() {
+			promoteRequestStrings(&c.req)
 			handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
 			handler(&c.req, &c.resp)
 		} else {

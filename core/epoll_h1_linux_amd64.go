@@ -205,6 +205,7 @@ func (c *epollConn) epollProcessH1(srv *Server) int {
 				w.postTask(func(w *epollWorker) { cc.finishH1Dispatch(w, gen, reqClose) })
 			}()
 			if fast {
+				promoteRequestStrings(&cc.req)
 				handler := srv.Router.Lookup(cc.req.Method, cc.req.Path, &cc.req)
 				handler(&cc.req, &cc.resp)
 			} else {
