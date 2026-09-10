@@ -30,16 +30,18 @@ func hashForScheme(scheme uint16) crypto.Hash {
 }
 
 const (
-	suite12RSAAES128 = 0xc02f
+	suite12RSAAES128  = 0xc02f
 	suite12ECDSAES128 = 0xc02b
-	suite12RSAAES256 = 0xc030
+	suite12RSAAES256  = 0xc030
 	suite12ECDSAES256 = 0xc02c
 )
 
 type aead12 struct {
-	aead cipher.AEAD
-	iv   [4]byte
-	seq  uint64
+	aead     cipher.AEAD
+	iv       [4]byte
+	seq      uint64
+	nonceBuf [tls12NonceLen]byte
+	aadBuf   [tls12AADLen]byte
 }
 
 func (t *tlsTransport) begin12() error {
@@ -259,11 +261,13 @@ func (t *tlsTransport) send12ClientFlight(c *backendConn) error {
 }
 
 func (t *tlsTransport) handle12Finished(c *backendConn, plain []byte) error {
-	if len(plain) < 4 || plain[0] != tlsHSFinished {
+	const verifyDataLen = 12
+	if len(plain) != 4+verifyDataLen || plain[0] != tlsHSFinished ||
+		plain[1] != 0 || plain[2] != 0 || plain[3] != verifyDataLen {
 		return errTLS
 	}
-	expected := t.prf(t.master12, "server finished", t.hashOf(t.transcript), 12)
-	if !hmac.Equal(plain[4:4+12], expected) {
+	expected := t.prf(t.master12, "server finished", t.hashOf(t.transcript), verifyDataLen)
+	if !hmac.Equal(plain[4:4+verifyDataLen], expected) {
 		return errTLS
 	}
 	t.negALPN = "http/1.1"
@@ -308,50 +312,8 @@ func makeAEAD12(key, iv []byte) aead12 {
 	return k
 }
 
-func (t *tlsTransport) seal12(k *aead12, contentType byte, plain []byte) []byte {
-	var nonce [12]byte
-	copy(nonce[:4], k.iv[:])
-	seq := k.seq
-	for i := 0; i < 8; i++ {
-		nonce[11-i] = byte(seq)
-		seq >>= 8
-	}
-	var aad [13]byte
-	s := k.seq
-	for i := 0; i < 8; i++ {
-		aad[7-i] = byte(s)
-		s >>= 8
-	}
-	aad[8] = contentType
-	aad[9] = 0x03
-	aad[10] = 0x03
-	aad[11] = byte(len(plain) >> 8)
-	aad[12] = byte(len(plain))
-
-	ct := k.aead.Seal(nil, nonce[:], plain, aad[:])
-	total := 8 + len(ct)
-	rec := make([]byte, 5+total)
-	rec[0] = contentType
-	rec[1] = 0x03
-	rec[2] = 0x03
-	rec[3] = byte(total >> 8)
-	rec[4] = byte(total)
-	copy(rec[5:13], nonce[4:])
-	copy(rec[13:], ct)
-	k.seq++
-	return rec
-}
-
-func (t *tlsTransport) open12(k *aead12, contentType byte, body []byte) ([]byte, error) {
-	if len(body) < 8+16 {
-		return nil, errTLS
-	}
-	var nonce [12]byte
-	copy(nonce[:4], k.iv[:])
-	copy(nonce[4:], body[:8])
-	ct := body[8:]
-	plainLen := len(ct) - 16
-	var aad [13]byte
+func (k *aead12) putAAD(contentType byte, plainLen int) []byte {
+	aad := &k.aadBuf
 	s := k.seq
 	for i := 0; i < 8; i++ {
 		aad[7-i] = byte(s)
@@ -362,7 +324,42 @@ func (t *tlsTransport) open12(k *aead12, contentType byte, body []byte) ([]byte,
 	aad[10] = 0x03
 	aad[11] = byte(plainLen >> 8)
 	aad[12] = byte(plainLen)
-	out, err := k.aead.Open(nil, nonce[:], ct, aad[:])
+	return aad[:]
+}
+
+func (t *tlsTransport) seal12(k *aead12, contentType byte, plain []byte) []byte {
+	return t.seal12To(nil, k, contentType, plain)
+}
+
+func (t *tlsTransport) seal12To(dst []byte, k *aead12, contentType byte, plain []byte) []byte {
+	nonce := &k.nonceBuf
+	copy(nonce[:4], k.iv[:])
+	seq := k.seq
+	for i := 0; i < 8; i++ {
+		nonce[11-i] = byte(seq)
+		seq >>= 8
+	}
+	aad := k.putAAD(contentType, len(plain))
+	total := tls12ExplicitNonceLen + len(plain) + k.aead.Overhead()
+	dst = growSlice(dst, tls12RecordHeaderLen+total)
+	dst = append(dst, contentType, 0x03, 0x03, byte(total>>8), byte(total))
+	dst = append(dst, nonce[4:]...)
+	dst = k.aead.Seal(dst, nonce[:], plain, aad)
+	k.seq++
+	return dst
+}
+
+func (t *tlsTransport) open12(k *aead12, contentType byte, body []byte) ([]byte, error) {
+	if len(body) < 8+16 {
+		return nil, errTLS
+	}
+	nonce := &k.nonceBuf
+	copy(nonce[:4], k.iv[:])
+	copy(nonce[4:], body[:8])
+	ct := body[8:]
+	plainLen := len(ct) - 16
+	aad := k.putAAD(contentType, plainLen)
+	out, err := k.aead.Open(nil, nonce[:], ct, aad)
 	if err != nil {
 		return nil, err
 	}

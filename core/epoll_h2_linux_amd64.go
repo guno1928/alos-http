@@ -169,12 +169,6 @@ func (c *epollConn) epollH2Settings(payload []byte) bool {
 			}
 			st.initialWindowSize = val
 			windowChanged = true
-		case H2SettingHeaderTableSize:
-			if val > 65536 {
-				val = 65536
-			}
-			st.decoder.protocolMaxSize = int(val)
-			st.decoder.setMaxSize(int(val))
 		}
 	}
 	if windowChanged {
@@ -250,50 +244,43 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrProtocol)
 		return true
 	}
-	fastRoot := srv.h2RootFast.enabled && srv.httpRouter == nil
+	h2Fast := srv.h2RootFast.Load()
+	fastRoot := h2Fast != nil && srv.httpRouter == nil
 
 	if endStream && fastRoot && matchIndexedH2FastRootHeaderBlock(headerBlock) {
 		if srv.tryAcquireRequestSlot() {
 			st.lastStreamID = streamID
 			Stats.TotalReqs.Add(1)
 			Stats.RawReqs.Add(1)
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
+			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast, streamID, int(st.maxFrameSize))
 			srv.releaseRequestSlot()
 			return false
 		}
 	}
 
-	if endStream && fastRoot {
-		meta, ok, err := st.decoder.DecodeFastRootRequest(headerBlock)
-		if err != nil {
-			c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrCompression)
-			return false
-		}
-		if ok {
-			if srv.tryAcquireRequestSlot() {
-				st.lastStreamID = streamID
-				_ = meta
-				Stats.TotalReqs.Add(1)
-				Stats.RawReqs.Add(1)
-				c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
-				srv.releaseRequestSlot()
-				return false
-			}
-		}
-	}
-
-	headers, meta, err := st.decoder.DecodeIntoRequest(st.headersBuf[:0], headerBlock)
-	st.headersBuf = headers[:0]
-	if err != nil {
-		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrCompression)
-		return false
-	}
-	if endStream && fastRoot && meta.method == "GET" && meta.path == "/" {
+	if endStream && fastRoot && st.decoder.MemoizedRootRequest(headerBlock) {
 		if srv.tryAcquireRequestSlot() {
 			st.lastStreamID = streamID
 			Stats.TotalReqs.Add(1)
 			Stats.RawReqs.Add(1)
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, srv.h2RootFast, streamID, int(st.maxFrameSize))
+			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast, streamID, int(st.maxFrameSize))
+			srv.releaseRequestSlot()
+			return false
+		}
+	}
+
+	headers, meta, isRoot, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
+	st.headersBuf = headers[:0]
+	if err != nil {
+		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrCompression)
+		return true
+	}
+	if endStream && fastRoot && isRoot {
+		if srv.tryAcquireRequestSlot() {
+			st.lastStreamID = streamID
+			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
+			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast, streamID, int(st.maxFrameSize))
 			srv.releaseRequestSlot()
 			return false
 		}
@@ -409,10 +396,11 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 		st.recvConnWindow += int64(connUpdate)
 		c.writeBuf = appendH2WindowUpdateFrame(c.writeBuf, 0, connUpdate)
 	}
-	c.writeBuf = appendH2WindowUpdateFrame(c.writeBuf, streamID, consumedWindow)
-	stream.RecvWindow += int64(consumedWindow)
-
 	if frameFlags&H2FlagEndStream == 0 {
+		if consumedWindow > 0 {
+			c.writeBuf = appendH2WindowUpdateFrame(c.writeBuf, streamID, consumedWindow)
+			stream.RecvWindow += int64(consumedWindow)
+		}
 		return false
 	}
 	stream.State.Store(StreamHalfClosed)
@@ -495,6 +483,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 	stream.req.cachedHost = stream.Auth
 	stream.req.headerCacheMask = headerCacheHost
 	stream.req.RemoteAddr = c.remoteAddr
+	stream.req.IsTLS = c.tls
 	stream.req.server = srv
 	stream.req.StreamWriter = nil
 	stream.req.conn = nil
@@ -537,6 +526,7 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32) bool {
 		}
 	}
 
+	w.spawned++
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

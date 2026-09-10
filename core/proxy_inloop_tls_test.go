@@ -77,7 +77,7 @@ func tlsProxyClient(domain string) *http.Client {
 	return &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: domain},
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: domain},
 			ForceAttemptHTTP2: false,
 		},
 	}

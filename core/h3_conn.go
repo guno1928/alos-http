@@ -56,32 +56,20 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	var arenaPtr *[]byte
 	defer func() {
 		if arenaPtr != nil {
-			qpackArenaPool.Put(arenaPtr)
+			putBoxedBufCapped(&qpackArenaPool, arenaPtr, qpackArenaPoolMaxCap)
 		}
 		if r := recover(); r != nil {
 			log.Printf("[H3-PANIC] handleRequestStream: %v", r)
+			h3.writeErrorResponse(s, 500)
 		}
 	}()
 	data, err := s.ReadAll()
 	if err != nil {
 		return
 	}
-
-	consumed := uint64(len(data))
-	if consumed > 0 {
-		h3.qconn.streamsMu.Lock()
-		h3.qconn.dataRecv += consumed
-		var connFC uint64
-		if h3.qconn.dataRecv+uint64(quicInitialMaxData)/2 > h3.qconn.dataRecvGranted {
-			connFC = h3.qconn.dataRecv + uint64(quicInitialMaxData)
-			h3.qconn.dataRecvGranted = connFC
-		}
-		h3.qconn.streamsMu.Unlock()
-
-		if connFC > 0 {
-			fc := quicAppendMaxDataFrame(nil, connFC)
-			h3.qconn.sendFrames(quicSpaceAppData, fc, false)
-		}
+	if s.overflowed() {
+		h3.writeErrorResponse(s, 413)
+		return
 	}
 
 	req := RequestPool.Get().(*Request)
@@ -114,12 +102,14 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 					log.Printf("[H3] QPACK decode error: %v", decErr)
 				}
 				releaseRequestToPool(req)
+				h3.writeErrorResponse(s, 400)
 				return
 			}
 		case h3FrameData:
 			req.Body = append(req.Body, payload...)
 			if max := h3.server.config.MaxBodySize; max > 0 && int64(len(req.Body)) > max {
 				releaseRequestToPool(req)
+				h3.writeErrorResponse(s, 413)
 				return
 			}
 		}
@@ -148,6 +138,7 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 
 	if method == "" || path == "" {
 		releaseRequestToPool(req)
+		h3.writeErrorResponse(s, 400)
 		return
 	}
 	_ = scheme
@@ -163,6 +154,7 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	req.headerCacheMask = headerCacheHost
 	req.RemoteAddr = h3.remoteAddr
 	req.IsH2 = false
+	req.IsTLS = true
 	req.server = h3.server
 	req.aliasesReadBuf = true
 
@@ -184,6 +176,14 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	releaseResponseToPool(resp)
 }
 
+func (h3 *H3Conn) writeErrorResponse(s *QUICStream, status int) {
+	resp := ResponsePool.Get().(*Response)
+	resp.Reset()
+	resp.Status(status).String(StatusText(status))
+	h3.writeResponse(s, resp)
+	releaseResponseToPool(resp)
+}
+
 func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 	hbp := qpackEncodeResponseHeaders(
 		resp.StatusCode,
@@ -195,7 +195,7 @@ func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 
 	fbp := h3FrameBufPool.Get().(*[]byte)
 	frames := h3AppendHeadersFrame((*fbp)[:0], *hbp)
-	qpackEncodeBufPool.Put(hbp)
+	putBoxedBufCapped(&qpackEncodeBufPool, hbp, qpackEncodeBufPoolMaxCap)
 
 	bodyBytes := resp.transmittedBodyBytes()
 	if len(bodyBytes) > 0 {
@@ -205,7 +205,7 @@ func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 	s.setSendBuf(frames)
 	h3.qconn.sendStreamData(s)
 	if s.sendBufDrained() {
-		*fbp = frames[:0]
-		h3FrameBufPool.Put(fbp)
+		*fbp = frames
+		putBoxedBufCapped(&h3FrameBufPool, fbp, h3FrameBufPoolMaxCap)
 	}
 }

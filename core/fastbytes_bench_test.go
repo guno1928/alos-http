@@ -34,9 +34,21 @@ func TestCRLF2Equiv(t *testing.T) {
 	}
 }
 
-func BenchmarkCRLF2_Std(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLF2Std(crlf2Data) } }
-func BenchmarkCRLF2_Swar(b *testing.B) { for i := 0; i < b.N; i++ { crlfSink = indexCRLF2Swar(crlf2Data) } }
-func BenchmarkCRLF2_Asm(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLF2(crlf2Data) } }
+func BenchmarkCRLF2_Std(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLF2Std(crlf2Data)
+	}
+}
+func BenchmarkCRLF2_Swar(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLF2Swar(crlf2Data)
+	}
+}
+func BenchmarkCRLF2_Asm(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLF2(crlf2Data)
+	}
+}
 
 func makeHeaderBlock(nHeaders int) []byte {
 	var b []byte
@@ -87,12 +99,44 @@ func TestEqualPrefix16(t *testing.T) {
 	}
 }
 
-func BenchmarkEq16_Std(b *testing.B)  { for i := 0; i < b.N; i++ { eqSink = bytes.Equal(eqData[:16], rootPrefixBytes) } }
-func BenchmarkEq16_Fast(b *testing.B) { for i := 0; i < b.N; i++ { eqSink = equalPrefix16(eqData, &rootPrefix16) } }
+func BenchmarkEq16_Std(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		eqSink = bytes.Equal(eqData[:16], rootPrefixBytes)
+	}
+}
+func BenchmarkEq16_Fast(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		eqSink = equalPrefix16(eqData, &rootPrefix16)
+	}
+}
 
-func BenchmarkCRLF_Std_Small(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLFStd(hbSmall) } }
-func BenchmarkCRLF_Swar_Small(b *testing.B) { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLFSwar(hbSmall) } }
-func BenchmarkCRLF_Asm_Small(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLF(hbSmall) } }
-func BenchmarkCRLF_Std_Large(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLFStd(hbLarge) } }
-func BenchmarkCRLF_Swar_Large(b *testing.B) { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLFSwar(hbLarge) } }
-func BenchmarkCRLF_Asm_Large(b *testing.B)  { for i := 0; i < b.N; i++ { crlfSink = indexCRLFCRLF(hbLarge) } }
+func BenchmarkCRLF_Std_Small(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLFStd(hbSmall)
+	}
+}
+func BenchmarkCRLF_Swar_Small(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLFSwar(hbSmall)
+	}
+}
+func BenchmarkCRLF_Asm_Small(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLF(hbSmall)
+	}
+}
+func BenchmarkCRLF_Std_Large(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLFStd(hbLarge)
+	}
+}
+func BenchmarkCRLF_Swar_Large(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLFSwar(hbLarge)
+	}
+}
+func BenchmarkCRLF_Asm_Large(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		crlfSink = indexCRLFCRLF(hbLarge)
+	}
+}

@@ -2,19 +2,6 @@ package core
 
 import "encoding/binary"
 
-func quicVarintLen(v uint64) int {
-	if v < 64 {
-		return 1
-	}
-	if v < 16384 {
-		return 2
-	}
-	if v < 1073741824 {
-		return 4
-	}
-	return 8
-}
-
 func quicAppendVarint(dst []byte, v uint64) []byte {
 	if v < 64 {
 		return append(dst, byte(v))

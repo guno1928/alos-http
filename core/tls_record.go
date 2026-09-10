@@ -57,8 +57,8 @@ func releaseOwnedWriteBuf(data []byte, releaseBuf *[]byte, releasePool uint8) {
 		*releaseBuf = data[:0]
 		MediumBufPool.Put(releaseBuf)
 	case writeOwnedReleaseLargeBuf:
-		*releaseBuf = data[:0]
-		LargeBufPool.Put(releaseBuf)
+		*releaseBuf = data
+		putBoxedBufCapped(&LargeBufPool, releaseBuf, largeBufPoolMaxCap)
 	}
 }
 
@@ -319,7 +319,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	}
 	*ibp = (*ibp)[:0]
 	WriteBufPool.Put(ibp)
-	*obp = out[:0]
-	LargeBufPool.Put(obp)
+	*obp = out
+	putBoxedBufCapped(&LargeBufPool, obp, largeBufPoolMaxCap)
 	return err
 }

@@ -115,6 +115,28 @@ func sanitizeFilename(name string) string {
 //	resp.SendFile("videos/demo.mp4",
 //	    core.WithRateLimit(10),
 //	    core.WithAttachment("demo.mp4"))
+const sendFileBufferedMax = 64 << 20
+
+func (r *Response) sendFileBuffered(f *os.File, size int64, contentType string, hdrs [][2]string) error {
+	if size > sendFileBufferedMax {
+		r.Status(500).String("no stream writer available")
+		return ErrStreamClosed
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(f, body); err != nil {
+		r.Status(500).String("read error")
+		return err
+	}
+	for _, h := range hdrs {
+		if h[0] != "content-length" {
+			r.SetHeader(h[0], h[1])
+		}
+	}
+	r.Status(200).Bytes(body)
+	r.ContentType = contentType
+	return nil
+}
+
 func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 	var cfg sendFileConfig
 	for _, o := range opts {
@@ -192,8 +214,7 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 
 	sw := r.ensureSW()
 	if sw == nil {
-		r.Status(500).String("no stream writer available")
-		return ErrStreamClosed
+		return r.sendFileBuffered(f, fi.Size(), ct, hdrs)
 	}
 	if err := sw.WriteHeader(200, hdrs, ct); err != nil {
 		return err

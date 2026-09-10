@@ -35,7 +35,8 @@ func constantTimeEqualString(a, b string) bool {
 //
 //	Example: FormField: "authenticity_token".
 //
-// Secure sets the Secure flag on the token cookie so it is sent only over HTTPS.
+// Secure sets the Secure flag on the token cookie so it is sent only over HTTPS;
+// tokens issued on a TLS request always carry Secure.
 //
 //	Example: Secure: true.
 //
@@ -107,7 +108,7 @@ func CSRF(cfg CSRFConfig) MiddlewareFunc {
 					Value:    token,
 					Path:     "/",
 					MaxAge:   maxAge,
-					Secure:   secure,
+					Secure:   secure || req.IsTLS,
 					HttpOnly: false,
 					SameSite: sameSite,
 				})

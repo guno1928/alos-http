@@ -79,8 +79,9 @@ type acmeIntegration struct {
 
 	challenges *alosmap.TypedMap[string, *acmeChallenge]
 
-	localIPs atomic.Pointer[[]net.IP]
-	stop     chan struct{}
+	localIPs   atomic.Pointer[[]net.IP]
+	stop       chan struct{}
+	registered atomic.Bool
 }
 
 type acmeChallenge struct {
@@ -121,9 +122,9 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 	acmePrintf("[ACME] cert persistence enabled; cache dir: %s", cfg.CacheDir)
 	acmePrintf("[ACME] challenge dir: %s", challengeDir)
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := loadOrCreateACMEAccountKey(filepath.Join(cfg.CacheDir, acmeAccountKeyFile))
 	if err != nil {
-		acmePrintf("[ACME] account key generation failed: %v", err)
+		acmePrintf("[ACME] account key unavailable: %v", err)
 		return nil
 	}
 
@@ -146,6 +147,41 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 	acmePrintf("[ACME] LE directory: %s", directoryURL)
 	ai.refreshLocalIPs()
 	return ai
+}
+
+const acmeAccountKeyFile = "account.key"
+
+func loadOrCreateACMEAccountKey(path string) (*ecdsa.PrivateKey, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, fmt.Errorf("%s: not PEM", path)
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		key, ok := parsed.(*ecdsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("%s: not an ECDSA key", path)
+		}
+		return key, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	data := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		acmePrintf("[ACME] account key not persisted to %s: %v", path, err)
+	}
+	return key, nil
 }
 
 func (ai *acmeIntegration) refreshLocalIPs() {
@@ -654,10 +690,10 @@ func (ai *acmeIntegration) deferredObtain(domain string) {
 	ai.obtainWithRetry(domain)
 }
 
-func (ai *acmeIntegration) obtain(domain string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
+func (ai *acmeIntegration) ensureRegistered(ctx context.Context) error {
+	if ai.registered.Load() {
+		return nil
+	}
 	acct := &acme.Account{}
 	if ai.email != "" {
 		acct.Contact = []string{"mailto:" + ai.email}
@@ -678,6 +714,17 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		}
 	} else {
 		acmePrintf("[ACME] account registered successfully")
+	}
+	ai.registered.Store(true)
+	return nil
+}
+
+func (ai *acmeIntegration) obtain(domain string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := ai.ensureRegistered(ctx); err != nil {
+		return err
 	}
 
 	acmePrintf("[ACME] creating order for %s...", domain)
@@ -915,20 +962,20 @@ func (s *Server) AddDomainCert(domain string, certPEM, keyPEM []byte) error {
 // Example: srv.AddACMEDomain("example.com")
 // Example: srv.AddACMEDomain("example.com", "admin@example.com")
 func (s *Server) AddACMEDomain(domain string, email ...string) {
-	if s.acme == nil {
-		e := ""
-		if len(email) > 0 {
-			e = email[0]
-		}
-		ai := newACMEIntegration(ACMEConfig{Email: e, Domains: []string{domain}}, s)
-		if ai == nil {
-			return
-		}
-		s.acme = ai
-		ai.Start()
+	if cur := s.acme.Load(); cur != nil {
+		cur.addDomain(domain)
 		return
 	}
-	s.acme.addDomain(domain)
+	e := ""
+	if len(email) > 0 {
+		e = email[0]
+	}
+	ai := newACMEIntegration(ACMEConfig{Email: e, Domains: []string{domain}}, s)
+	if ai == nil {
+		return
+	}
+	s.replaceACME(ai)
+	ai.Start()
 }
 
 // EnableACME starts automatic TLS certificate provisioning for cfg.Domains
@@ -940,18 +987,25 @@ func (s *Server) EnableACME(cfg ACMEConfig) {
 	if ai == nil {
 		return
 	}
-	s.acme = ai
+	s.replaceACME(ai)
 	ai.Start()
+}
+
+func (s *Server) replaceACME(ai *acmeIntegration) {
+	if old := s.acme.Swap(ai); old != nil && old != ai {
+		old.Stop()
+	}
 }
 
 // LocalIPs returns the server's detected public IPv4 addresses, used to
 // verify that a domain's DNS points at this machine before requesting an
 // ACME certificate.
 func (s *Server) LocalIPs() []net.IP {
-	if s.acme == nil {
+	ai := s.acme.Load()
+	if ai == nil {
 		return gatherPublicIPv4()
 	}
-	p := s.acme.localIPs.Load()
+	p := ai.localIPs.Load()
 	if p == nil {
 		return nil
 	}

@@ -8,13 +8,13 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	wroteServer := false
 
 	if contentType != "" {
-		enc.EncodeHeaderFold("content-type", contentType)
+		enc.encodeStaticFieldCached(hpackStaticContentType, contentType)
 		wroteContentType = true
 	}
 	if contentLength >= 0 {
 		var clBuf [20]byte
 		clStr := appendUint(clBuf[:0], contentLength)
-		enc.EncodeHeaderFold("content-length", UnsafeString(clStr))
+		enc.encodeStaticFieldCached(hpackStaticContentLength, UnsafeString(clStr))
 		wroteContentLength = true
 	}
 
@@ -74,6 +74,6 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	}
 
 	if !wroteServer {
-		enc.EncodeHeaderFold("server", serverName)
+		enc.encodeStaticFieldCached(hpackStaticServer, serverName)
 	}
 }

@@ -141,7 +141,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	eeCert := certEntry.CachedEECert(selectedALPN)
 	transcript.Write(eeCert)
 	var cvHashBuf [64]byte
-	cvScheme, sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(cvHashBuf[:0]))
+	cvScheme, sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(cvHashBuf[:0]), c.clientHello.SignatureSchemes)
 	if err != nil {
 		return epollActionCloseAfterFlush
 	}
@@ -263,11 +263,6 @@ func (c *epollConn) epollTLSDecryptToApp(srv *Server) (int, bool) {
 			return epollActionNeedRead, false
 		}
 		switch ct {
-		case 0x14:
-			c.compactCipher(totalLen)
-			continue
-		case 0x15:
-			return epollActionCloseAfterFlush, false
 		case 0x17:
 			pt, err := c.appReader.Decrypt(payload)
 			if err != nil {
@@ -293,8 +288,7 @@ func (c *epollConn) epollTLSDecryptToApp(srv *Server) (int, bool) {
 				continue
 			}
 		default:
-			c.compactCipher(totalLen)
-			continue
+			return epollActionCloseAfterFlush, false
 		}
 	}
 }
@@ -347,7 +341,7 @@ func (c *epollConn) epollTLS12ClientHello(srv *Server, payload []byte, totalLen 
 
 	shMsg := buildTLS12ServerHello(st.serverRandom[:], suite.id, selectedALPN)
 	certMsg := buildTLS12Certificate(certEntry.ChainDER)
-	skeMsg, err := buildTLS12ServerKeyExchange(certEntry.PrivKey, st.clientRandom[:], st.serverRandom[:], curve, ecdhePub)
+	skeMsg, err := buildTLS12ServerKeyExchange(certEntry.PrivKey, st.clientRandom[:], st.serverRandom[:], curve, ecdhePub, c.clientHello.SignatureSchemes)
 	if err != nil {
 		return epollActionCloseAfterFlush
 	}
@@ -455,12 +449,8 @@ func (c *epollConn) epollTLS12DecryptToApp(srv *Server) (int, bool) {
 			c.appBuf = append(c.appBuf, pt...)
 			c.compactCipher(totalLen)
 			return epollTLSContinue, true
-		case 0x15, 0x16:
-			c.compactCipher(totalLen)
-			return epollActionCloseAfterFlush, false
 		default:
-			c.compactCipher(totalLen)
-			continue
+			return epollActionCloseAfterFlush, false
 		}
 	}
 }

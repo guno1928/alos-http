@@ -133,8 +133,8 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	if bodyLen+256 > maxInner {
 		respData, respBP := BuildH1Response(resp)
 		err := WriteAppData(conn, writer, respData)
-		*respBP = (*respBP)[:0]
-		LargeBufPool.Put(respBP)
+		*respBP = (*respBP)
+		putBoxedBufCapped(&LargeBufPool, respBP, largeBufPoolMaxCap)
 		return err
 	}
 	ibp := WriteBufPool.Get().(*[]byte)
@@ -169,8 +169,8 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 		WriteBufPool.Put(ibp)
 		respData, respBP := BuildH1Response(resp)
 		err := WriteAppData(conn, writer, respData)
-		*respBP = (*respBP)[:0]
-		LargeBufPool.Put(respBP)
+		*respBP = (*respBP)
+		putBoxedBufCapped(&LargeBufPool, respBP, largeBufPoolMaxCap)
 		return err
 	}
 	inner = append(inner, 0x17)
@@ -188,7 +188,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	err := writeFull(conn, out)
 	*ibp = (*ibp)[:0]
 	WriteBufPool.Put(ibp)
-	*obp = out[:0]
-	LargeBufPool.Put(obp)
+	*obp = out
+	putBoxedBufCapped(&LargeBufPool, obp, largeBufPoolMaxCap)
 	return err
 }

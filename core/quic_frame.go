@@ -1,6 +1,21 @@
 package core
 
 const (
+	quicErrFlowControl       = 0x03
+	quicErrProtocolViolation = 0x0a
+)
+
+var errQUICFrameNotAllowedInSpace = &staticError{"frame type not permitted in this packet space"}
+
+func quicFrameAllowedInHandshakeSpaces(frameType uint64) bool {
+	switch frameType {
+	case quicFramePadding, quicFramePing, quicFrameACK, quicFrameACKECN, quicFrameCrypto, quicFrameConnClose:
+		return true
+	}
+	return false
+}
+
+const (
 	quicFramePadding          = 0x00
 	quicFramePing             = 0x01
 	quicFrameACK              = 0x02
@@ -165,27 +180,6 @@ func quicAppendConnCloseFrame(dst []byte, errorCode, frameType uint64, reason st
 	return dst
 }
 
-func quicAppendPingFrame(dst []byte) []byte {
-	return quicAppendVarint(dst, quicFramePing)
-}
-
-func quicAppendPaddingFrame(dst []byte, count int) []byte {
-	for i := 0; i < count; i++ {
-		dst = append(dst, 0x00)
-	}
-	return dst
-}
-
-func quicAppendNewConnIDFrame(dst []byte, seq, retirePT uint64, connID []byte, resetToken [16]byte) []byte {
-	dst = quicAppendVarint(dst, quicFrameNewConnID)
-	dst = quicAppendVarint(dst, seq)
-	dst = quicAppendVarint(dst, retirePT)
-	dst = append(dst, byte(len(connID)))
-	dst = append(dst, connID...)
-	dst = append(dst, resetToken[:]...)
-	return dst
-}
-
 type quicFrameParser struct {
 	data []byte
 	off  int
@@ -234,6 +228,7 @@ type quicFrameVisitor struct {
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)
 	onNewToken      func(token []byte)
+	allowed         func(frameType uint64) bool
 }
 
 func quicParseFrames(data []byte, v *quicFrameVisitor) error {
@@ -251,6 +246,9 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 		frameType, ok := p.readVarint()
 		if !ok {
 			return ErrTruncated
+		}
+		if v.allowed != nil && !v.allowed(frameType) {
+			return errQUICFrameNotAllowedInSpace
 		}
 
 		switch {

@@ -356,70 +356,6 @@ func (s *Server) fineTuneConfig(addr string, workers int, listeners int) Config 
 	return cfg
 }
 
-func startFineTuneServer(server *Server, bindHost string, listenerCount int) (string, chan error, error) {
-	workers := server.config.WorkerCount
-	if workers < 1 {
-		workers = runtime.GOMAXPROCS(0) + runtime.GOMAXPROCS(0)/2
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	if listenerCount < 1 {
-		listenerCount = 1
-	}
-	listenerCount = clampListenerCount(listenerCount)
-	if workers > listenerCount {
-		workers = listenerCount
-	}
-	runtime.GOMAXPROCS(workers)
-	maybeRaiseProcessFileLimit()
-	server.Router.Build()
-	server.computeFastDispatch()
-
-	listeners, err := allocateFineTuneListeners(bindHost, listenerCount)
-	if err != nil {
-		return "", nil, err
-	}
-	addr := listeners[0].Addr().String()
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
-	log.Println("=== ALOS HTTP Server (Plain HTTP/1.1 + HTTP/2 prior knowledge) ===")
-	log.Printf("Listening on http://%s (%d listener(s))", addr, listenerCount)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.ListenAndServeEpollH2(addr)
-	}()
-	return addr, errCh, nil
-}
-
-func allocateFineTuneListeners(bindHost string, listenerCount int) ([]net.Listener, error) {
-	if listenerCount < 1 {
-		listenerCount = 1
-	}
-	listenerCount = clampListenerCount(listenerCount)
-	first, err := createListeners(net.JoinHostPort(bindHost, "0"), 1)
-	if err != nil {
-		return nil, err
-	}
-	if listenerCount == 1 {
-		return first, nil
-	}
-	addr := first[0].Addr().String()
-	more, err := createListeners(addr, listenerCount-1)
-	if err != nil {
-		for _, ln := range first {
-			_ = ln.Close()
-		}
-		return nil, err
-	}
-	listeners := make([]net.Listener, 0, listenerCount)
-	listeners = append(listeners, first...)
-	listeners = append(listeners, more...)
-	return listeners, nil
-}
-
 func reserveFineTuneAddr(bindHost string) (string, error) {
 	listener, err := net.Listen("tcp4", net.JoinHostPort(bindHost, "0"))
 	if err != nil {
@@ -572,11 +508,6 @@ func chooseOverallBestConfig(results []FineTuneResult) (int, int) {
 		}
 	}
 	return bestKey.workers, bestKey.listeners
-}
-
-func chooseOverallBestWorker(results []FineTuneResult) int {
-	workers, _ := chooseOverallBestConfig(results)
-	return workers
 }
 
 func formatWrkDuration(duration time.Duration) string {

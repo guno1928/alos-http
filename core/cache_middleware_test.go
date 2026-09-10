@@ -176,7 +176,10 @@ func TestCache_HitPreservesContentType(t *testing.T) {
 func TestCache_HitPreservesHeaders(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{TTL: time.Minute})
 	defer rc.Stop()
-	h := func(req *Request, resp *Response) { resp.Status(200).SetHeaderUnsafe("X-Custom", "yes"); resp.String("x") }
+	h := func(req *Request, resp *Response) {
+		resp.Status(200).SetHeaderUnsafe("X-Custom", "yes")
+		resp.String("x")
+	}
 	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
 	r2 := cResp()
 	rc.handle(h, cReq("GET", "x", "/a", ""), r2)

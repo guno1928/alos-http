@@ -249,15 +249,10 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 
 	host, path := extractHostPath(buf)
 
-	if !ValidateHost(host) {
+	path, pathOK := originFormTarget(path)
+	if !ValidateHost(host) || !pathOK {
 		_ = writeFull(conn, []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
-	}
-	for i := 0; i < len(path); i++ {
-		if path[i] == '\r' || path[i] == '\n' {
-			_ = writeFull(conn, []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-			return
-		}
 	}
 
 	if s.httpRouter != nil {
@@ -273,20 +268,21 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 			log.Printf("[HTTP] ACME challenge request from %s: %s%s", conn.RemoteAddr(), host, path)
 		}
 
-		if s.acme != nil && s.acme.acmeNode != "" {
+		ai := s.acme.Load()
+		if ai != nil && ai.acmeNode != "" {
 			if debugFlag.Load() {
-				log.Printf("[HTTP] proxying ACME challenge to node %s", s.acme.acmeNode)
+				log.Printf("[HTTP] proxying ACME challenge to node %s", ai.acmeNode)
 			}
 			route := &httpRouteEntry{
 				pathPrefix: "/.well-known/acme-challenge/",
-				addr:       normalizeRouteAddr(s.acme.acmeNode),
+				addr:       normalizeRouteAddr(ai.acmeNode),
 			}
 			s.proxyHTTPRoute(conn, buf, route, host, path)
 			return
 		}
 
-		if s.acme != nil {
-			resp, ok := s.acme.HandleHTTP01(path)
+		if ai != nil {
+			resp, ok := ai.HandleHTTP01(path)
 			if ok {
 				if debugFlag.Load() {
 					log.Printf("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
@@ -358,8 +354,8 @@ func (s *Server) proxyHTTPRoute(clientConn net.Conn, rawReq []byte, route *httpR
 			break
 		}
 	}
-	*rbp = readBuf[:0]
-	LargeBufPool.Put(rbp)
+	*rbp = readBuf
+	putBoxedBufCapped(&LargeBufPool, rbp, largeBufPoolMaxCap)
 }
 
 func rewriteHostHeader(raw []byte, newHost string) []byte {
@@ -439,6 +435,24 @@ func containsHeaderEnd(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func originFormTarget(target string) (string, bool) {
+	if containsCRLF(target) {
+		return "", false
+	}
+	if hasPrefix(target, "http://") || hasPrefix(target, "https://") {
+		authority := target[indexByte(target, ':')+3:]
+		if slash := indexByte(authority, '/'); slash >= 0 {
+			target = authority[slash:]
+		} else {
+			target = "/"
+		}
+	}
+	if len(target) == 0 || target[0] != '/' {
+		return "", false
+	}
+	return target, true
 }
 
 func extractHostPath(data []byte) (string, string) {

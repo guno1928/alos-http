@@ -18,7 +18,6 @@ var (
 	fpErrBadAuthority   = errors.New("outbound: bad authority")
 	fpErrDNSFailed      = errors.New("outbound: dns lookup failed")
 	fpErrTooManyConns   = errors.New("outbound: backend connection limit reached")
-	fpErrBlocked        = errors.New("outbound: request blocked by interceptor")
 )
 
 type fpRequest struct {
@@ -71,11 +70,12 @@ type Exchange struct {
 	err      error
 	done     chan struct{}
 	deadline int64
-	ip [4]byte
+	ip       [4]byte
 	// rawRequest is a fully serialised request line, headers and body. When it
 	// is set the H1 protocol writes it verbatim instead of building one from
 	// req, which lets the caller own header filtering and sanitisation.
 	rawRequest []byte
+	bc         *backendConn
 	// Per-domain limits carried with the exchange, so the connection it lands
 	// on adopts the settings of the domain that asked for it.
 	connectTimeoutNano int64
@@ -84,10 +84,10 @@ type Exchange struct {
 	maxIdle            int
 	port               uint16
 	key                poolKey
-	sink     *UpstreamStream
-	pnext    *Exchange
-	retried  bool
-	finished bool
+	sink               *UpstreamStream
+	pnext              *Exchange
+	retried            bool
+	finished           bool
 }
 
 type fpConfig struct {

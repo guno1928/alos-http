@@ -151,8 +151,8 @@ func (pe *ProxyEngine) forwardRequestStdnet(req *Request, resp *Response, b *bac
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := buildProxyRequest((*bp)[:0], req, b.Addr, cfg)
 	err = writeFull(pc.conn, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	if err != nil {
 		b.pool.discard(pc)
 		return err
@@ -213,6 +213,10 @@ func (pe *ProxyEngine) forwardRequestStdnet(req *Request, resp *Response, b *bac
 
 		if isChunked {
 			body, bufOK = readChunkedBody(pc.br, cacheMax)
+			if !bufOK {
+				b.pool.discard(pc)
+				return ErrProxyBadResponse
+			}
 		} else if contentLength <= cacheMax {
 			body = make([]byte, contentLength)
 			_, err := io.ReadFull(pc.br, body)
@@ -317,8 +321,8 @@ func (pe *ProxyEngine) forwardRequestStdnet(req *Request, resp *Response, b *bac
 		err = streamUntilClose(pc.br, sw, readBuf)
 	}
 
-	*rbp = readBuf[:0]
-	LargeBufPool.Put(rbp)
+	*rbp = readBuf
+	putBoxedBufCapped(&LargeBufPool, rbp, largeBufPoolMaxCap)
 
 	sw.Close()
 	resp.SetStreamer(sw)
@@ -369,7 +373,9 @@ func streamChunked(br io.Reader, sw StreamWriter, buf []byte) error {
 			return ErrProxyBadResponse
 		}
 		if size == 0 {
-			readLine(br, buf[:0])
+			if !skipChunkedTrailers(br) {
+				return ErrProxyBadResponse
+			}
 			return nil
 		}
 		remaining := size
@@ -467,8 +473,7 @@ func readChunkedBody(br io.Reader, maxSize int64) ([]byte, bool) {
 			return nil, false
 		}
 		if size == 0 {
-			readLine(br, lineBuf[:0])
-			return body, true
+			return body, skipChunkedTrailers(br)
 		}
 		if size < 0 || size > int64(maxParsedLength) {
 			return nil, false
@@ -493,6 +498,22 @@ func readChunkedBody(br io.Reader, maxSize int64) ([]byte, bool) {
 		}
 		readLine(br, lineBuf[:0])
 	}
+}
+
+const maxChunkedTrailerLines = 64
+
+func skipChunkedTrailers(br io.Reader) bool {
+	var lineBuf [64]byte
+	for i := 0; i < maxChunkedTrailerLines; i++ {
+		line, err := readLine(br, lineBuf[:0])
+		if err != nil {
+			return false
+		}
+		if len(trimASCIISpaceBytes(line)) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func buildProxyRequest(buf []byte, req *Request, backendAddr string, cfg *DomainConfig) []byte {
@@ -679,12 +700,12 @@ func parseHTTPResponse(br *bufio.Reader) (int, string, int64, bool, bool, [][2]s
 			}
 			continue
 		case EqualFoldASCII(name, "transfer-encoding"):
-			if EqualFoldASCII(val, "chunked") {
+			if containsTokenFold(val, "chunked") {
 				isChunked = true
 			}
 			continue
 		case EqualFoldASCII(name, "connection"):
-			if EqualFoldASCII(val, "close") {
+			if containsTokenFold(val, "close") {
 				keepAlive = false
 			}
 			continue
@@ -746,8 +767,8 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := buildProxyRequest((*bp)[:0], req, b.Addr, cfg)
 	err = writeFull(backendConn, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	if err != nil {
 		backendConn.Close()
 		return err
@@ -809,8 +830,8 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 	copyBuf := func(dst, src net.Conn) {
 		buf := LargeBufPool.Get().(*[]byte)
 		io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
-		*buf = (*buf)[:0]
-		LargeBufPool.Put(buf)
+		*buf = (*buf)
+		putBoxedBufCapped(&LargeBufPool, buf, largeBufPoolMaxCap)
 		done <- struct{}{}
 	}
 	go copyBuf(backendConn, clientConn)
@@ -822,26 +843,6 @@ func (pe *ProxyEngine) forwardWebSocket(req *Request, resp *Response, b *backend
 	<-done
 
 	return nil
-}
-
-func isHopByHopFold(name string) bool {
-	switch len(name) {
-	case 2:
-		return EqualFoldASCII(name, "te")
-	case 7:
-		return EqualFoldASCII(name, "trailer") || EqualFoldASCII(name, "upgrade")
-	case 10:
-		return EqualFoldASCII(name, "connection") || EqualFoldASCII(name, "keep-alive")
-	case 16:
-		return EqualFoldASCII(name, "proxy-connection")
-	case 17:
-		return EqualFoldASCII(name, "transfer-encoding")
-	case 18:
-		return EqualFoldASCII(name, "proxy-authenticate")
-	case 19:
-		return EqualFoldASCII(name, "proxy-authorization")
-	}
-	return false
 }
 
 func extractIP(addr string) string {

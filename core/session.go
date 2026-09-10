@@ -20,7 +20,8 @@ import (
 //	Example: MaxAge: 3600 expires the session after one hour.
 //	Example: MaxAge: 0 uses the default 86400.
 //
-// Secure emits the cookie with the Secure attribute, restricting it to HTTPS.
+// Secure emits the cookie with the Secure attribute, restricting it to HTTPS;
+// sessions created on a TLS request are always emitted with Secure.
 //
 //	Example: Secure: true sends the cookie only over HTTPS.
 //
@@ -271,7 +272,7 @@ func Sessions(cfg SessionConfig) MiddlewareFunc {
 					Value:    sess.id,
 					Path:     path,
 					MaxAge:   maxAge,
-					Secure:   secure,
+					Secure:   secure || req.IsTLS,
 					HttpOnly: httpOnly,
 					SameSite: sameSite,
 				})

@@ -122,6 +122,7 @@ func (l *beLoop) assign(c *backendConn, ex *Exchange) {
 		return
 	}
 	c.cur = ex
+	ex.bc = c
 	if c.state == connReady {
 		if err := l.h1proto.attach(c); err != nil {
 			l.closeConn(c, err)
@@ -158,22 +159,26 @@ func (l *beLoop) onTransportReady(c *backendConn) {
 // guarded against re-entering itself: doing so would run the response parser
 // recursively and complete an exchange the outer frame still holds.
 func (l *beLoop) readable(c *backendConn) {
+	l.readableUntil(c, false)
+}
+
+func (l *beLoop) readableUntil(c *backendConn, peerHungUp bool) {
 	if c.reading {
 		return
 	}
 	c.reading = true
-	l.readLoop(c)
+	l.readLoop(c, peerHungUp)
 	c.reading = false
 }
 
-func (l *beLoop) readLoop(c *backendConn) {
+func (l *beLoop) readLoop(c *backendConn, peerHungUp bool) {
 	for c.state != connClosed {
 		// A pause applied while relaying takes effect immediately, so a fast
 		// backend cannot outrun a slow client within a single wake-up.
 		if c.readPaused {
 			return
 		}
-		n, err := unix.Read(c.fd, l.scratch)
+		n, err := socketRecv(c.fd, l.scratch)
 		if n > 0 {
 			c.gotBytes = true
 			if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
@@ -181,7 +186,7 @@ func (l *beLoop) readLoop(c *backendConn) {
 			}
 			if c.tunnelClient != nil {
 				l.sink.tunnelToClient(c, l.scratch[:n])
-				if n < len(l.scratch) {
+				if n < len(l.scratch) && !peerHungUp {
 					return
 				}
 				continue
@@ -190,7 +195,7 @@ func (l *beLoop) readLoop(c *backendConn) {
 				l.closeConn(c, ferr)
 				return
 			}
-			if n < len(l.scratch) {
+			if n < len(l.scratch) && !peerHungUp {
 				return
 			}
 			continue
@@ -258,7 +263,7 @@ func (l *beLoop) flushWrites(c *backendConn) {
 		if len(p) == 0 {
 			return
 		}
-		n, err := unix.Write(c.fd, p)
+		n, err := socketSend(c.fd, p)
 		if n > 0 {
 			c.wbuf.consume(n)
 			continue

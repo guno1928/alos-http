@@ -52,7 +52,8 @@ type proxyExchange struct {
 
 	// mayCache means a store is possible for this request, so a response that
 	// fits the cache is buffered rather than relayed.
-	mayCache bool
+	mayCache   bool
+	reqCacheOK bool
 
 	keepClient    bool
 	headersOut    bool
@@ -154,13 +155,16 @@ func proxyDeclaredLength(method string, headers respHeaders, body []byte) int64 
 func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn, reqClose bool) int {
 	req := &c.req
 	host := stripPort(req.Host)
+	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
+	reqCacheOK := false
 
-	if pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") {
+	if pe.Cache != nil && cacheableMethod {
+		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath := req.Path
 		if req.Query != "" {
 			cachePath = req.Path + "?" + req.Query
 		}
-		if entry, hit := pe.Cache.Get(req.Method, host, cachePath, req); hit {
+		if entry, hit := pe.Cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
 			pe.Cache.ServeCached(entry, req, &c.resp)
 			if pe.OnResponse != nil {
 				pr := &ProxyResponse{
@@ -194,7 +198,8 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
 	px.keepClient = !reqClose
-	px.mayCache = pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD")
+	px.mayCache = pe.Cache != nil && cacheableMethod
+	px.reqCacheOK = reqCacheOK
 	for len(px.tried) < len(ds.backends) {
 		px.tried = append(px.tried, false)
 	}
@@ -339,6 +344,10 @@ func (w *epollWorker) proxyMaybeCache(px *proxyExchange, status int, headers res
 	if px.c == nil {
 		return
 	}
+	manual := hooked != nil && hooked.cacheRequested
+	if !manual && !px.reqCacheOK {
+		return
+	}
 	cachePath := px.path
 	if q := px.c.req.Query; q != "" {
 		cachePath = px.path + "?" + q
@@ -348,9 +357,12 @@ func (w *epollWorker) proxyMaybeCache(px *proxyExchange, status int, headers res
 	// needs the headers as strings. putEntry copies the slice it is given.
 	stored := w.headerStrings(headers)
 	ctype := proxyContentType(stored)
-	if hooked != nil && hooked.cacheRequested {
+	if manual {
 		px.pe.Cache.PutManual(px.method, host, cachePath, status, stored, ctype, body,
 			hooked.cacheTTL, hooked.cacheMaxHits, hooked.cacheCompress, hooked.cacheCompressMin)
+		return
+	}
+	if !proxyCacheResponseAllowed(stored) {
 		return
 	}
 	px.pe.Cache.Put(px.method, host, cachePath, status, stored, ctype, body)
@@ -478,7 +490,8 @@ func (w *epollWorker) proxyFinishClient(px *proxyExchange, status int, headers r
 }
 
 // proxyResume flushes the finished response and picks up any pipelined request
-// that already arrived on the same connection.
+// that already arrived on the same connection, or a read edge that was seen
+// while the exchange was in flight.
 func (w *epollWorker) proxyResume(c *epollConn) {
 	if !w.flush(c) {
 		return
@@ -486,23 +499,12 @@ func (w *epollWorker) proxyResume(c *epollConn) {
 	if c.fd < 0 || c.closeAfter {
 		return
 	}
-	// A TLS connection buffers decrypted requests in appBuf; a plaintext one
-	// keeps them in readBuf.
-	var action int
-	if c.tls {
-		if c.appBufOff >= len(c.appBuf) {
-			return
-		}
-		action = c.epollProcessTLS(w.server)
-	} else {
-		if c.readN <= c.h1Off {
-			return
-		}
-		action = c.epollProcess(w.server)
+	if c.readPending {
+		w.readable(c, false)
+		return
 	}
-	if action == epollActionCloseAfterFlush {
-		c.closeAfter = true
-		w.flush(c)
+	if c.readN > c.h1Off || c.tlsAppPending() {
+		w.serviceBuffered(c, false, false)
 	}
 }
 

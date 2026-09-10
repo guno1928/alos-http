@@ -22,36 +22,6 @@ func dialNonBlocking(ip [4]byte, port uint16) (int, error) {
 	return fd, nil
 }
 
-func ipv4String(a [4]byte) string {
-	var buf [15]byte
-	n := 0
-	for i := 0; i < 4; i++ {
-		if i > 0 {
-			buf[n] = '.'
-			n++
-		}
-		v := a[i]
-		if v >= 100 {
-			buf[n] = '0' + v/100
-			n++
-			v %= 100
-			buf[n] = '0' + v/10
-			n++
-			buf[n] = '0' + v%10
-			n++
-		} else if v >= 10 {
-			buf[n] = '0' + v/10
-			n++
-			buf[n] = '0' + v%10
-			n++
-		} else {
-			buf[n] = '0' + v
-			n++
-		}
-	}
-	return string(buf[:n])
-}
-
 func socketError(fd int) error {
 	v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
 	if err != nil {

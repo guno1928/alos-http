@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -163,10 +164,18 @@ type tls12AEAD struct {
 	iv       []byte
 	seq      uint64
 	isChaCha bool
+	nonceBuf [tls12NonceLen]byte
+	aadBuf   [tls12AADLen]byte
 }
 
-func (c *tls12AEAD) aad(seq uint64, typ byte, ptLen int) []byte {
-	var b [13]byte
+const (
+	tls12RecordHeaderLen  = 5
+	tls12ExplicitNonceLen = 8
+	tls12NonceLen         = 12
+	tls12AADLen           = 13
+)
+
+func (c *tls12AEAD) putAAD(b *[tls12AADLen]byte, seq uint64, typ byte, ptLen int) []byte {
 	binary.BigEndian.PutUint64(b[0:8], seq)
 	b[8] = typ
 	b[9] = 0x03
@@ -175,42 +184,52 @@ func (c *tls12AEAD) aad(seq uint64, typ byte, ptLen int) []byte {
 	return b[:]
 }
 
-func (c *tls12AEAD) nonce(seq uint64) []byte {
-	n := make([]byte, 12)
+func (c *tls12AEAD) putNonce(n *[tls12NonceLen]byte, seq uint64) []byte {
 	if c.isChaCha {
-		copy(n, c.iv)
+		copy(n[:], c.iv)
 		var s [8]byte
 		binary.BigEndian.PutUint64(s[:], seq)
 		for i := 0; i < 8; i++ {
 			n[4+i] ^= s[i]
 		}
-		return n
+		return n[:]
 	}
 	copy(n[0:4], c.iv)
 	binary.BigEndian.PutUint64(n[4:12], seq)
-	return n
+	return n[:]
 }
 
 func (c *tls12AEAD) seal(typ byte, plaintext []byte) []byte {
+	return c.sealTo(nil, typ, plaintext)
+}
+
+func (c *tls12AEAD) sealTo(dst []byte, typ byte, plaintext []byte) []byte {
 	seq := c.seq
 	c.seq++
-	nonce := c.nonce(seq)
-	aad := c.aad(seq, typ, len(plaintext))
+	nonce := c.putNonce(&c.nonceBuf, seq)
+	aad := c.putAAD(&c.aadBuf, seq, typ, len(plaintext))
 
-	var fragment []byte
-	if c.isChaCha {
-		fragment = c.aead.Seal(nil, nonce, plaintext, aad)
-	} else {
-		fragment = make([]byte, 8, 8+len(plaintext)+c.aead.Overhead())
-		binary.BigEndian.PutUint64(fragment[0:8], seq)
-		fragment = c.aead.Seal(fragment, nonce, plaintext, aad)
+	fragLen := len(plaintext) + c.aead.Overhead()
+	if !c.isChaCha {
+		fragLen += tls12ExplicitNonceLen
 	}
-	rec := make([]byte, 5, 5+len(fragment))
-	rec[0] = typ
-	rec[1] = 0x03
-	rec[2] = 0x03
-	binary.BigEndian.PutUint16(rec[3:5], uint16(len(fragment)))
-	return append(rec, fragment...)
+	dst = growSlice(dst, tls12RecordHeaderLen+fragLen)
+	dst = append(dst, typ, 0x03, 0x03, byte(fragLen>>8), byte(fragLen))
+	if !c.isChaCha {
+		var explicit [tls12ExplicitNonceLen]byte
+		binary.BigEndian.PutUint64(explicit[:], seq)
+		dst = append(dst, explicit[:]...)
+	}
+	return c.aead.Seal(dst, nonce, plaintext, aad)
+}
+
+func growSlice(b []byte, n int) []byte {
+	if cap(b)-len(b) >= n {
+		return b
+	}
+	grown := make([]byte, len(b), 2*cap(b)+n)
+	copy(grown, b)
+	return grown
 }
 
 func (c *tls12AEAD) open(record []byte) (byte, []byte, bool) {
@@ -227,24 +246,23 @@ func (c *tls12AEAD) open(record []byte) (byte, []byte, bool) {
 
 	var nonce, ct []byte
 	if c.isChaCha {
-		nonce = c.nonce(seq)
+		nonce = c.putNonce(&c.nonceBuf, seq)
 		ct = fragment
 	} else {
-		if len(fragment) < 8 {
+		if len(fragment) < tls12ExplicitNonceLen {
 			return 0, nil, false
 		}
-		n := make([]byte, 12)
-		copy(n[0:4], c.iv)
-		copy(n[4:12], fragment[0:8])
-		nonce = n
-		ct = fragment[8:]
+		copy(c.nonceBuf[0:4], c.iv)
+		copy(c.nonceBuf[4:12], fragment[0:tls12ExplicitNonceLen])
+		nonce = c.nonceBuf[:]
+		ct = fragment[tls12ExplicitNonceLen:]
 	}
 	ptLen := len(ct) - c.aead.Overhead()
 	if ptLen < 0 {
 		return 0, nil, false
 	}
-	aad := c.aad(seq, typ, ptLen)
-	pt, err := c.aead.Open(nil, nonce, ct, aad)
+	aad := c.putAAD(&c.aadBuf, seq, typ, ptLen)
+	pt, err := c.aead.Open(ct[:0], nonce, ct, aad)
 	if err != nil {
 		return 0, nil, false
 	}
@@ -315,7 +333,7 @@ type tls12State struct {
 
 func tls12KeyTypeOf(signer crypto.Signer) (tls12KeyType, bool) {
 	switch signer.(type) {
-	case *ecdsa.PrivateKey:
+	case *ecdsa.PrivateKey, ed25519.PrivateKey:
 		return keyTypeECDSA, true
 	case *rsa.PrivateKey:
 		return keyTypeRSA, true
@@ -372,7 +390,7 @@ func buildTLS12AppDataRecords(dst []byte, w *tls12AEAD, payload []byte) []byte {
 			chunk = chunk[:MaxRecordPayload]
 		}
 		payload = payload[len(chunk):]
-		dst = append(dst, w.seal(0x17, chunk)...)
+		dst = w.sealTo(dst, 0x17, chunk)
 	}
 	return dst
 }
@@ -393,24 +411,44 @@ func parseTLS12ClientKeyExchange(msg []byte) ([]byte, bool) {
 }
 
 const (
-	sigSchemeECDSAP256SHA256 uint16 = 0x0403
-	sigSchemeRSAPSSSHA256    uint16 = 0x0804
+	sigSchemeECDSASHA256    uint16 = 0x0403
+	sigSchemeRSAPSSSHA256   uint16 = 0x0804
+	sigSchemeRSAPKCS1SHA256 uint16 = 0x0401
+	sigSchemeEd25519        uint16 = 0x0807
 )
 
-func tls12Sign(signer crypto.Signer, msg []byte) (uint16, []byte, error) {
+// tls12Sign signs a ServerKeyExchange. In TLS 1.2 the ECDSA scheme names only
+// the hash, so SHA-256 applies to every curve; RSA prefers PSS and falls back to
+// PKCS#1 v1.5 for clients that do not offer PSS.
+func tls12Sign(signer crypto.Signer, msg []byte, offered []uint16) (uint16, []byte, error) {
 	d := sha256.Sum256(msg)
 	switch k := signer.(type) {
 	case *ecdsa.PrivateKey:
+		if !schemeOffered(offered, sigSchemeECDSASHA256) {
+			return 0, nil, errNoCommonSignatureScheme
+		}
 		sig, err := ecdsa.SignASN1(rand.Reader, k, d[:])
-		return sigSchemeECDSAP256SHA256, sig, err
+		return sigSchemeECDSASHA256, sig, err
+	case ed25519.PrivateKey:
+		if !schemeOffered(offered, sigSchemeEd25519) {
+			return 0, nil, errNoCommonSignatureScheme
+		}
+		return sigSchemeEd25519, ed25519.Sign(k, msg), nil
 	case *rsa.PrivateKey:
-		sig, err := rsa.SignPSS(rand.Reader, k, crypto.SHA256, d[:], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256})
-		return sigSchemeRSAPSSSHA256, sig, err
+		if schemeOffered(offered, sigSchemeRSAPSSSHA256) {
+			sig, err := rsa.SignPSS(rand.Reader, k, crypto.SHA256, d[:], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256})
+			return sigSchemeRSAPSSSHA256, sig, err
+		}
+		if schemeOffered(offered, sigSchemeRSAPKCS1SHA256) {
+			sig, err := rsa.SignPKCS1v15(rand.Reader, k, crypto.SHA256, d[:])
+			return sigSchemeRSAPKCS1SHA256, sig, err
+		}
+		return 0, nil, errNoCommonSignatureScheme
 	}
-	return 0, nil, errors.New("unsupported signer for ServerKeyExchange")
+	return 0, nil, errUnsupportedSignatureKey
 }
 
-func buildTLS12ServerKeyExchange(signer crypto.Signer, clientRandom, serverRandom []byte, curve tls12Curve, pub []byte) ([]byte, error) {
+func buildTLS12ServerKeyExchange(signer crypto.Signer, clientRandom, serverRandom []byte, curve tls12Curve, pub []byte, offered []uint16) ([]byte, error) {
 	params := make([]byte, 0, 4+len(pub))
 	params = append(params, 0x03)
 	params = append(params, byte(uint16(curve)>>8), byte(uint16(curve)))
@@ -422,7 +460,7 @@ func buildTLS12ServerKeyExchange(signer crypto.Signer, clientRandom, serverRando
 	signed = append(signed, serverRandom...)
 	signed = append(signed, params...)
 
-	scheme, sig, err := tls12Sign(signer, signed)
+	scheme, sig, err := tls12Sign(signer, signed, offered)
 	if err != nil {
 		return nil, err
 	}

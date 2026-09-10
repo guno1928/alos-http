@@ -17,13 +17,13 @@ const (
 
 type eventLoop struct {
 	beLoop
-	wakeFd      int
-	q           mpscQueue
-	sleeping    atomic.Int32
-	quit        atomic.Int32
-	exFree      *Exchange
-	events      []unix.EpollEvent
-	wakeBuf     [8]byte
+	wakeFd   int
+	q        mpscQueue
+	sleeping atomic.Int32
+	quit     atomic.Int32
+	exFree   *Exchange
+	events   []unix.EpollEvent
+	wakeBuf  [8]byte
 }
 
 func newEventLoop(cfg *fpConfig) (*eventLoop, error) {
@@ -143,7 +143,7 @@ func (l *eventLoop) run() {
 				}
 			}
 			if evs&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP) != 0 {
-				l.readable(c)
+				l.readableUntil(c, evs&(unix.EPOLLRDHUP|unix.EPOLLHUP) != 0)
 				if c.state == connClosed {
 					continue
 				}

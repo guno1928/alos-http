@@ -2,6 +2,8 @@ package core
 
 import (
 	"bytes"
+	"strings"
+	"sync/atomic"
 
 	"github.com/zeebo/xxh3"
 )
@@ -145,6 +147,11 @@ func hpackHuffmanAppend(dst []byte, s string) []byte {
 // EncodeString appends s to the buffer as an HPACK string literal, using
 // Huffman encoding when it produces a shorter representation than raw bytes.
 func (e *HpackEncoder) EncodeString(s string) {
+	if len(s) < hpackHuffmanMinValueLen {
+		e.EncodeInt(0x00, 7, uint64(len(s)))
+		e.Buf = append(e.Buf, s...)
+		return
+	}
 	huffLen := hpackHuffmanEncodedLen(s)
 	if huffLen < len(s) {
 		e.EncodeInt(0x80, 7, uint64(huffLen))
@@ -178,13 +185,60 @@ func (e *HpackEncoder) EncodeHeader(name, value string) {
 func (e *HpackEncoder) EncodeHeaderFold(name, value string) {
 	idx := hpackFindStaticNameFold(name)
 	if idx > 0 {
-		e.EncodeInt(0x00, 4, uint64(idx))
-		e.EncodeString(value)
+		e.encodeStaticFieldCached(idx, value)
 	} else {
 		e.Buf = append(e.Buf, 0x00)
 		e.encodeStringLower(name)
 		e.EncodeString(value)
 	}
+}
+
+const (
+	hpackStaticContentLength = 28
+	hpackStaticContentType   = 31
+	hpackStaticServer        = 54
+)
+
+const (
+	hpackFieldCacheSlots    = 64
+	hpackFieldCacheMaxValue = 96
+	hpackHuffmanMinValueLen = 12
+)
+
+type hpackCachedField struct {
+	idx   int
+	value string
+	enc   []byte
+}
+
+var hpackFieldCache [hpackFieldCacheSlots]atomic.Pointer[hpackCachedField]
+
+func hpackFieldCacheSlot(idx int, value string) uint32 {
+	h := uint32(idx) * 0x9E3779B1
+	h ^= uint32(len(value)) * 0x85EBCA6B
+	if len(value) > 0 {
+		h ^= uint32(value[0])<<8 ^ uint32(value[len(value)-1])<<16 ^ uint32(value[len(value)/2])<<24
+	}
+	return (h ^ h>>16) % hpackFieldCacheSlots
+}
+
+func (e *HpackEncoder) encodeStaticFieldCached(idx int, value string) {
+	if len(value) > hpackFieldCacheMaxValue {
+		e.EncodeInt(0x00, 4, uint64(idx))
+		e.EncodeString(value)
+		return
+	}
+	slot := &hpackFieldCache[hpackFieldCacheSlot(idx, value)]
+	if ent := slot.Load(); ent != nil && ent.idx == idx && ent.value == value {
+		e.Buf = append(e.Buf, ent.enc...)
+		return
+	}
+	start := len(e.Buf)
+	e.EncodeInt(0x00, 4, uint64(idx))
+	e.EncodeString(value)
+	enc := make([]byte, len(e.Buf)-start)
+	copy(enc, e.Buf[start:])
+	slot.Store(&hpackCachedField{idx: idx, value: strings.Clone(value), enc: enc})
 }
 
 func hpackFindStaticNameFold(name string) int {
@@ -488,13 +542,6 @@ type hpackDynEntry struct {
 	size  int
 }
 
-type hpackDecoderSnapshot struct {
-	maxTableSize    int
-	protocolMaxSize int
-	dynSize         int
-	entries         []hpackDynEntry
-}
-
 const (
 	hpackHuffmanDecodeCacheSize = 16
 	hpackHuffmanDecodeInlineMax = 64
@@ -569,6 +616,7 @@ type HpackDecoder struct {
 	huffmanCacheNext uint8
 	tableGen         uint64
 	memoBlock        []byte
+	memoHeaders      [][2]string
 	memoMeta         hpackRequestMeta
 	memoValid        bool
 	memoRoot         bool
@@ -583,40 +631,6 @@ func NewHpackDecoder() *HpackDecoder {
 func newHpackDecoder(tableSize uint32) *HpackDecoder {
 	limit := int(tableSize)
 	return &HpackDecoder{maxTableSize: limit, protocolMaxSize: limit}
-}
-
-func (d *HpackDecoder) snapshot() hpackDecoderSnapshot {
-	snap := hpackDecoderSnapshot{
-		maxTableSize:    d.maxTableSize,
-		protocolMaxSize: d.protocolMaxSize,
-		dynSize:         d.dynSize,
-	}
-	if d.dynLen > 0 {
-		snap.entries = make([]hpackDynEntry, d.dynLen)
-		for i := 0; i < d.dynLen; i++ {
-			snap.entries[i] = *d.dynGet(i)
-		}
-	}
-	return snap
-}
-
-func (d *HpackDecoder) restore(snap hpackDecoderSnapshot) {
-	cache := d.huffmanCache
-	cacheNext := d.huffmanCacheNext
-	*d = HpackDecoder{
-		maxTableSize:    snap.maxTableSize,
-		protocolMaxSize: snap.protocolMaxSize,
-		dynSize:         snap.dynSize,
-		dynLen:          len(snap.entries),
-	}
-	d.huffmanCache = cache
-	d.huffmanCacheNext = cacheNext
-	if len(snap.entries) > len(d.dynInline) {
-		d.dynRing = make([]hpackDynEntry, len(snap.entries))
-	}
-	for i := range snap.entries {
-		*d.dynGet(i) = snap.entries[i]
-	}
 }
 
 func (d *HpackDecoder) decodeString(data []byte) (string, int) {
@@ -1283,46 +1297,39 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 	return meta, nil
 }
 
-// DecodeFastRootRequest decodes the HPACK header block in data and reports
-// whether it represents a GET request for the root path. It reuses the
-// memoized result of the previous call when data is byte-identical to it,
-// and otherwise restores the decoder's dynamic table to its prior state
-// whenever the block does not target the root path.
-func (d *HpackDecoder) DecodeFastRootRequest(data []byte) (hpackRequestMeta, bool, error) {
-	if d.memoValid && bytes.Equal(data, d.memoBlock) {
-		return d.memoMeta, d.memoRoot, nil
-	}
-	if len(data) >= 4 && data[0] == 0x82 && data[1] == 0x04 && data[len(data)-1] == 0x87 {
-		gen := d.tableGen
-		meta, err := d.DecodeRequestMeta(data)
-		if err == nil {
-			isRoot := meta.method == "GET" && meta.path == "/"
-			if d.tableGen == gen {
-				d.storeMemo(data, meta, isRoot)
-			}
-			return meta, isRoot, nil
-		}
-		return meta, false, err
-	}
-	snap := d.snapshot()
-	gen := d.tableGen
-	meta, err := d.DecodeRequestMeta(data)
-	if err != nil {
-		d.restore(snap)
-		return meta, false, err
-	}
-	if meta.method == "GET" && meta.path == "/" {
-		if d.tableGen == gen {
-			d.storeMemo(data, meta, true)
-		}
-		return meta, true, nil
-	}
-	d.restore(snap)
-	return meta, false, nil
+// MemoizedRootRequest reports whether data is byte-identical to the last
+// header block that decoded to a GET for the root path without touching the
+// dynamic table, so it can be answered without decoding again.
+func (d *HpackDecoder) MemoizedRootRequest(data []byte) bool {
+	return d.memoValid && d.memoRoot && bytes.Equal(data, d.memoBlock)
 }
 
-func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot bool) {
+// DecodeRequest decodes one header block in a single pass, returning the
+// headers, the request metadata, and whether the block was a GET for the root
+// path. A root block that left the dynamic table untouched is memoized so the
+// next identical block skips decoding.
+const hpackMemoMaxBlock = 512
+
+func (d *HpackDecoder) DecodeRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, bool, error) {
+	if d.memoValid && bytes.Equal(data, d.memoBlock) {
+		headers = append(headers[:0], d.memoHeaders...)
+		return headers, d.memoMeta, d.memoRoot, nil
+	}
+	gen := d.tableGen
+	headers, meta, err := d.DecodeIntoRequest(headers, data)
+	if err != nil {
+		return headers, meta, false, err
+	}
+	isRoot := meta.method == "GET" && meta.path == "/"
+	if d.tableGen == gen && len(data) <= hpackMemoMaxBlock {
+		d.storeMemo(data, meta, isRoot, headers)
+	}
+	return headers, meta, isRoot, nil
+}
+
+func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot bool, headers [][2]string) {
 	d.memoBlock = append(d.memoBlock[:0], block...)
+	d.memoHeaders = append(d.memoHeaders[:0], headers...)
 	d.memoMeta = meta
 	d.memoRoot = isRoot
 	d.memoValid = true

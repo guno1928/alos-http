@@ -390,8 +390,8 @@ func TestDeepHookCanBlockRequest(t *testing.T) {
 
 func TestDeepHookCanRewritePathAndHeaders(t *testing.T) {
 	type got struct {
-		uri  string
-		hdr  string
+		uri string
+		hdr string
 	}
 	seen := make(chan got, 1)
 	o := newInloopOrigin(t, func(req *http.Request, conn net.Conn, br *bufio.Reader) {

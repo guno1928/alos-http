@@ -242,7 +242,7 @@ func (ts *quicTLSState) handleClientHello(qc *QUICConn, data []byte) {
 	if debugFlag.Load() {
 		log.Printf("[H3-TLS] transcript after EE+Cert: %x", cvHash)
 	}
-	cvScheme, sig, sigErr := SignCertificateVerify(entry.PrivKey, cvHash)
+	cvScheme, sig, sigErr := SignCertificateVerify(entry.PrivKey, cvHash, ch.SignatureSchemes)
 	if sigErr != nil {
 		if debugFlag.Load() {
 			log.Printf("[QUIC-TLS] sign CertificateVerify: %v", sigErr)

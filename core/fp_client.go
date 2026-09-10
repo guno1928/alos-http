@@ -11,11 +11,10 @@ import (
 )
 
 type fpClient struct {
-	cfg        fpConfig
-	loops      []*eventLoop
-	listenIP   [4]byte
-	listenPort uint16
-	closed     atomic.Bool
+	cfg   fpConfig
+	loops []*eventLoop
+
+	closed atomic.Bool
 }
 
 func fpNew(cfg fpConfig) (*fpClient, error) {

@@ -27,9 +27,9 @@ const (
 	h2SettingsInitialWindowSize = 0x4
 	h2SettingsMaxFrameSize      = 0x5
 
-	h2DefaultWindow    = 65535
-	h2MaxFrameSize     = 16384
-	h2ConnWindowBump   = 1 << 30
+	h2DefaultWindow     = 65535
+	h2MaxFrameSize      = 16384
+	h2ConnWindowBump    = 1 << 30
 	h2DefaultConcurrent = 100
 )
 
@@ -48,21 +48,21 @@ type h2Stream struct {
 }
 
 type h2Conn struct {
-	enc            hpackEncoder
-	dec            hpackDecoder
-	streams        map[uint32]*h2Stream
-	pending        []*Exchange
-	nextID         uint32
-	maxConcurrent  uint32
-	peerInitWindow int32
-	connSendWindow int32
-	connRecvWindow int32
-	maxFrameSize   int
-	goAway         bool
-	headerAssembly []byte
-	continuation   uint32
+	enc             hpackEncoder
+	dec             hpackDecoder
+	streams         map[uint32]*h2Stream
+	pending         []*Exchange
+	nextID          uint32
+	maxConcurrent   uint32
+	peerInitWindow  int32
+	connSendWindow  int32
+	connRecvWindow  int32
+	maxFrameSize    int
+	goAway          bool
+	headerAssembly  []byte
+	continuation    uint32
 	continuationEnd bool
-	prefaceSent    bool
+	prefaceSent     bool
 }
 
 type h2Proto struct{}
@@ -324,7 +324,10 @@ func (h *h2Proto) onHeaders(c *backendConn, flags byte, streamID uint32, payload
 	return h.completeHeaders(c, streamID, flags&h2FlagEndStream != 0)
 }
 
-const fpMaxHeaderAssembly = 256 << 10
+const (
+	fpMaxHeaderAssembly = 256 << 10
+	h2FrameHeaderSize   = 9
+)
 
 func (h *h2Proto) onContinuation(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
@@ -368,6 +371,7 @@ func (h *h2Proto) completeHeaders(c *backendConn, streamID uint32, endStream boo
 
 func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
+	consumed := len(payload)
 	if flags&h2FlagPadded != 0 {
 		if len(payload) < 1 {
 			return fpErrBadResponse
@@ -380,16 +384,17 @@ func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, paylo
 		payload = payload[:len(payload)-pad]
 	}
 	st := hc.streams[streamID]
-	if len(payload) > 0 {
-		if st != nil {
-			if len(st.body)+len(payload) > c.be.cfg.MaxResponseBody {
-				return fpErrBodyTooLarge
-			}
-			st.body = append(st.body, payload...)
+	if st != nil && len(payload) > 0 {
+		if len(st.body)+len(payload) > c.be.cfg.MaxResponseBody {
+			return fpErrBodyTooLarge
 		}
-		c.send(h2WindowUpdateFrame(0, int32(len(payload))))
+		st.body = append(st.body, payload...)
+	}
+	if consumed > 0 {
+		var wu [h2FrameHeaderSize + 4]byte
+		c.send(putH2WindowUpdateFrame(wu[:], 0, int32(consumed)))
 		if st != nil {
-			c.send(h2WindowUpdateFrame(streamID, int32(len(payload))))
+			c.send(putH2WindowUpdateFrame(wu[:], streamID, int32(consumed)))
 		}
 		c.be.flushWrites(c)
 	}
@@ -482,8 +487,23 @@ func h2PingAck(payload []byte) []byte {
 }
 
 func h2WindowUpdateFrame(streamID uint32, inc int32) []byte {
-	payload := []byte{byte(inc >> 24), byte(inc >> 16), byte(inc >> 8), byte(inc)}
-	return h2Frame(h2FrameWindowUpdate, 0, streamID, payload)
+	return putH2WindowUpdateFrame(make([]byte, h2FrameHeaderSize+4), streamID, inc)
+}
+
+func putH2WindowUpdateFrame(dst []byte, streamID uint32, inc int32) []byte {
+	dst = dst[:h2FrameHeaderSize+4]
+	dst[0], dst[1], dst[2] = 0, 0, 4
+	dst[3] = h2FrameWindowUpdate
+	dst[4] = 0
+	dst[5] = byte(streamID >> 24)
+	dst[6] = byte(streamID >> 16)
+	dst[7] = byte(streamID >> 8)
+	dst[8] = byte(streamID)
+	dst[9] = byte(inc >> 24)
+	dst[10] = byte(inc >> 16)
+	dst[11] = byte(inc >> 8)
+	dst[12] = byte(inc)
+	return dst
 }
 
 func h2WriteHeaders(c *backendConn, streamID uint32, block []byte, endStream bool) {

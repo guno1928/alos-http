@@ -290,8 +290,8 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 	buf = append(buf, '\r', '\n')
 
 	err := w.writeEncrypted(buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return err
 }
 
@@ -430,8 +430,8 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 	buf = append(buf, '\r', '\n')
 
 	err := writeFull(w.conn, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return err
 }
 

@@ -20,13 +20,16 @@ package core
 func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollConn, stream *H2Stream, streamID uint32) int {
 	req := &stream.req
 	host := stripPort(req.Host)
+	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
+	reqCacheOK := false
 
-	if pe.Cache != nil && (req.Method == "GET" || req.Method == "HEAD") {
+	if pe.Cache != nil && cacheableMethod {
+		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath := req.Path
 		if req.Query != "" {
 			cachePath = req.Path + "?" + req.Query
 		}
-		if entry, hit := pe.Cache.Get(req.Method, host, cachePath, req); hit {
+		if entry, hit := pe.Cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
 			pe.Cache.ServeCached(entry, req, &stream.resp)
 			if pe.OnResponse != nil {
 				pr := &ProxyResponse{
@@ -61,6 +64,8 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	px.method = req.Method
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
+	px.mayCache = pe.Cache != nil && cacheableMethod
+	px.reqCacheOK = reqCacheOK
 	// HTTP/2 has no per-request connection reuse decision; the stream ends and
 	// the connection carries on.
 	px.keepClient = true

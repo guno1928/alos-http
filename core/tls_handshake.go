@@ -3,10 +3,11 @@ package core
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"errors"
 	"hash"
 )
@@ -228,34 +229,112 @@ var cvPrefix = func() [64]byte {
 
 var cvContext = []byte("TLS 1.3, server CertificateVerify")
 
-// SignCertificateVerify signs transcriptHash for a TLS 1.3 server CertificateVerify
-// message using signer, returning the negotiated signature scheme (ECDSA P-256/SHA-256
-// for an *ecdsa.PrivateKey, or RSA-PSS/SHA-256 for an *rsa.PrivateKey) and the
-// signature. It returns an error if signer is neither key type.
-func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte) (uint16, []byte, error) {
+const (
+	sigECDSAP256SHA256 uint16 = 0x0403
+	sigECDSAP384SHA384 uint16 = 0x0503
+	sigECDSAP521SHA512 uint16 = 0x0603
+	sigRSAPSSSHA256    uint16 = 0x0804
+	sigRSAPSSSHA384    uint16 = 0x0805
+	sigRSAPSSSHA512    uint16 = 0x0806
+	sigEd25519         uint16 = 0x0807
+)
+
+var errUnsupportedSignatureKey = errors.New("unsupported certificate key type")
+var errNoCommonSignatureScheme = errors.New("client offers no signature scheme usable with the certificate key")
+
+func schemeOffered(offered []uint16, scheme uint16) bool {
+	if offered == nil {
+		return true
+	}
+	for _, s := range offered {
+		if s == scheme {
+			return true
+		}
+	}
+	return false
+}
+
+func certificateVerifyContent(transcriptHash []byte) []byte {
 	content := make([]byte, 64+len(cvContext)+1+len(transcriptHash))
 	copy(content, cvPrefix[:])
 	copy(content[64:], cvContext)
 	content[64+len(cvContext)] = 0x00
 	copy(content[64+len(cvContext)+1:], transcriptHash)
+	return content
+}
 
-	digest := sha256.Sum256(content)
+func ecdsaScheme(k *ecdsa.PrivateKey) (uint16, crypto.Hash, bool) {
+	switch k.Curve {
+	case elliptic.P256():
+		return sigECDSAP256SHA256, crypto.SHA256, true
+	case elliptic.P384():
+		return sigECDSAP384SHA384, crypto.SHA384, true
+	case elliptic.P521():
+		return sigECDSAP521SHA512, crypto.SHA512, true
+	}
+	return 0, 0, false
+}
+
+var rsaPSSSchemes = [...]struct {
+	scheme uint16
+	hash   crypto.Hash
+}{
+	{sigRSAPSSSHA256, crypto.SHA256},
+	{sigRSAPSSSHA384, crypto.SHA384},
+	{sigRSAPSSSHA512, crypto.SHA512},
+}
+
+// SignCertificateVerify signs transcriptHash for a TLS 1.3 server CertificateVerify
+// message using signer. The signature scheme is dictated by the key: ECDSA keys sign
+// with the hash their curve mandates (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512),
+// Ed25519 keys use ed25519, and RSA keys use RSA-PSS with the strongest hash the
+// client offered. offered is the client's signature_algorithms list; nil accepts any
+// scheme. It returns the scheme and signature, or an error when the key type is
+// unsupported or the client offers no scheme the key can produce.
+func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte, offered []uint16) (uint16, []byte, error) {
+	content := certificateVerifyContent(transcriptHash)
 	switch k := signer.(type) {
 	case *ecdsa.PrivateKey:
-		sig, err := ecdsa.SignASN1(rand.Reader, k, digest[:])
+		scheme, h, ok := ecdsaScheme(k)
+		if !ok {
+			return 0, nil, errUnsupportedSignatureKey
+		}
+		if !schemeOffered(offered, scheme) {
+			return 0, nil, errNoCommonSignatureScheme
+		}
+		digest := hashSum(h, content)
+		sig, err := ecdsa.SignASN1(rand.Reader, k, digest)
 		if err != nil {
 			return 0, nil, err
 		}
-		return 0x0403, sig, nil
+		return scheme, sig, nil
+	case ed25519.PrivateKey:
+		if !schemeOffered(offered, sigEd25519) {
+			return 0, nil, errNoCommonSignatureScheme
+		}
+		return sigEd25519, ed25519.Sign(k, content), nil
 	case *rsa.PrivateKey:
-		sig, err := rsa.SignPSS(rand.Reader, k, crypto.SHA256, digest[:], &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: crypto.SHA256})
-		if err != nil {
-			return 0, nil, err
+		for _, cand := range rsaPSSSchemes {
+			if !schemeOffered(offered, cand.scheme) {
+				continue
+			}
+			digest := hashSum(cand.hash, content)
+			sig, err := rsa.SignPSS(rand.Reader, k, cand.hash, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: cand.hash})
+			if err != nil {
+				return 0, nil, err
+			}
+			return cand.scheme, sig, nil
 		}
-		return 0x0804, sig, nil
+		return 0, nil, errNoCommonSignatureScheme
 	default:
-		return 0, nil, errors.New("unsupported certificate key type")
+		return 0, nil, errUnsupportedSignatureKey
 	}
+}
+
+func hashSum(h crypto.Hash, data []byte) []byte {
+	hh := h.New()
+	hh.Write(data)
+	return hh.Sum(nil)
 }
 
 // ComputeFinished computes a TLS 1.3 Finished message MAC over transcriptHash,
@@ -271,17 +350,17 @@ func ComputeFinished(h func() hash.Hash, hashLen int, baseSecret, transcriptHash
 // ParseClientHello. Reuse an instance across parses via Reset to avoid reallocating
 // its internal scratch buffers.
 type ParsedClientHello struct {
-	SessionID         []byte
-	CipherSuites      []uint16
-	X25519PubKey      []byte
-	ALPNProtos        []string
-	ServerName        string
-	SupportedVersions []uint16
-	SupportedGroups   []uint16
-	SignatureSchemes  []uint16
-	Random            [32]byte
-	MaxUDPPayload     uint64
-	InitialMaxData    uint64
+	SessionID                     []byte
+	CipherSuites                  []uint16
+	X25519PubKey                  []byte
+	ALPNProtos                    []string
+	ServerName                    string
+	SupportedVersions             []uint16
+	SupportedGroups               []uint16
+	SignatureSchemes              []uint16
+	Random                        [32]byte
+	MaxUDPPayload                 uint64
+	InitialMaxData                uint64
 	InitialMaxStreamDataBidiLocal uint64
 
 	hasUncompressedPoint bool

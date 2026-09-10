@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"io"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -367,22 +366,6 @@ func cacheVarySupported(value string) bool {
 	return true
 }
 
-func splitHeaderTokens(value string) []string {
-	if value == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	out := parts[:0]
-	for _, part := range parts {
-		trimmed := ToLowerASCII(trimASCIISpace(part))
-		if trimmed == "" {
-			continue
-		}
-		out = append(out, trimmed)
-	}
-	return out
-}
-
 func splitHeaderDirective(token string) (string, string) {
 	if idx := indexByte(token, '='); idx >= 0 {
 		return trimASCIISpace(token[:idx]), trimASCIISpace(token[idx+1:])
@@ -666,8 +649,8 @@ func (pc *ProxyCache) compressGzip(data []byte) []byte {
 	bytesWriterPool.Put(w)
 	result := make([]byte, len(buf))
 	copy(result, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return result
 }
 
@@ -793,8 +776,8 @@ func decompressGzip(data []byte) ([]byte, error) {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			if len(buf) > maxDecompressedSize {
-				*bp = buf[:0]
-				LargeBufPool.Put(bp)
+				*bp = buf
+				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 				return nil, ErrBodyTooLarge
 			}
 		}
@@ -802,15 +785,15 @@ func decompressGzip(data []byte) ([]byte, error) {
 			if rerr == io.EOF {
 				break
 			}
-			*bp = buf[:0]
-			LargeBufPool.Put(bp)
+			*bp = buf
+			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 			return nil, rerr
 		}
 	}
 	result := make([]byte, len(buf))
 	copy(result, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return result, nil
 }
 
@@ -826,8 +809,8 @@ func decompressDeflate(data []byte) ([]byte, error) {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			if len(buf) > maxDecompressedSize {
-				*bp = buf[:0]
-				LargeBufPool.Put(bp)
+				*bp = buf
+				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 				return nil, ErrBodyTooLarge
 			}
 		}
@@ -835,15 +818,15 @@ func decompressDeflate(data []byte) ([]byte, error) {
 			if rerr == io.EOF {
 				break
 			}
-			*bp = buf[:0]
-			LargeBufPool.Put(bp)
+			*bp = buf
+			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 			return nil, rerr
 		}
 	}
 	result := make([]byte, len(buf))
 	copy(result, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return result, nil
 }
 
@@ -858,8 +841,8 @@ func decompressBrotli(data []byte) ([]byte, error) {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			if len(buf) > maxDecompressedSize {
-				*bp = buf[:0]
-				LargeBufPool.Put(bp)
+				*bp = buf
+				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 				return nil, ErrBodyTooLarge
 			}
 		}
@@ -867,15 +850,15 @@ func decompressBrotli(data []byte) ([]byte, error) {
 			if rerr == io.EOF {
 				break
 			}
-			*bp = buf[:0]
-			LargeBufPool.Put(bp)
+			*bp = buf
+			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 			return nil, rerr
 		}
 	}
 	result := make([]byte, len(buf))
 	copy(result, buf)
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return result, nil
 }
 

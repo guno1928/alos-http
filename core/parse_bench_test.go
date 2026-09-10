@@ -45,4 +45,3 @@ func BenchmarkParseH1RequestHead_Post(b *testing.B) {
 		ParseH1RequestHead(benchReqPost, &req, 8192, 128)
 	}
 }
-

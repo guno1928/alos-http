@@ -121,7 +121,7 @@ func (t *tlsTransport) wrapOut(c *backendConn, plain []byte) error {
 		}
 		plain = plain[len(chunk):]
 		if t.version == 0x0303 {
-			c.wbuf.write(t.seal12(&t.client12, tlsRecAppData, chunk))
+			c.wbuf.b = t.seal12To(c.wbuf.b, &t.client12, tlsRecAppData, chunk)
 			continue
 		}
 		rec, err := t.sealRecord(&t.clientAppKey, tlsRecAppData, chunk)

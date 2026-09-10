@@ -28,10 +28,12 @@ const (
 const (
 	epollActionNeedRead = iota
 	epollActionCloseAfterFlush
-	epollActionDetached
 	// epollActionProxyInFlight means an upstream exchange owns this connection
 	// until it completes: nothing may flush, recycle or close it meanwhile.
 	epollActionProxyInFlight
+	// epollActionDetached means a handler took the socket over on the event
+	// loop thread; the connection object goes back to the pool.
+	epollActionDetached
 )
 
 type epollConn struct {
@@ -42,6 +44,8 @@ type epollConn struct {
 	outArmed    bool
 	tls         bool
 	dispatching bool
+	readPending bool
+	flushQueued bool
 	ipHeld      bool
 	inFlight    int
 	readN       int
@@ -157,7 +161,7 @@ func (c *epollConn) releaseClientHello() {
 
 func (p *epollConnPool) put(c *epollConn) {
 	if p.server != nil {
-		p.server.activeConns.Add(-1)
+		p.server.releaseTrackedConn()
 		Stats.ActiveConns.Add(-1)
 	}
 	if c.ipHeld {
@@ -253,14 +257,16 @@ type epollWorker struct {
 	listenerFD      int
 	wakeFd          int
 	coreID          int
+	spawned         int
 	tlsMode         bool
 	conns           []*epollConn
 	pool            epollConnPool
 	events          []unix.EpollEvent
 	taskCh          chan func(*epollWorker)
 	taskPending     atomic.Bool
+	parked          atomic.Bool
 	wakeBuf         [8]byte
-	flushSet        map[*epollConn]struct{}
+	flushList       []*epollConn
 	h2FinishScratch []byte
 	readTO          int64
 	headerTO        int64
@@ -416,7 +422,7 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 		conns:      make([]*epollConn, 1024),
 		events:     make([]unix.EpollEvent, epollEventBatch),
 		taskCh:     make(chan func(*epollWorker), epollTaskQueueSize),
-		flushSet:   make(map[*epollConn]struct{}, 64),
+		flushList:  make([]*epollConn, 0, 64),
 	}
 	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
@@ -427,7 +433,13 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 	w.idleTO = int64(s.config.IdleTimeout)
 	w.pool.prewarm(minPrealloc)
 	w.initBackendLoop()
+	s.addShutdownWaker(w)
 	return w, nil
+}
+
+func (w *epollWorker) wakeForShutdown() {
+	var one uint64 = 1
+	_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
 }
 
 func (s *Server) preallocBatch() int {
@@ -442,8 +454,10 @@ const epollTaskQueueSize = 8192
 func (w *epollWorker) postTask(fn func(*epollWorker)) {
 	w.taskCh <- fn
 	w.taskPending.Store(true)
-	var one uint64 = 1
-	_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
+	if w.parked.Load() {
+		var one uint64 = 1
+		_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
+	}
 }
 
 func (w *epollWorker) drainTasks() {
@@ -519,6 +533,7 @@ func (w *epollWorker) run() error {
 	defer runtime.UnlockOSThread()
 	defer unix.Close(w.epfd)
 	defer unix.Close(w.wakeFd)
+	defer w.server.removeShutdownWaker(w)
 	accepting := true
 	for {
 		if accepting {
@@ -531,11 +546,14 @@ func (w *epollWorker) run() error {
 			default:
 			}
 		}
-		if !accepting && !w.hasClientConns() {
-			return nil
+		if !accepting {
+			w.closeIdleConns()
+			if !w.hasClientConns() {
+				return nil
+			}
 		}
 		w.be.seq++
-		n, err := unix.EpollWait(w.epfd, w.events, epollSweepIntervalMs)
+		n, err := w.waitEvents()
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -569,13 +587,73 @@ func (w *epollWorker) run() error {
 		}
 		if tasksPending {
 			_, _ = unix.Read(w.wakeFd, w.wakeBuf[:])
-			w.drainTasks()
+		}
+		for round := 0; round < epollDispatchRounds && (tasksPending || w.spawned > 0 || w.taskPending.Load()); round++ {
+			tasksPending = false
+			if w.spawned > 0 {
+				w.spawned = 0
+				w.yieldToHandlers()
+			}
+			if w.taskPending.Load() {
+				w.drainTasks()
+			}
+		}
+		if len(w.flushList) > 0 {
 			w.flushPending()
 		}
 		if acceptPending {
 			w.acceptLoop()
 		}
 		w.sweepDeadlines()
+	}
+}
+
+// waitEvents blocks for readiness. The parked flag lets postTask skip the
+// eventfd wake whenever the worker is not actually inside epoll_wait.
+func (w *epollWorker) waitEvents() (int, error) {
+	waitMs := epollSweepIntervalMs
+	w.parked.Store(true)
+	if w.taskPending.Load() {
+		waitMs = 0
+	}
+	n, err := unix.EpollWait(w.epfd, w.events, waitMs)
+	w.parked.Store(false)
+	return n, err
+}
+
+func (c *epollConn) speaksH2() bool {
+	return c.protocol == plainConnProtoH2 || c.phase == tlsConnPhaseH2Native
+}
+
+func (c *epollConn) unparsedInput() bool {
+	if c.tls {
+		return c.readN != 0 || c.appBufOff < len(c.appBuf) || (c.speaksH2() && c.h2.appBufOff < len(c.appBuf))
+	}
+	if c.speaksH2() {
+		return c.readN != c.h2.appBufOff
+	}
+	return c.readN != 0
+}
+
+func (c *epollConn) idle() bool {
+	return c.fd >= 0 && c.inFlight == 0 && !c.dispatching && c.proxyEx == nil && c.tunnelBE == nil &&
+		!c.unparsedInput() && !c.outArmed && c.writeSent == len(c.writeBuf) &&
+		len(c.h2.streams) == 0 && len(c.h2.sending) == 0
+}
+
+func (w *epollWorker) closeIdleConns() {
+	for _, c := range w.conns {
+		if c == nil || !c.idle() {
+			continue
+		}
+		if !c.speaksH2() {
+			w.closeConn(c)
+			continue
+		}
+		var goAway [h2FrameHeaderSize + 8]byte
+		w.clientAppend(c, appendH2GoAwayFrame(goAway[:0], c.h2.lastStreamID, H2ErrNoError))
+		c.closeAfter = true
+		w.flush(c)
 	}
 }
 
@@ -588,7 +666,10 @@ func (w *epollWorker) hasClientConns() bool {
 	return false
 }
 
-const epollSweepIntervalMs = 1000
+const (
+	epollSweepIntervalMs = 1000
+	epollDispatchRounds  = 64
+)
 
 func (w *epollWorker) sweepDeadlines() {
 	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 && w.be.liveConns == 0 {
@@ -633,17 +714,29 @@ func (w *epollWorker) nextReadTimeout(c *epollConn) int64 {
 	return w.headerTO
 }
 
+func (w *epollWorker) yieldToHandlers() {
+	runtime.UnlockOSThread()
+	runtime.Gosched()
+	runtime.LockOSThread()
+}
+
 func (w *epollWorker) markFlush(c *epollConn) {
-	w.flushSet[c] = struct{}{}
+	if c.flushQueued {
+		return
+	}
+	c.flushQueued = true
+	w.flushList = append(w.flushList, c)
 }
 
 func (w *epollWorker) flushPending() {
-	for c := range w.flushSet {
-		delete(w.flushSet, c)
+	for i, c := range w.flushList {
+		w.flushList[i] = nil
+		c.flushQueued = false
 		if c.fd >= 0 {
 			w.flush(c)
 		}
 	}
+	w.flushList = w.flushList[:0]
 }
 
 func (w *epollWorker) acceptLoop() {
@@ -661,7 +754,7 @@ func (w *epollWorker) acceptLoop() {
 		active := w.server.activeConns.Add(1)
 		Stats.ActiveConns.Add(1)
 		if lim := w.server.config.MaxConns; lim > 0 && active > lim {
-			w.server.activeConns.Add(-1)
+			w.server.releaseTrackedConn()
 			Stats.ActiveConns.Add(-1)
 			_ = unix.Close(nfd)
 			continue
@@ -675,6 +768,8 @@ func (w *epollWorker) acceptLoop() {
 		c.closeAfter = false
 		c.outArmed = false
 		c.dispatching = false
+		c.readPending = false
+		c.flushQueued = false
 		c.readN = 0
 		c.writeSent = 0
 		c.h1Off = 0
@@ -736,8 +831,10 @@ func epollRemoteAddr(sa unix.Sockaddr) string {
 
 func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 	if c.dispatching {
+		c.readPending = true
 		return
 	}
+	c.readPending = false
 	if c.readBuf == nil {
 		c.readBuf = acquireEpollReadBuf()
 	}
@@ -760,7 +857,7 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 			}
 		}
 		reqLen := cap(c.readBuf) - c.readN
-		n, err := unix.Read(c.fd, c.readBuf[c.readN:cap(c.readBuf)])
+		n, err := socketRecv(c.fd, c.readBuf[c.readN:cap(c.readBuf)])
 		if n > 0 {
 			c.readN += n
 			if n < reqLen {
@@ -787,7 +884,29 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 			c.deadline = deadlineFrom(w.nextReadTimeout(c))
 		}
 	}
-	if c.readN > 0 {
+	w.serviceBuffered(c, closed, peerClosed)
+}
+
+// resumeConn continues a connection after an asynchronous dispatch. A read
+// edge seen while the handler ran is honoured with a fresh read; otherwise
+// only already-buffered input is processed, which spares a syscall per
+// request on the common path.
+func (w *epollWorker) resumeConn(c *epollConn) {
+	if c.readPending {
+		w.readable(c, false)
+		return
+	}
+	if c.readBuf == nil {
+		c.readBuf = acquireEpollReadBuf()
+	}
+	if c.writeBuf == nil {
+		c.writeBuf = acquireIOBuf()
+	}
+	w.serviceBuffered(c, false, false)
+}
+
+func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
+	if c.readN > 0 || c.tlsAppPending() {
 		var action int
 		if c.tls {
 			action = c.epollProcessTLS(w.server)
@@ -795,7 +914,9 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 			action = c.epollProcess(w.server)
 		}
 		if action == epollActionDetached {
-			w.recycleConn(c)
+			if c.inFlight == 0 {
+				w.pool.put(c)
+			}
 			return
 		}
 		if action == epollActionProxyInFlight {
@@ -811,7 +932,11 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 		if action == epollActionCloseAfterFlush {
 			c.closeAfter = true
 		}
-		if !w.flush(c) {
+		if c.dispatching && !c.closeAfter {
+			if len(c.writeBuf) > c.writeSent {
+				w.markFlush(c)
+			}
+		} else if !w.flush(c) {
 			return
 		}
 	}
@@ -851,36 +976,8 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 	}
 }
 
-func (w *epollWorker) recycleConn(c *epollConn) {
-	for id, stream := range c.h2.streams {
-		stream.Reset()
-		StreamPool.Put(stream)
-		delete(c.h2.streams, id)
-	}
-	for id, stream := range c.h2.sending {
-		stream.Reset()
-		StreamPool.Put(stream)
-		delete(c.h2.sending, id)
-	}
-	c.readN = 0
-	c.writeSent = 0
-	c.h1Off = 0
-	c.chunkScanPos = 0
-	c.writeBuf = c.writeBuf[:0]
-	c.h2.appBufOff = 0
-	c.protocol = plainConnProtoUnknown
-	c.closeAfter = false
-	c.outArmed = false
-	c.hsReader = nil
-	c.appReader = nil
-	c.appWriter = nil
-	c.tls12 = nil
-	c.appBufOff = 0
-	if c.appBuf != nil {
-		c.appBuf = c.appBuf[:0]
-	}
-	c.tls = false
-	w.pool.put(c)
+func (c *epollConn) tlsAppPending() bool {
+	return c.tls && c.appBufOff < len(c.appBuf)
 }
 
 func (c *epollConn) epollProcess(srv *Server) int {
@@ -925,7 +1022,7 @@ const epollMaxPendingWrite = 8 << 20
 
 func (w *epollWorker) flush(c *epollConn) bool {
 	for c.writeSent < len(c.writeBuf) {
-		n, err := unix.Write(c.fd, c.writeBuf[c.writeSent:])
+		n, err := socketSend(c.fd, c.writeBuf[c.writeSent:])
 		if n > 0 {
 			c.writeSent += n
 			continue
@@ -939,6 +1036,9 @@ func (w *epollWorker) flush(c *epollConn) bool {
 				return false
 			}
 			w.resumeRelayIfDrained(c)
+			if c.fd < 0 {
+				return false
+			}
 			w.armOut(c)
 			return true
 		}
@@ -951,6 +1051,12 @@ func (w *epollWorker) flush(c *epollConn) bool {
 		w.disarmOut(c)
 	}
 	w.resumeRelayIfDrained(c)
+	if c.fd < 0 {
+		return false
+	}
+	if c.writeSent < len(c.writeBuf) {
+		return true
+	}
 	if c.closeAfter {
 		w.closeConn(c)
 		return false
@@ -995,7 +1101,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	if c.tunnelBE != nil {
 		w.closeTunnelFromClient(c)
 	}
-	delete(w.flushSet, c)
+	c.flushQueued = false
 	for id, stream := range c.h2.streams {
 		if stream.asyncBusy {
 			continue
@@ -1019,6 +1125,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.closeAfter = false
 	c.outArmed = false
 	c.dispatching = false
+	c.readPending = false
 	c.hsReader = nil
 	c.appReader = nil
 	c.appWriter = nil

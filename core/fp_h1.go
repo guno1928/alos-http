@@ -389,7 +389,7 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 		switch {
 		case asciiEqualFold(name, "content-length"):
 			v, err := strconv.ParseInt(string(value), 10, 64)
-			if err != nil || v < 0 {
+			if err != nil || v < 0 || (contentLen >= 0 && contentLen != v) {
 				return false, -1, fpErrBadResponse
 			}
 			contentLen = v

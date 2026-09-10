@@ -519,8 +519,8 @@ func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig
 		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
 	}
 
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 }
 
 func responseHasHeader(headers [][2]string, name string) bool {
@@ -702,6 +702,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			tmpReq.tlsWriter = nil
 			tmpReq.hdrBuf = nil
 			tmpReq.attachConn = nil
+			tmpReq.detachLazyCaches()
 			ctx, cancel := context.WithTimeout(req.Context(), d)
 			defer cancel()
 			tmpReq.ctx = ctx

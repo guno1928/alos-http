@@ -94,7 +94,8 @@ var rootPrefix16 = [16]byte{'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/
 var rootPrefixBytes = rootPrefix16[:]
 
 func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool) {
-	if !s.plainRootFast.enabled {
+	fast := s.plainRootFast.Load()
+	if fast == nil {
 		return nil, 0, false, false
 	}
 	if len(data) < len(rootPrefixBytes)+4 || !equalPrefix16(data, &rootPrefix16) {
@@ -112,9 +113,9 @@ func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool
 		return nil, 0, false, false
 	}
 	if !keepAlive {
-		return s.plainRootFast.getClose, consumed, true, true
+		return fast.getClose, consumed, true, true
 	}
-	return s.plainRootFast.getKeepAlive, consumed, false, true
+	return fast.getKeepAlive, consumed, false, true
 }
 
 func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (consumed int, keepAlive bool, ok bool, needRead bool) {
@@ -268,6 +269,13 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 	if !validH1Version(rl[sp2+1:]) {
 		return 0, 0, false, false, true, false, false, true
 	}
+	http10 := rl[sp2+8] == '0'
+	if http10 {
+		req.Proto = "HTTP/1.0"
+	} else {
+		req.Proto = "HTTP/1.1"
+	}
+	keepAliveRequested := false
 
 	methodBytes := rl[:sp1]
 	if !isH1Token(methodBytes) {
@@ -319,6 +327,9 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 			if hasContentLength && chunkedEncoding {
 				badTransferEncoding = true
 			}
+			if http10 && !keepAliveRequested {
+				closeConn = true
+			}
 			req.aliasesReadBuf = true
 			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
 		}
@@ -367,6 +378,7 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 					req.cachedConn = valStr
 					req.headerCacheMask |= headerCacheConnection
 					closeConn = len(val) == 5 && asciiLower[val[0]] == 'c' && asciiLower[val[1]] == 'l' && asciiLower[val[2]] == 'o' && asciiLower[val[3]] == 's' && asciiLower[val[4]] == 'e'
+					keepAliveRequested = len(val) == 10 && asciiEqualFoldBytes(val, "keep-alive")
 				}
 			case 13:
 				if (name[0] == 'A' || name[0] == 'a') && EqualFoldASCII(name, "Authorization") {
@@ -430,42 +442,12 @@ func appendPlainResponse(resp *Response, dst []byte) []byte {
 	return appendPlainResponseMode(resp, dst, true, true)
 }
 
+func appendPlainResponseClose(resp *Response, dst []byte) []byte {
+	return appendPlainResponseMode(resp, dst, false, true)
+}
+
 func appendPlainResponseHeaders(resp *Response, dst []byte) []byte {
 	return appendPlainResponseMode(resp, dst, true, false)
-}
-
-var crlfcrlf = [4]byte{13, 10, 13, 10}
-
-func findRequestEnd(data []byte) int {
-	if len(data) < 4 {
-		return -1
-	}
-	off := 0
-	for {
-		idx := bytes.IndexByte(data[off:], '\r')
-		if idx < 0 {
-			return -1
-		}
-		pos := off + idx
-		if pos+3 >= len(data) {
-			return -1
-		}
-		if data[pos+1] == '\n' && data[pos+2] == '\r' && data[pos+3] == '\n' {
-			return pos + 4
-		}
-		off = pos + 1
-	}
-}
-
-func findRequestEndFrom(data []byte, start int) int {
-	if len(data)-start < 4 {
-		return -1
-	}
-	idx := bytes.Index(data[start:], crlfcrlf[:])
-	if idx < 0 {
-		return -1
-	}
-	return start + idx + 4
 }
 
 // ServeH2Plain serves an HTTP/2 connection over conn without TLS, running the

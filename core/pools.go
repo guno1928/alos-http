@@ -21,6 +21,8 @@ var MediumBufPool = sync.Pool{
 }
 
 // LargeBufPool pools 32768-byte scratch buffers.
+const largeBufPoolMaxCap = 1 << 20
+
 var LargeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 32768); return &b },
 }
@@ -154,6 +156,14 @@ func acquirePooledBuf(pool *sync.Pool) []byte {
 	*bp = nil
 	bufBoxPool.Put(bp)
 	return buf
+}
+
+func putBoxedBufCapped(pool *sync.Pool, bp *[]byte, maxCap int) {
+	if cap(*bp) > maxCap {
+		return
+	}
+	*bp = (*bp)[:0]
+	pool.Put(bp)
 }
 
 func releasePooledBuf(pool *sync.Pool, buf []byte, maxCap int) {

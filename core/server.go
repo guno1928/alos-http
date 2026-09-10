@@ -224,6 +224,15 @@ var timeNow = time.Now
 //
 //	Example: ProxyMode: true.
 //
+// InlineHandlers runs HTTP/1.1 handlers directly on the event-loop thread
+// instead of handing each request to a goroutine. It removes the goroutine
+// hand-off and wake-up from every request, which is measurably faster for
+// handlers that return in microseconds, but a handler that blocks (database
+// call, sleep, slow upstream) stalls every other connection on that worker
+// for as long as it runs. Leave it off unless every handler is non-blocking.
+//
+//	Example: InlineHandlers: true.
+//
 // WebSocketOriginMode controls Origin validation for WebSocket upgrades; defaults to WSOriginSameOrigin.
 //
 //	Example: WebSocketOriginMode: WSOriginAllowlist.
@@ -289,6 +298,7 @@ type Config struct {
 	PlainHTTP       bool
 	DisableHTTP2    bool
 	ProxyMode       bool
+	InlineHandlers  bool
 
 	WSReadTimeout           time.Duration
 	WSWriteTimeout          time.Duration
@@ -422,117 +432,61 @@ func serverConnHeaders(resp *Response) (keepAlive, closeHdr []byte) {
 	return connKeepAlive, connClose
 }
 
-func newPerIPRequestLimiter() *perIPRequestLimiter {
-	l := &perIPRequestLimiter{
-		m:    alosmap.NewTyped[string, *ipReqCounter]().Prealloc(256),
-		done: make(chan struct{}),
-	}
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							Dbg("[iplimiter sweep] recovered panic: %v", r)
-						}
-					}()
-					l.m.Range(func(key string, c *ipReqCounter) bool {
-						if c.n.Load() <= 0 {
-							l.m.Delete(key)
-						}
-						return true
-					})
-				}()
-			case <-l.done:
-				return
-			}
-		}
-	}()
-	return l
-}
+const (
+	perIPSweepInterval = 60 * time.Second
+	ipCounterDead      = -1 << 62
+)
 
-func (l *perIPRequestLimiter) Stop() {
-	if l == nil {
-		return
-	}
-	select {
-	case <-l.done:
-	default:
-		close(l.done)
-	}
-}
-
-func (l *perIPRequestLimiter) acquire(ip string, limit int64) bool {
-	if l == nil || ip == "" || limit <= 0 {
-		return true
-	}
-	c, ok := l.m.Load(ip)
-	if !ok {
-		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
-	}
-	for {
-		cur := c.n.Load()
-		if cur >= limit {
-			return false
-		}
-		if c.n.CompareAndSwap(cur, cur+1) {
-			return true
-		}
-	}
-}
-
-func (l *perIPRequestLimiter) release(ip string) {
-	if l == nil || ip == "" {
-		return
-	}
-	if c, ok := l.m.Load(ip); ok {
-		if c.n.Add(-1) < 0 {
-			c.n.Add(1)
-		}
-	}
-}
-
-type perIPConnLimiter struct {
+type perIPLimiter struct {
 	m    *alosmap.TypedMap[string, *ipReqCounter]
 	done chan struct{}
 }
 
-func newPerIPConnLimiter() *perIPConnLimiter {
-	l := &perIPConnLimiter{
-		m:    alosmap.NewTyped[string, *ipReqCounter]().Prealloc(128),
+type perIPRequestLimiter = perIPLimiter
+
+type perIPConnLimiter = perIPLimiter
+
+func newPerIPRequestLimiter() *perIPLimiter { return newPerIPLimiter(256) }
+
+func newPerIPConnLimiter() *perIPLimiter { return newPerIPLimiter(128) }
+
+func newPerIPLimiter(prealloc int) *perIPLimiter {
+	l := &perIPLimiter{
+		m:    alosmap.NewTyped[string, *ipReqCounter]().Prealloc(prealloc),
 		done: make(chan struct{}),
 	}
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							Dbg("[connlimiter sweep] recovered panic: %v", r)
-						}
-					}()
-					l.m.Range(func(key string, c *ipReqCounter) bool {
-						if c.n.Load() <= 0 {
-							l.m.Delete(key)
-						}
-						return true
-					})
-				}()
-			case <-l.done:
-				return
-			}
-		}
-	}()
+	go l.sweepLoop()
 	return l
 }
 
-func (l *perIPConnLimiter) Stop() {
+func (l *perIPLimiter) sweepLoop() {
+	ticker := time.NewTicker(perIPSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			l.sweep()
+		case <-l.done:
+			return
+		}
+	}
+}
+
+func (l *perIPLimiter) sweep() {
+	defer func() {
+		if r := recover(); r != nil {
+			Dbg("[iplimiter sweep] recovered panic: %v", r)
+		}
+	}()
+	l.m.Range(func(key string, c *ipReqCounter) bool {
+		if c.n.CompareAndSwap(0, ipCounterDead) {
+			l.m.CompareAndDelete(key, c)
+		}
+		return true
+	})
+}
+
+func (l *perIPLimiter) Stop() {
 	if l == nil {
 		return
 	}
@@ -543,26 +497,32 @@ func (l *perIPConnLimiter) Stop() {
 	}
 }
 
-func (l *perIPConnLimiter) acquire(ip string, limit int64) bool {
+func (l *perIPLimiter) acquire(ip string, limit int64) bool {
 	if l == nil || ip == "" || limit <= 0 {
 		return true
 	}
-	c, ok := l.m.Load(ip)
-	if !ok {
-		c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
-	}
 	for {
-		cur := c.n.Load()
-		if cur >= limit {
-			return false
+		c, ok := l.m.Load(ip)
+		if !ok {
+			c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
 		}
-		if c.n.CompareAndSwap(cur, cur+1) {
-			return true
+		for {
+			cur := c.n.Load()
+			if cur < 0 {
+				l.m.CompareAndDelete(ip, c)
+				break
+			}
+			if cur >= limit {
+				return false
+			}
+			if c.n.CompareAndSwap(cur, cur+1) {
+				return true
+			}
 		}
 	}
 }
 
-func (l *perIPConnLimiter) release(ip string) {
+func (l *perIPLimiter) release(ip string) {
 	if l == nil || ip == "" {
 		return
 	}
@@ -596,7 +556,8 @@ type Server struct {
 	proxy             atomic.Pointer[ProxyEngine]
 	proxyDomains      []DomainConfig
 	httpRouter        *HTTPRouter
-	acme              *acmeIntegration
+	acme              atomic.Pointer[acmeIntegration]
+	quicTimers        quicTimerHub
 	listeners         []net.Listener
 	done              chan struct{}
 	tlsRuntimeOnce    sync.Once
@@ -609,13 +570,15 @@ type Server struct {
 	drainDone         chan struct{}
 	drainOnce         sync.Once
 	shutdownOnce      sync.Once
+	wakersMu          sync.Mutex
+	wakers            map[shutdownWaker]struct{}
 	connLimiter       *ConnectionLimiter
 	globalLimiter     *GlobalLimiter
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
 	fastDispatch      atomic.Bool
-	plainRootFast     plainRootFastResponse
-	h2RootFast        h2RootFastResponse
+	plainRootFast     atomic.Pointer[plainRootFastResponse]
+	h2RootFast        atomic.Pointer[h2RootFastResponse]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
 	perIPConnLimiter  *perIPConnLimiter
@@ -623,8 +586,9 @@ type Server struct {
 	perIPInFlight     int64
 	trackedConnMu     sync.Mutex
 	trackedConns      map[*trackedHandoffConn]struct{}
-	onRequestHooks    []func(*Request, *Response) bool
-	onResponseHooks   []func(*Request, *Response)
+	hookMu            sync.Mutex
+	onRequestHooks    atomic.Pointer[[]func(*Request, *Response) bool]
+	onResponseHooks   atomic.Pointer[[]func(*Request, *Response)]
 	srvKeepAlive      []byte
 	srvClose          []byte
 }
@@ -641,13 +605,7 @@ type ipReqCounter struct {
 	n atomic.Int64
 }
 
-type perIPRequestLimiter struct {
-	m    *alosmap.TypedMap[string, *ipReqCounter]
-	done chan struct{}
-}
-
 type plainRootFastResponse struct {
-	enabled         bool
 	getKeepAlive    []byte
 	getClose        []byte
 	getKeepAliveTLS []byte
@@ -655,7 +613,6 @@ type plainRootFastResponse struct {
 }
 
 type h2RootFastResponse struct {
-	enabled       bool
 	headerPayload []byte
 	body          []byte
 	framed        []byte
@@ -942,8 +899,8 @@ func (s *Server) ListenAndServeTLS() error {
 	}
 	s.primeTLSCertificates()
 
-	if s.acme != nil {
-		s.acme.Start()
+	if ai := s.acme.Load(); ai != nil {
+		ai.Start()
 	}
 	s.ensureTLSRuntime()
 	log.Printf("[INFO] epoll TLS worker mode active on Linux amd64: listeners=%d", s.config.Listeners)
@@ -1122,19 +1079,19 @@ func (s *Server) loadCerts() error {
 				seen[d] = struct{}{}
 			}
 		}
-		s.acme = newACMEIntegration(cfg, s)
-		if s.acme != nil {
+		if ai := newACMEIntegration(cfg, s); ai != nil {
+			s.replaceACME(ai)
 			log.Printf("[ACME] enabled for domains: %v", cfg.Domains)
 		}
 	} else if len(acmeDomains) > 0 {
 		cfg := ACMEConfig{Domains: acmeDomains}
-		s.acme = newACMEIntegration(cfg, s)
-		if s.acme != nil {
+		if ai := newACMEIntegration(cfg, s); ai != nil {
+			s.replaceACME(ai)
 			log.Printf("[ACME] enabled for domains: %v", acmeDomains)
 		}
 	}
 
-	if len(s.config.Certs) > 0 || s.acme != nil {
+	if len(s.config.Certs) > 0 || s.acme.Load() != nil {
 		if s.config.DefaultDomain != "" {
 			s.certStore.SetDefault(s.config.DefaultDomain)
 		}
@@ -1150,17 +1107,18 @@ func (s *Server) loadCerts() error {
 }
 
 func (s *Server) primeTLSCertificates() {
-	if s.acme == nil {
+	ai := s.acme.Load()
+	if ai == nil {
 		return
 	}
 	before := len(s.certStore.ListCerts())
 	if before == 0 {
 		log.Printf("[ACME] priming initial TLS certificates before opening HTTPS listeners")
 	}
-	s.acme.primeInitial()
+	ai.primeInitial()
 	after := len(s.certStore.ListCerts())
 	if after == 0 {
-		domains := s.acme.domainsSnapshot()
+		domains := ai.domainsSnapshot()
 		if len(domains) == 0 {
 			log.Printf("[WARN] ACME is enabled but no TLS certificates are loaded yet")
 			return
@@ -1202,8 +1160,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		s.shuttingDown.Store(true)
 		close(s.done)
-		if s.acme != nil {
-			s.acme.Stop()
+		s.wakeAllForShutdown()
+		if ai := s.acme.Load(); ai != nil {
+			ai.Stop()
 		}
 		if pe := s.proxy.Load(); pe != nil {
 			pe.Stop()
@@ -1234,6 +1193,33 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		s.closeTrackedHandoffConns()
 		return ctx.Err()
+	}
+}
+
+type shutdownWaker interface {
+	wakeForShutdown()
+}
+
+func (s *Server) addShutdownWaker(w shutdownWaker) {
+	s.wakersMu.Lock()
+	if s.wakers == nil {
+		s.wakers = make(map[shutdownWaker]struct{})
+	}
+	s.wakers[w] = struct{}{}
+	s.wakersMu.Unlock()
+}
+
+func (s *Server) removeShutdownWaker(w shutdownWaker) {
+	s.wakersMu.Lock()
+	delete(s.wakers, w)
+	s.wakersMu.Unlock()
+}
+
+func (s *Server) wakeAllForShutdown() {
+	s.wakersMu.Lock()
+	defer s.wakersMu.Unlock()
+	for w := range s.wakers {
+		w.wakeForShutdown()
 	}
 }
 
@@ -1321,8 +1307,8 @@ func (s *Server) rootFastEligible() bool {
 		s.config.EnableCompress ||
 		s.perIPLimiter != nil ||
 		s.trustedProxies.active ||
-		len(s.onRequestHooks) != 0 ||
-		len(s.onResponseHooks) != 0 {
+		s.onRequestHooks.Load() != nil ||
+		s.onResponseHooks.Load() != nil {
 		return false
 	}
 	if pe := s.proxy.Load(); pe != nil {
@@ -1375,6 +1361,12 @@ func (s *Server) releaseBodyBytes(n int64) {
 }
 
 func (s *Server) computeFastDispatch() {
+	if !s.Router.built.Load() {
+		s.fastDispatch.Store(false)
+		s.plainRootFast.Store(nil)
+		s.h2RootFast.Store(nil)
+		return
+	}
 	rootFast := s.rootFastEligible()
 	fast := rootFast && s.config.MaxConcurrentReqs <= 0
 	s.fastDispatch.Store(fast)
@@ -1383,13 +1375,16 @@ func (s *Server) computeFastDispatch() {
 }
 
 func (s *Server) computePlainRootFastResponse(fast bool) {
-	s.plainRootFast = plainRootFastResponse{}
+	s.plainRootFast.Store(s.buildPlainRootFastResponse(fast))
+}
+
+func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	if !fast || len(s.Router.globalMiddleware) != 0 {
-		return
+		return nil
 	}
 	handler := s.lookupStaticHandler(methodGET, "/")
 	if handler == nil {
-		return
+		return nil
 	}
 	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1", server: s}
 	resp := Response{
@@ -1400,15 +1395,15 @@ func (s *Server) computePlainRootFastResponse(fast bool) {
 	resp.lazyReq = &req
 	handler(&req, &resp)
 	if req.hijacked || resp.IsStreamed() {
-		return
+		return nil
 	}
 	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return
+		return nil
 	}
 	keepAlive := appendPlainResponseMode(&resp, make([]byte, 0, resp.BodyLen()+128), true, true)
 	closeResp := appendPlainResponseMode(&resp, make([]byte, 0, len(keepAlive)), false, true)
 	if len(keepAlive) == 0 || len(closeResp) == 0 {
-		return
+		return nil
 	}
 	keepAliveTLS := make([]byte, len(keepAlive)+1)
 	copy(keepAliveTLS, keepAlive)
@@ -1416,8 +1411,7 @@ func (s *Server) computePlainRootFastResponse(fast bool) {
 	closeTLS := make([]byte, len(closeResp)+1)
 	copy(closeTLS, closeResp)
 	closeTLS[len(closeResp)] = 0x17
-	s.plainRootFast = plainRootFastResponse{
-		enabled:         true,
+	return &plainRootFastResponse{
 		getKeepAlive:    keepAlive,
 		getClose:        closeResp,
 		getKeepAliveTLS: keepAliveTLS,
@@ -1426,13 +1420,16 @@ func (s *Server) computePlainRootFastResponse(fast bool) {
 }
 
 func (s *Server) computeH2RootFastResponse(fast bool) {
-	s.h2RootFast = h2RootFastResponse{}
+	s.h2RootFast.Store(s.buildH2RootFastResponse(fast))
+}
+
+func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
 	if !fast || !s.http2Enabled() || len(s.Router.globalMiddleware) != 0 {
-		return
+		return nil
 	}
 	handler := s.lookupStaticHandler(methodGET, "/")
 	if handler == nil {
-		return
+		return nil
 	}
 	req := Request{Method: "GET", Path: "/", Proto: "HTTP/2"}
 	resp := Response{
@@ -1442,10 +1439,10 @@ func (s *Server) computeH2RootFastResponse(fast bool) {
 	}
 	handler(&req, &resp)
 	if req.hijacked || resp.IsStreamed() {
-		return
+		return nil
 	}
 	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return
+		return nil
 	}
 
 	enc := HpackEncoder{}
@@ -1454,8 +1451,7 @@ func (s *Server) computeH2RootFastResponse(fast bool) {
 	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
 
 	body := append([]byte(nil), resp.transmittedBodyBytes()...)
-	fastResp := h2RootFastResponse{
-		enabled:       true,
+	fastResp := &h2RootFastResponse{
 		headerPayload: append([]byte(nil), enc.Buf...),
 		body:          body,
 	}
@@ -1481,7 +1477,7 @@ func (s *Server) computeH2RootFastResponse(fast bool) {
 			}
 		}
 	}
-	s.h2RootFast = fastResp
+	return fastResp
 }
 
 func (s *Server) lookupStaticHandler(methodIdx int, path string) HandlerFunc {
@@ -1504,57 +1500,6 @@ func (s *Server) lookupStaticHandler(methodIdx int, path string) HandlerFunc {
 		idx = (idx + 1) & mask
 	}
 	return nil
-}
-
-func tlsAlertName(desc byte) string {
-	switch desc {
-	case 0:
-		return "close_notify"
-	case 10:
-		return "unexpected_message"
-	case 20:
-		return "bad_record_mac"
-	case 22:
-		return "record_overflow"
-	case 40:
-		return "handshake_failure"
-	case 42:
-		return "bad_certificate"
-	case 43:
-		return "unsupported_certificate"
-	case 44:
-		return "certificate_revoked"
-	case 45:
-		return "certificate_expired"
-	case 46:
-		return "certificate_unknown"
-	case 47:
-		return "illegal_parameter"
-	case 48:
-		return "unknown_ca"
-	case 50:
-		return "decode_error"
-	case 51:
-		return "decrypt_error"
-	case 70:
-		return "protocol_version"
-	case 71:
-		return "insufficient_security"
-	case 80:
-		return "internal_error"
-	case 90:
-		return "user_canceled"
-	case 109:
-		return "missing_extension"
-	case 110:
-		return "unsupported_extension"
-	case 112:
-		return "unrecognized_name"
-	case 120:
-		return "no_application_protocol"
-	default:
-		return "unknown"
-	}
 }
 
 // SetProxy installs a reverse-proxy engine, replacing any existing one.
@@ -1704,7 +1649,19 @@ func (s *Server) PurgeDomainCache(domain string) int64 {
 // Example: s.OnRequest(func(req *Request, resp *Response) bool { return true })
 // Example: s.OnRequest(func(req *Request, resp *Response) bool { if req.Path == "/blocked" { resp.Status(403); return false }; return true })
 func (s *Server) OnRequest(fn func(*Request, *Response) bool) {
-	s.onRequestHooks = append(s.onRequestHooks, fn)
+	s.hookMu.Lock()
+	next := appendHook(s.onRequestHooks.Load(), fn)
+	s.onRequestHooks.Store(&next)
+	s.hookMu.Unlock()
+	s.computeFastDispatch()
+}
+
+func appendHook[T any](cur *[]T, fn T) []T {
+	var next []T
+	if cur != nil {
+		next = append(make([]T, 0, len(*cur)+1), *cur...)
+	}
+	return append(next, fn)
 }
 
 // OnResponse registers a hook run after each handler completes. Multiple hooks run in registration order.
@@ -1712,7 +1669,11 @@ func (s *Server) OnRequest(fn func(*Request, *Response) bool) {
 // Example: s.OnResponse(func(req *Request, resp *Response) { log.Printf("%s %d", req.Path, resp.StatusCode) })
 // Example: s.OnResponse(func(req *Request, resp *Response) { resp.SetHeader("X-Served-By", "ALOS") })
 func (s *Server) OnResponse(fn func(*Request, *Response)) {
-	s.onResponseHooks = append(s.onResponseHooks, fn)
+	s.hookMu.Lock()
+	next := appendHook(s.onResponseHooks.Load(), fn)
+	s.onResponseHooks.Store(&next)
+	s.hookMu.Unlock()
+	s.computeFastDispatch()
 }
 
 func (s *Server) dispatch(req *Request, resp *Response) {
@@ -1746,9 +1707,11 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}()
 	}
 
-	for _, hook := range s.onRequestHooks {
-		if !hook(req, resp) {
-			return
+	if hooks := s.onRequestHooks.Load(); hooks != nil {
+		for _, hook := range *hooks {
+			if !hook(req, resp) {
+				return
+			}
 		}
 	}
 
@@ -1758,8 +1721,10 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		corsSnap = cors.snapshot.Load()
 	}
 	defer func() {
-		for _, hook := range s.onResponseHooks {
-			hook(req, resp)
+		if hooks := s.onResponseHooks.Load(); hooks != nil {
+			for _, hook := range *hooks {
+				hook(req, resp)
+			}
 		}
 		if s.config.EnableCompress && !req.hijacked {
 			applyConfiguredCompression(req, resp, CompressConfig{

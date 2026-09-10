@@ -1,7 +1,9 @@
 package core
 
 import (
+	"cmp"
 	"compress/gzip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -64,15 +66,15 @@ import (
 //
 //	Example: CacheableStatus: func(code int) bool { return code == 200 || code == 404 }.
 type CacheConfig struct {
-	TTL           time.Duration
-	Methods       []string
-	IgnoreQuery   bool
-	MaxEntries    int
-	MaxBodyBytes  int
-	Gzip          bool
-	GzipMinBytes  int
-	GzipLevel     int
-	SweepInterval time.Duration
+	TTL             time.Duration
+	Methods         []string
+	IgnoreQuery     bool
+	MaxEntries      int
+	MaxBodyBytes    int
+	Gzip            bool
+	GzipMinBytes    int
+	GzipLevel       int
+	SweepInterval   time.Duration
 	CacheableStatus func(int) bool
 }
 
@@ -300,15 +302,7 @@ func (rc *ResponseCache) evictOverflow() {
 		victims = append(victims, aged{key, ent.storedAtNs})
 		return true
 	})
-	for i := 1; i < len(victims); i++ {
-		v := victims[i]
-		j := i - 1
-		for j >= 0 && victims[j].ts > v.ts {
-			victims[j+1] = victims[j]
-			j--
-		}
-		victims[j+1] = v
-	}
+	slices.SortFunc(victims, func(a, b aged) int { return cmp.Compare(a.ts, b.ts) })
 	for i := 0; i < over && i < len(victims); i++ {
 		rc.store.Delete(victims[i].key)
 	}
@@ -379,7 +373,7 @@ func gzipEncode(body []byte, level int) []byte {
 		out = make([]byte, len(buf))
 		copy(out, buf)
 	}
-	*bp = buf[:0]
-	LargeBufPool.Put(bp)
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return out
 }

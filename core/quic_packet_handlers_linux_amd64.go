@@ -184,8 +184,7 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 	connMap.Store(srcCIDKey, qc)
 
 	go qc.recvLoop()
-	go qc.runIdleTimer()
-	go qc.runLossTimer()
+	s.quicTimers.add(qc, s.done)
 
 	quicActiveConns.Add(1)
 	quicHandshakingConns.Add(1)

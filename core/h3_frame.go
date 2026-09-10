@@ -17,6 +17,8 @@ const (
 	h3SettingQPACKBlockedStr   uint64 = 0x07
 )
 
+const h3FrameBufPoolMaxCap = 64 << 10
+
 var h3FrameBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 512); return &b },
 }
@@ -45,12 +47,6 @@ func h3AppendHeadersFrame(dst []byte, encodedHeaders []byte) []byte {
 
 func h3AppendDataFrame(dst []byte, data []byte) []byte {
 	return h3AppendFrame(dst, h3FrameData, data)
-}
-
-func h3AppendGoawayFrame(dst []byte, streamID uint64) []byte {
-	var payload []byte
-	payload = quicAppendVarint(payload, streamID)
-	return h3AppendFrame(dst, h3FrameGoaway, payload)
 }
 
 type h3FrameReader struct {

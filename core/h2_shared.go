@@ -24,8 +24,8 @@ type tlsWorkerH2State struct {
 	appBufOff          int
 	headerAccum        []byte
 	headersBuf         [][2]string
-	pendingBody        map[uint32][]byte
-	sending            map[uint32]*H2Stream
+
+	sending map[uint32]*H2Stream
 
 	rstCount     int
 	rstWindow    int64
@@ -104,39 +104,6 @@ func (st *tlsWorkerH2State) countCtrl() bool {
 	return st.ctrlCount > h2MaxCtrlPerWindow
 }
 
-func (st *tlsWorkerH2State) reset() {
-	if st.streams != nil {
-		for id, stream := range st.streams {
-			stream.Reset()
-			StreamPool.Put(stream)
-			delete(st.streams, id)
-		}
-	}
-	if st.decoder != nil {
-		*st.decoder = HpackDecoder{
-			maxTableSize:    H2HeaderTableSize,
-			protocolMaxSize: H2HeaderTableSize,
-		}
-	}
-	st.initialWindowSize = 0
-	st.maxFrameSize = 0
-	st.connWindow = 0
-	st.recvConnWindow = 0
-	st.pendingConnWindow = 0
-	st.lastStreamID = 0
-	st.prefaceReceived = false
-	st.expectContinuation = 0
-	st.headerEndStream = false
-	st.appBufOff = 0
-	st.headerAccum = shrinkBuffer(st.headerAccum, 4096)
-	clear(st.headersBuf)
-	if cap(st.headersBuf) > 128 {
-		st.headersBuf = nil
-	} else {
-		st.headersBuf = st.headersBuf[:0]
-	}
-}
-
 func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	settings := [5][2]uint32{
 		{uint32(H2SettingHeaderTableSize), s.h2HeaderTableSize()},
@@ -152,7 +119,7 @@ func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	return dst
 }
 
-func appendFastH2RootResponse(dst []byte, fast h2RootFastResponse, streamID uint32, maxFrame int) []byte {
+func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uint32, maxFrame int) []byte {
 	off := len(dst)
 	if len(fast.framed) > 0 {
 		dst = append(dst, fast.framed...)

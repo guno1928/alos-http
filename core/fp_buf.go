@@ -27,11 +27,6 @@ func (bb *byteBuffer) length() int {
 	return len(bb.b) - bb.r
 }
 
-func (bb *byteBuffer) reset() {
-	bb.b = bb.b[:0]
-	bb.r = 0
-}
-
 func (bb *byteBuffer) compact() {
 	if bb.r == 0 {
 		return

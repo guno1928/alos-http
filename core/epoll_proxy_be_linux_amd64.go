@@ -3,8 +3,6 @@
 package core
 
 import (
-	"log"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -50,7 +48,7 @@ func (w *epollWorker) backendEvent(fd int, evs uint32) {
 		}
 	}
 	if evs&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP) != 0 {
-		w.be.readable(c)
+		w.be.readableUntil(c, evs&(unix.EPOLLRDHUP|unix.EPOLLHUP) != 0)
 		if c.state == connClosed {
 			return
 		}
@@ -98,23 +96,11 @@ func (w *epollWorker) abortProxyExchange(c *epollConn) {
 		px.b.ActiveConns.Add(-1)
 		px.b = nil
 	}
-	for _, bc := range w.be.conns {
-		if bc != nil && bc.cur == &px.Exchange {
-			w.be.closeConn(bc, fpErrClientClosed)
-			return
-		}
+	if bc := px.Exchange.bc; bc != nil && bc.cur == &px.Exchange {
+		w.be.closeConn(bc, fpErrClientClosed)
+		return
 	}
 	w.pxPut(px)
-}
-
-func (w *epollWorker) exGet() *Exchange {
-	ex := w.exFree
-	if ex != nil {
-		w.exFree = ex.pnext
-		*ex = Exchange{req: ex.req}
-		return ex
-	}
-	return &Exchange{req: &fpRequest{}}
 }
 
 func (w *epollWorker) exPut(ex *Exchange) {
@@ -127,10 +113,6 @@ func (w *epollWorker) exPut(ex *Exchange) {
 
 // onForwardDone only fires for exchanges carrying an inConn, which belong to
 // the standalone event loop. Worker-hosted exchanges never set one.
-func (w *epollWorker) onForwardDone(ex *Exchange) {
-	log.Printf("[EPOLL-BUG] worker %d: inbound completion on a worker exchange", w.coreID)
-	w.exPut(ex)
-}
 
 // exchangeDone delivers a fully buffered upstream response to the client. It is
 // the terminal callback for exchanges that carry neither an inConn nor a done

@@ -72,7 +72,7 @@ func TestProxyCache_EntryEvictionNoWipeNoFreeze(t *testing.T) {
 }
 
 func TestQUICStreamReassembly_OutOfOrder(t *testing.T) {
-	s := &QUICStream{maxRecv: 1 << 20}
+	s := &QUICStream{maxRecv: 1 << 20, recvGranted: 1 << 20}
 	s.handleStreamFrame(quicStreamFrame{offset: 5, data: []byte("WORLD")})
 	if len(s.recvBuf) != 0 {
 		t.Fatalf("out-of-order frame should not be readable yet, got %q", s.recvBuf)
@@ -87,7 +87,7 @@ func TestQUICStreamReassembly_OutOfOrder(t *testing.T) {
 }
 
 func TestQUICStreamReassembly_Duplicate(t *testing.T) {
-	s := &QUICStream{maxRecv: 1 << 20}
+	s := &QUICStream{maxRecv: 1 << 20, recvGranted: 1 << 20}
 	s.handleStreamFrame(quicStreamFrame{offset: 0, data: []byte("ABCDEF")})
 	s.handleStreamFrame(quicStreamFrame{offset: 2, data: []byte("CDE")})
 	if string(s.recvBuf) != "ABCDEF" {
@@ -99,7 +99,7 @@ func TestQUICStreamReassembly_Duplicate(t *testing.T) {
 }
 
 func TestQUICStreamReassembly_MultiGap(t *testing.T) {
-	s := &QUICStream{maxRecv: 1 << 20}
+	s := &QUICStream{maxRecv: 1 << 20, recvGranted: 1 << 20}
 	s.handleStreamFrame(quicStreamFrame{offset: 8, data: []byte("IJ")})
 	s.handleStreamFrame(quicStreamFrame{offset: 4, data: []byte("EFGH")})
 	s.handleStreamFrame(quicStreamFrame{offset: 0, data: []byte("ABCD")})

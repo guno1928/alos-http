@@ -28,17 +28,16 @@ const (
 )
 
 type quicPacketHeader struct {
-	pktType     int
-	version     uint32
-	dcid        []byte
-	scid        []byte
-	token       []byte
-	pn          uint64
-	pnLen       int
-	pnOffset    int
-	payloadOff  int
-	payloadLen  int
-	headerBytes []byte
+	pktType    int
+	version    uint32
+	dcid       []byte
+	scid       []byte
+	token      []byte
+	pn         uint64
+	pnLen      int
+	pnOffset   int
+	payloadOff int
+	payloadLen int
 }
 
 func quicParseLongHeader(data []byte) (hdr quicPacketHeader, total int, err error) {
@@ -133,17 +132,6 @@ func quicParseShortHeader(data []byte, dcidLen int) (hdr quicPacketHeader, err e
 
 func quicIsLongHeader(data []byte) bool {
 	return len(data) > 0 && data[0]&quicLongHeaderBit != 0
-}
-
-func quicIsInitialPacket(data []byte) bool {
-	if len(data) < 5 {
-		return false
-	}
-	if data[0]&quicLongHeaderBit == 0 {
-		return false
-	}
-	longType := (data[0] & 0x30) >> 4
-	return longType == quicInitialType
 }
 
 func quicBuildLongHeader(dst []byte, pktType byte, version uint32, dcid, scid, token []byte, pnLen int) []byte {

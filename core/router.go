@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -128,7 +129,7 @@ type Router struct {
 	globalMiddleware        []MiddlewareFunc
 	wrappedNotFound         HandlerFunc
 	wrappedMethodNotAllowed HandlerFunc
-	built                   bool
+	built                   atomic.Bool
 	buildOnce               sync.Once
 	server                  *Server
 }
@@ -424,7 +425,7 @@ func (r *Router) build() {
 			}
 		}
 	}
-	r.built = true
+	r.built.Store(true)
 }
 
 func collectStaticRoutes(n *node, prefix string, out *[]staticEntry) {
@@ -469,13 +470,13 @@ func (r *Router) buildNode(n *node, inheritedCatchAll *node) {
 func (r *Router) Lookup(method, path string, req *Request) HandlerFunc {
 	idx := methodIndex(method)
 	if idx < 0 {
-		if r.built {
+		if r.built.Load() {
 			return r.wrappedNotFound
 		}
 		return r.notFound
 	}
 
-	if r.built {
+	if r.built.Load() {
 		return r.lookupBuilt(idx, path, req)
 	}
 
@@ -990,7 +991,7 @@ func (r *Router) Match(method, path string) bool {
 	if idx < 0 {
 		return false
 	}
-	if r.built {
+	if r.built.Load() {
 		root := r.trees[idx]
 		if root == nil {
 			return false

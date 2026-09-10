@@ -158,6 +158,7 @@ func (l *beLoop) idlePut(c *backendConn) {
 	if idleTimeout <= 0 {
 		idleTimeout = l.cfg.IdleTimeout.Nanoseconds()
 	}
+	l.resumeBackendRead(c)
 	c.inIdle = true
 	c.reused = false
 	c.idleDeadline = l.nowNano() + idleTimeout
@@ -315,35 +316,6 @@ func (h respHeaders) intValue(i int) (int64, bool) {
 // The H1 parser lowercases names in place, so the byte forms compare directly.
 // Go allocates nothing for string(b) in a comparison or a switch.
 func headerNameIsBytes(name []byte, lower string) bool { return string(name) == lower }
-
-func isHopByHopBytes(name []byte) bool {
-	switch string(name) {
-	case "connection", "keep-alive", "te", "trailer", "transfer-encoding",
-		"upgrade", "proxy-authenticate", "proxy-authorization":
-		return true
-	}
-	return false
-}
-
-func isHopByHopStr(name string) bool {
-	switch len(name) {
-	case 7:
-		return headerNameIs(name, "upgrade") || headerNameIs(name, "trailer")
-	case 10:
-		return headerNameIs(name, "connection") || headerNameIs(name, "keep-alive")
-	case 12:
-		return headerNameIs(name, "te")
-	case 17:
-		return headerNameIs(name, "transfer-encoding")
-	case 18:
-		return headerNameIs(name, "proxy-authenticate")
-	case 19:
-		return headerNameIs(name, "proxy-authorization")
-	case 2:
-		return headerNameIs(name, "te")
-	}
-	return false
-}
 
 // fpIsClientForwardedHeader reports whether a client-supplied header claims to
 // describe the original caller. Such a claim is never trustworthy and is

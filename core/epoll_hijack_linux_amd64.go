@@ -41,57 +41,7 @@ func (w *epollWorker) detachConnFd(c *epollConn) (net.Conn, bool) {
 	return nc, true
 }
 
-func (w *epollWorker) tlsH1Attacher(c *epollConn, consumed int) func(*Request) net.Conn {
-	return func(req *Request) net.Conn {
-		if req.connTakenOver {
-			return req.conn
-		}
-		reader := c.appReader
-		writer := c.appWriter
-		rawPrefix := append([]byte(nil), c.readBuf[:c.readN]...)
-		decOff := c.appBufOff + consumed
-		var decryptedPrefix []byte
-		if decOff < len(c.appBuf) {
-			decryptedPrefix = append([]byte(nil), c.appBuf[decOff:]...)
-		}
-		nc, ok := w.detachConnFd(c)
-		if !ok {
-			return nil
-		}
-		req.tlsReader = reader
-		req.tlsWriter = writer
-		req.hdrBuf = make([]byte, 5)
-		req.hijackReadBuf = decryptedPrefix
-		handed := net.Conn(nc)
-		if len(rawPrefix) > 0 {
-			handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(rawPrefix), nc)}
-		}
-		ipKey, fromInFlight := w.handoffIPSlot(c, req)
-		tracked := w.server.trackHandoffConn(handed, ipKey, fromInFlight)
-		if tracked == nil {
-			_ = nc.Close()
-			return nil
-		}
-		c.ipHeld = false
-		c.ipKey = ""
-		req.connTakenOver = true
-		req.attachConn = nil
-		req.conn = tracked
-		return tracked
-	}
-}
-
-func (w *epollWorker) handoffIPSlot(c *epollConn, req *Request) (string, bool) {
-	if w.server.trustedProxies.active {
-		if w.server.perIPLimiter == nil {
-			return "", false
-		}
-		return extractIP(req.RemoteAddr), true
-	}
-	return c.ipKey, false
-}
-
-func (w *epollWorker) plainH1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
+func (w *epollWorker) h1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
 	return func(req *Request) net.Conn {
 		if req.connTakenOver {
 			return req.conn
@@ -102,28 +52,70 @@ func (w *epollWorker) plainH1Attacher(c *epollConn, gen uint32) func(*Request) n
 			if c.fd < 0 || c.generation != gen {
 				return
 			}
-			prefix := append([]byte(nil), c.readBuf[c.h1Off:c.readN]...)
-			nc, ok := w.detachConnFd(c)
-			if !ok {
-				return
-			}
-			handed := nc
-			if len(prefix) > 0 {
-				handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(prefix), nc)}
-			}
-			ipKey, fromInFlight := w.handoffIPSlot(c, req)
-			tracked := w.server.trackHandoffConn(handed, ipKey, fromInFlight)
-			if tracked == nil {
-				_ = nc.Close()
-				return
-			}
-			c.ipHeld = false
-			c.ipKey = ""
-			req.connTakenOver = true
-			req.attachConn = nil
-			req.conn = tracked
+			w.handoffH1Conn(c, req)
 		})
 		<-done
 		return req.conn
 	}
+}
+
+func (w *epollWorker) inlineH1Attacher(c *epollConn) func(*Request) net.Conn {
+	return func(req *Request) net.Conn {
+		if req.connTakenOver {
+			return req.conn
+		}
+		if c.fd >= 0 {
+			w.handoffH1Conn(c, req)
+		}
+		return req.conn
+	}
+}
+
+func (w *epollWorker) handoffH1Conn(c *epollConn, req *Request) {
+	var rawPrefix, decryptedPrefix []byte
+	if c.tls {
+		rawPrefix = append([]byte(nil), c.readBuf[:c.readN]...)
+		if c.appBufOff < len(c.appBuf) {
+			decryptedPrefix = append([]byte(nil), c.appBuf[c.appBufOff:]...)
+		}
+	} else {
+		rawPrefix = append([]byte(nil), c.readBuf[c.h1Off:c.readN]...)
+	}
+	reader := c.appReader
+	writer := c.appWriter
+	nc, ok := w.detachConnFd(c)
+	if !ok {
+		return
+	}
+	if c.tls {
+		req.tlsReader = reader
+		req.tlsWriter = writer
+		req.hdrBuf = make([]byte, 5)
+		req.hijackReadBuf = decryptedPrefix
+	}
+	handed := net.Conn(nc)
+	if len(rawPrefix) > 0 {
+		handed = &prefixConn{Conn: nc, reader: io.MultiReader(bytes.NewReader(rawPrefix), nc)}
+	}
+	ipKey, fromInFlight := w.handoffIPSlot(c, req)
+	tracked := w.server.trackHandoffConn(handed, ipKey, fromInFlight)
+	if tracked == nil {
+		_ = nc.Close()
+		return
+	}
+	c.ipHeld = false
+	c.ipKey = ""
+	req.connTakenOver = true
+	req.attachConn = nil
+	req.conn = tracked
+}
+
+func (w *epollWorker) handoffIPSlot(c *epollConn, req *Request) (string, bool) {
+	if w.server.trustedProxies.active {
+		if w.server.perIPLimiter == nil {
+			return "", false
+		}
+		return extractIP(req.RemoteAddr), true
+	}
+	return c.ipKey, false
 }

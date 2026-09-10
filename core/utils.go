@@ -263,24 +263,6 @@ var hexValid = [256]bool{
 	'A': true, 'B': true, 'C': true, 'D': true, 'E': true, 'F': true,
 }
 
-func parseHex64(s string) (int64, bool) {
-	if len(s) == 0 {
-		return 0, false
-	}
-	var n int64
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !hexValid[c] {
-			return 0, false
-		}
-		n = n<<4 | int64(hexLookup[c])
-		if n < 0 || n > maxParsedLength {
-			return 0, false
-		}
-	}
-	return n, true
-}
-
 func parseHex64Bytes(b []byte) (int64, bool) {
 	if len(b) == 0 {
 		return 0, false
@@ -324,14 +306,6 @@ func trimASCIISpace(s string) string {
 		end--
 	}
 	return s[start:end]
-}
-
-func trimRight(s string, cutset byte) string {
-	end := len(s)
-	for end > 0 && (s[end-1] == cutset || s[end-1] == '\r' || s[end-1] == '\n') {
-		end--
-	}
-	return s[:end]
 }
 
 func indexByte(s string, c byte) int {

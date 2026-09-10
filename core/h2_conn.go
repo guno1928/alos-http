@@ -628,12 +628,6 @@ func (hc *H2Conn) processSettings(payload []byte) {
 				stream.Window.Store(newWindow)
 				return true
 			})
-		case H2SettingHeaderTableSize:
-			if val > 65536 {
-				val = 65536
-			}
-			hc.decoder.protocolMaxSize = int(val)
-			hc.decoder.setMaxSize(int(val))
 		}
 	}
 }
@@ -698,7 +692,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		return
 	}
 
-	if endStream && hc.server.h2RootFast.enabled && matchIndexedH2FastRootHeaderBlock(headerBlock) {
+	if endStream && hc.server.h2RootFast.Load() != nil && matchIndexedH2FastRootHeaderBlock(headerBlock) {
 		if hc.server.tryAcquireRequestSlot() {
 			hc.lastStreamID.Store(streamID)
 			if hc.server.logRequests.Load() {
@@ -712,33 +706,38 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 		}
 	}
 
-	if endStream && hc.server.h2RootFast.enabled {
-		meta, ok, err := hc.decoder.DecodeFastRootRequest(headerBlock)
-		if err != nil {
-			hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrCompression))
+	fastRoot := endStream && hc.server.h2RootFast.Load() != nil
+	if fastRoot && hc.decoder.MemoizedRootRequest(headerBlock) {
+		if hc.server.tryAcquireRequestSlot() {
+			hc.lastStreamID.Store(streamID)
+			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
+			hc.writeFastH2RootResponse(streamID)
+			hc.server.releaseRequestSlot()
 			return
-		}
-		if ok {
-			if hc.server.tryAcquireRequestSlot() {
-				hc.lastStreamID.Store(streamID)
-				if hc.server.logRequests.Load() {
-					log.Printf("[H2] stream %d: %s %s (fast meta)", streamID, meta.method, meta.path)
-				}
-				Stats.TotalReqs.Add(1)
-				Stats.RawReqs.Add(1)
-				hc.writeFastH2RootResponse(streamID)
-				hc.server.releaseRequestSlot()
-				return
-			}
 		}
 	}
 
-	headers, meta, err := hc.decoder.DecodeIntoRequest(hc.headersBuf[:0], headerBlock)
+	headers, meta, isRoot, err := hc.decoder.DecodeRequest(hc.headersBuf[:0], headerBlock)
 	if err != nil {
-		hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrCompression))
+		hc.sendGoAway(H2ErrCompression)
+		hc.conn.Close()
 		return
 	}
 	hc.headersBuf = headers[:0]
+	if fastRoot && isRoot {
+		if hc.server.tryAcquireRequestSlot() {
+			hc.lastStreamID.Store(streamID)
+			if hc.server.logRequests.Load() {
+				log.Printf("[H2] stream %d: %s %s (fast meta)", streamID, meta.method, meta.path)
+			}
+			Stats.TotalReqs.Add(1)
+			Stats.RawReqs.Add(1)
+			hc.writeFastH2RootResponse(streamID)
+			hc.server.releaseRequestSlot()
+			return
+		}
+	}
 
 	if len(headers) > 128 {
 		hc.enqueueWrite(H2WriteRSTStream(nil, streamID, H2ErrEnhanceYourCalm))
@@ -746,7 +745,7 @@ func (hc *H2Conn) processDecodedHeaders(streamID uint32, headerBlock []byte, end
 	}
 	hc.lastStreamID.Store(streamID)
 
-	if endStream && hc.server.h2RootFast.enabled && meta.method == "GET" && meta.path == "/" {
+	if endStream && hc.server.h2RootFast.Load() != nil && meta.method == "GET" && meta.path == "/" {
 		if hc.server.tryAcquireRequestSlot() {
 			if hc.server.logRequests.Load() {
 				log.Printf("[H2] stream %d: %s %s (fast)", streamID, meta.method, meta.path)
@@ -916,7 +915,7 @@ func (hc *H2Conn) handleData(f *H2Frame) {
 			hc.sendWindowUpdate(0, connUpdate)
 		}
 	}
-	if maxBody <= 0 || int64(len(stream.Body)) < maxBody {
+	if connConsumed > 0 && f.Flags&H2FlagEndStream == 0 && (maxBody <= 0 || int64(len(stream.Body)) < maxBody) {
 		stream.RecvWindow += int64(connConsumed)
 		hc.sendWindowUpdate(f.StreamID, connConsumed)
 	}
@@ -964,6 +963,7 @@ func (hc *H2Conn) dispatchRequest(stream *H2Stream) {
 	req.cachedHost = stream.Auth
 	req.headerCacheMask = headerCacheHost
 	req.RemoteAddr = hc.remoteAddr
+	req.IsTLS = !hc.plain
 	req.server = hc.server
 
 	resp := ResponsePool.Get().(*Response)
@@ -1017,8 +1017,8 @@ func (hc *H2Conn) finishResponse(stream *H2Stream, req *Request, resp *Response)
 }
 
 func (hc *H2Conn) writeFastH2RootResponse(streamID uint32) {
-	fast := hc.server.h2RootFast
-	if !fast.enabled {
+	fast := hc.server.h2RootFast.Load()
+	if fast == nil {
 		return
 	}
 	fbp := H2FrameBufPool.Get().(*[]byte)

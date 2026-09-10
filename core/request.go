@@ -94,6 +94,7 @@ type Request struct {
 	headerCacheMask uint32
 
 	IsH2          bool
+	IsTLS         bool
 	hijacked      bool
 	connTakenOver bool
 	queryParsed   bool
@@ -158,6 +159,7 @@ func (r *Request) Reset() {
 	r.Body = shrinkBuffer(r.Body, 1024)
 	r.StreamID = 0
 	r.IsH2 = false
+	r.IsTLS = false
 	for i := 0; i < r.ParamCount && i < len(r.Params); i++ {
 		r.Params[i] = Param{}
 	}
@@ -189,24 +191,16 @@ func (r *Request) Reset() {
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
 	r.queryParsed = false
-	for k := range r.queryCache {
-		delete(r.queryCache, k)
-	}
+	clear(r.queryCache)
 	r.formParsed = false
-	for k := range r.formCache {
-		delete(r.formCache, k)
-	}
+	clear(r.formCache)
 	r.filesParsed = false
-	for k := range r.filesCache {
-		delete(r.filesCache, k)
-	}
+	clear(r.filesCache)
 	r.cookiesParsed = false
 	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
-	for k := range r.store {
-		delete(r.store, k)
-	}
+	clear(r.store)
 }
 
 func (r *Request) resetFastH1() {
@@ -264,24 +258,16 @@ func (r *Request) resetFastH1() {
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
 	r.queryParsed = false
-	for k := range r.queryCache {
-		delete(r.queryCache, k)
-	}
+	clear(r.queryCache)
 	r.formParsed = false
-	for k := range r.formCache {
-		delete(r.formCache, k)
-	}
+	clear(r.formCache)
 	r.filesParsed = false
-	for k := range r.filesCache {
-		delete(r.filesCache, k)
-	}
+	clear(r.filesCache)
 	r.cookiesParsed = false
 	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
-	for k := range r.store {
-		delete(r.store, k)
-	}
+	clear(r.store)
 }
 
 func (r *Request) ensureConn() net.Conn {
@@ -568,6 +554,20 @@ func (r *Request) GetString(key string) string {
 	}
 	s, _ := v.(string)
 	return s
+}
+
+func (r *Request) detachLazyCaches() {
+	r.cookiesCache = nil
+	r.cookiesParsed = false
+	r.queryCache = nil
+	r.queryParsed = false
+	r.formCache = nil
+	r.formParsed = false
+	r.filesCache = nil
+	r.filesParsed = false
+	r.promoteBuf = nil
+	r.promoteOff = 0
+	r.hijackReadBuf = nil
 }
 
 func (r *Request) parseCookiesLazy() {

@@ -14,6 +14,7 @@ const (
 	quicTimerGranularity = time.Millisecond
 	quicPktThreshold     = 3
 	quicTimeThreshold    = 9.0 / 8.0
+	quicMaxTrackedSent   = 16384
 )
 
 type quicSentPacket struct {
@@ -39,7 +40,6 @@ type quicLossState struct {
 	firstRTTDone bool
 
 	largestAcked [3]int64
-	lossTime     [3]time.Time
 
 	sent          [3][]quicSentPacket
 	bytesInFlight int
@@ -47,9 +47,7 @@ type quicLossState struct {
 	cwnd     uint64
 	ssthresh uint64
 
-	ptoCount    int
-	ptoTimerSet bool
-	ptoDeadline time.Time
+	ptoCount int
 }
 
 func newQuicLossState() *quicLossState {
@@ -68,7 +66,7 @@ func newQuicLossState() *quicLossState {
 
 func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit bool, frames []byte) {
 	var framesBuf *[]byte
-	stored := frames
+	var stored []byte
 	if ackElicit && len(frames) > 0 {
 		framesBuf = quicFramePool.Get().(*[]byte)
 		*framesBuf = append((*framesBuf)[:0], frames...)
@@ -77,12 +75,6 @@ func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit 
 	now := turbo.Now()
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	if len(ls.sent[space]) >= 4096 {
-		if framesBuf != nil {
-			quicFramePool.Put(framesBuf)
-		}
-		return
-	}
 	sp := quicSentPacket{
 		pn:        pn,
 		sent:      now,
@@ -257,19 +249,17 @@ func (ls *quicLossState) ptoTimeout() time.Duration {
 	return pto * time.Duration(1<<uint(ls.ptoCount))
 }
 
-func (ls *quicLossState) hasUnackedCrypto(space int) bool {
-	for i := range ls.sent[space] {
-		if ls.sent[space][i].ackElicit {
-			return true
-		}
-	}
-	return false
+func (ls *quicLossState) hasSentPackets(space int) bool {
+	ls.mu.Lock()
+	n := len(ls.sent[space])
+	ls.mu.Unlock()
+	return n > 0
 }
 
 func (ls *quicLossState) canSend() bool {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	return uint64(ls.bytesInFlight) < ls.cwnd
+	return uint64(ls.bytesInFlight) < ls.cwnd && len(ls.sent[quicSpaceAppData]) < quicMaxTrackedSent
 }
 
 func (ls *quicLossState) largestAckedPN(space int) int64 {

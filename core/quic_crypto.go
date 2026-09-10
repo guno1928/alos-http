@@ -3,7 +3,6 @@ package core
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
 	"hash"
@@ -56,31 +55,6 @@ func (c *chachaHeaderProtector) mask(sample []byte) [5]byte {
 	var out [5]byte
 	cipher.XORKeyStream(out[:], out[:])
 	return out
-}
-
-func quicExpandLabel(h func() hash.Hash, secret []byte, label string, ctx []byte, length int) []byte {
-	const prefix = "quic "
-	fullLen := len(prefix) + len(label)
-	infoLen := 2 + 1 + fullLen + 1 + len(ctx)
-	var infoBuf [128]byte
-	var info []byte
-	if infoLen <= len(infoBuf) {
-		info = infoBuf[:infoLen]
-	} else {
-		info = make([]byte, infoLen)
-	}
-	info[0] = byte(length >> 8)
-	info[1] = byte(length)
-	info[2] = byte(fullLen)
-	copy(info[3:], prefix)
-	copy(info[3+len(prefix):], label)
-	info[3+fullLen] = byte(len(ctx))
-	copy(info[3+fullLen+1:], ctx)
-
-	mac := hmac.New(h, secret)
-	mac.Write(info)
-	mac.Write(hkdfExpandOneByte[:])
-	return mac.Sum(nil)[:length]
 }
 
 func quicDeriveKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*quicKeys, error) {
@@ -143,14 +117,6 @@ func quicDeriveInitialKeys(dcid []byte) (client, server *quicKeys, err error) {
 
 func quicDeriveNextTrafficSecret(h func() hash.Hash, currentSecret []byte, hashLen int) []byte {
 	return TLSExpandLabel(h, currentSecret, "quic ku", nil, hashLen)
-}
-
-func quicDeriveHandshakeKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*quicKeys, error) {
-	return quicDeriveKeys(h, secret, cs)
-}
-
-func quicDeriveAppKeys(h func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*quicKeys, error) {
-	return quicDeriveKeys(h, secret, cs)
 }
 
 func (qk *quicKeys) encrypt(dst, header, payload []byte, pn uint64, pnOffset int) []byte {

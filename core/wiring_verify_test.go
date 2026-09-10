@@ -174,8 +174,8 @@ func TestRootFastServerName(t *testing.T) {
 		s.Router.GET("/", func(req *Request, resp *Response) { resp.String("ok") })
 		s.Router.Build()
 		s.computePlainRootFastResponse(true)
-		if !s.plainRootFast.enabled || !strings.Contains(string(s.plainRootFast.getKeepAlive), "Server: Zed\r\n") {
-			t.Fatalf("root fast custom name failed:\n%s", s.plainRootFast.getKeepAlive)
+		if fast := s.plainRootFast.Load(); fast == nil || !strings.Contains(string(fast.getKeepAlive), "Server: Zed\r\n") {
+			t.Fatalf("root fast custom name failed")
 		}
 	})
 	t.Run("default", func(t *testing.T) {
@@ -183,8 +183,8 @@ func TestRootFastServerName(t *testing.T) {
 		s.Router.GET("/", func(req *Request, resp *Response) { resp.String("ok") })
 		s.Router.Build()
 		s.computePlainRootFastResponse(true)
-		if !strings.Contains(string(s.plainRootFast.getKeepAlive), "Server: ALOS\r\n") {
-			t.Fatalf("root fast default name failed:\n%s", s.plainRootFast.getKeepAlive)
+		if fast := s.plainRootFast.Load(); fast == nil || !strings.Contains(string(fast.getKeepAlive), "Server: ALOS\r\n") {
+			t.Fatalf("root fast default name failed")
 		}
 	})
 }

@@ -85,11 +85,12 @@ func TestRootFastPathUsesServerName(t *testing.T) {
 	s.Router.GET("/", func(req *Request, resp *Response) { resp.String("hi") })
 	s.Router.Build()
 	s.computePlainRootFastResponse(true)
-	if !s.plainRootFast.enabled {
+	fast := s.plainRootFast.Load()
+	if fast == nil {
 		t.Fatal("root fast response not enabled")
 	}
-	if !strings.Contains(string(s.plainRootFast.getKeepAlive), "Server: MyServer\r\n") {
-		t.Fatalf("root fast response missing custom Server header:\n%s", s.plainRootFast.getKeepAlive)
+	if !strings.Contains(string(fast.getKeepAlive), "Server: MyServer\r\n") {
+		t.Fatalf("root fast response missing custom Server header:\n%s", fast.getKeepAlive)
 	}
 }
 

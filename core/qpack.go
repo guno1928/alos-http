@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	qpackBlockCacheMaxEntries = 1024
-	qpackBlockCacheMaxBytes   = 1 << 20
+	qpackBlockCacheMaxEntries  = 1024
+	qpackBlockCacheMaxBytes    = 1 << 20
 	qpackPrefixCacheMaxEntries = 512
 )
 
@@ -180,10 +180,6 @@ func (e *QPACKEncoder) encodeRequiredInsertCount() {
 	e.buf = append(e.buf, 0x00, 0x00)
 }
 
-func (e *QPACKEncoder) encodeIndexed(idx int) {
-	e.buf = append(e.buf, 0xc0|byte(idx))
-}
-
 func (e *QPACKEncoder) encodeIndexedLarge(idx int) {
 	e.encodeQPACKInt(0xc0, 6, uint64(idx))
 }
@@ -324,6 +320,8 @@ func (e *QPACKEncoder) EncodeHeader(name, value string) {
 // QPACKDecoder decodes QPACK-encoded HTTP/3 header blocks (RFC 9204) using
 // the static table only; it does not maintain a dynamic table.
 type QPACKDecoder struct{}
+
+const qpackArenaPoolMaxCap = 64 << 10
 
 var qpackArenaPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 4096); return &b },
@@ -470,6 +468,7 @@ func qpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	return HpackDecodeInt(data, prefixBits)
 }
 
+const qpackEncodeBufPoolMaxCap = 16 << 10
 
 var qpackEncodeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 256); return &b },
