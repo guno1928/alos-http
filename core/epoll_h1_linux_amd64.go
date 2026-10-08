@@ -117,7 +117,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 	maxRead := srv.effectiveReadCap()
 	proxyActive := srv.httpRouter != nil
 	for len(c.h1Unread()) > 0 {
-		if c.h1PendingWrite(out) > epollMaxPendingWrite {
+		if c.h1PendingWrite(out) > c.worker.maxPendingWrite {
 			return out, h1StepClose
 		}
 		data := c.h1Unread()
@@ -253,7 +253,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 		c.req.connTakenOver = false
 		if srv.config.InlineHandlers {
-			c.req.attachConn = w.inlineH1Attacher(c)
+			c.req.attachConn = w.cachedInlineH1Attacher(c)
 			promoteRequestStrings(&c.req)
 			c.runH1Inline(srv)
 			if c.req.connTakenOver {
@@ -277,7 +277,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			}
 			continue
 		}
-		c.req.attachConn = w.h1Attacher(c, gen)
+		c.req.attachConn = w.cachedH1Attacher(c, gen)
 		promoteRequestStrings(&c.req)
 		cc := c
 		fast := srv.fastDispatch.Load()

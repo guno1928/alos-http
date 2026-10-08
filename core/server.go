@@ -71,6 +71,15 @@ var timeNow = time.Now
 //
 //	Example: MaxInFlightBodyBytes: 32 << 20.
 //
+// MaxPendingWriteBytes caps the outbound bytes a single connection may buffer
+// before the server applies backpressure (closing an over-buffered HTTP/1.1
+// connection, sending GOAWAY on HTTP/2). 0 applies an 8 MiB default. Under many
+// slow-draining connections total peak RAM is bounded by this value times the
+// connection count, so lower it to cap backpressure memory on memory-constrained
+// hosts serving large responses.
+//
+//	Example: MaxPendingWriteBytes: 2 << 20.
+//
 // MaxHeaderSize is the maximum header block in bytes; defaults to 8192.
 //
 //	Example: MaxHeaderSize: 16384.
@@ -257,6 +266,7 @@ type Config struct {
 	MaxReadSize          int64
 	MaxWriteSize         int64
 	MaxInFlightBodyBytes int64
+	MaxPendingWriteBytes int64
 	MaxHeaderSize        int
 	MaxHeaderCount       int
 	MaxRequestsPerIP     int64

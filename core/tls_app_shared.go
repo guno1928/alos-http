@@ -24,6 +24,22 @@ func nextTLSRecord(buf []byte) (byte, []byte, int, bool, error) {
 	return ct, buf[5:totalLen], totalLen, true, nil
 }
 
+const tlsRecordHeaderLen = 5
+
+func ensureTailCap(dst []byte, need int) []byte {
+	if cap(dst)-len(dst) >= need {
+		return dst
+	}
+	want := len(dst) + need
+	newCap := cap(dst) * 2
+	if newCap < want {
+		newCap = want
+	}
+	grown := make([]byte, len(dst), newCap)
+	copy(grown, dst)
+	return grown
+}
+
 func appendTLSInnerRecord(dst []byte, writer *TrafficAEAD, innerPayload []byte) []byte {
 	ciphertextLen := len(innerPayload) + writer.Overhead()
 	dst = append(dst, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
@@ -38,6 +54,8 @@ func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []b
 	if len(payload) == 0 {
 		return dst
 	}
+	records := (len(payload) + maxContent - 1) / maxContent
+	dst = ensureTailCap(dst, len(payload)+records*(tlsRecordHeaderLen+1+writer.Overhead()))
 	scratch := acquirePooledBuf(&tlsScratchPool)
 	if cap(scratch) < MaxRecordPayload {
 		scratch = make([]byte, 0, MaxRecordPayload)

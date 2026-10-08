@@ -15,7 +15,7 @@ func (c *epollConn) epollProcessH2Frames(srv *Server) int {
 	}
 
 	for {
-		if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {
+		if len(c.writeBuf)-c.writeSent > c.worker.maxPendingWrite {
 			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 			return epollActionCloseAfterFlush
 		}
@@ -589,7 +589,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		st.sending[streamID] = stream
 		stream.stallBytes = len(resp.transmittedBodyBytes())
 		st.sendingBytes += int64(stream.stallBytes)
-		if st.sendingBytes > epollMaxPendingWrite {
+		if st.sendingBytes > int64(w.maxPendingWrite) {
 			c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 			c.closeAfter = true
 		}

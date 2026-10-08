@@ -384,6 +384,12 @@ func buildTLS12AppDataRecords(dst []byte, w *tls12AEAD, payload []byte) []byte {
 	if w == nil || len(payload) == 0 {
 		return dst
 	}
+	perRecord := tls12RecordHeaderLen + w.aead.Overhead()
+	if !w.isChaCha {
+		perRecord += tls12ExplicitNonceLen
+	}
+	records := (len(payload) + MaxRecordPayload - 1) / MaxRecordPayload
+	dst = ensureTailCap(dst, len(payload)+records*perRecord)
 	for len(payload) > 0 {
 		chunk := payload
 		if len(chunk) > MaxRecordPayload {

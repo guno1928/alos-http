@@ -41,6 +41,23 @@ func (w *epollWorker) detachConnFd(c *epollConn) (net.Conn, bool) {
 	return nc, true
 }
 
+func (w *epollWorker) cachedH1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
+	if c.h1AttacherFn == nil || c.h1AttacherGen != gen || c.h1AttacherInline {
+		c.h1AttacherFn = w.h1Attacher(c, gen)
+		c.h1AttacherGen = gen
+		c.h1AttacherInline = false
+	}
+	return c.h1AttacherFn
+}
+
+func (w *epollWorker) cachedInlineH1Attacher(c *epollConn) func(*Request) net.Conn {
+	if c.h1AttacherFn == nil || !c.h1AttacherInline {
+		c.h1AttacherFn = w.inlineH1Attacher(c)
+		c.h1AttacherInline = true
+	}
+	return c.h1AttacherFn
+}
+
 func (w *epollWorker) h1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
 	return func(req *Request) net.Conn {
 		if req.connTakenOver {

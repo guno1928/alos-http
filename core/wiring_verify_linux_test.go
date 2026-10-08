@@ -68,3 +68,29 @@ func TestEpollWorkerTimeoutConfigWiring(t *testing.T) {
 		t.Fatalf("TLS handshake timeout = %v", time.Duration(got))
 	}
 }
+
+func TestEpollWorkerMaxPendingWriteWiring(t *testing.T) {
+	def := New(Config{MaxConnsPerIP: -1})
+	wd, err := newEpollWorker(def, "127.0.0.1:0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(wd.listenerFD)
+	defer unix.Close(wd.epfd)
+	defer unix.Close(wd.wakeFd)
+	if wd.maxPendingWrite != epollMaxPendingWriteDefault {
+		t.Fatalf("default maxPendingWrite = %d, want %d", wd.maxPendingWrite, epollMaxPendingWriteDefault)
+	}
+
+	custom := New(Config{MaxConnsPerIP: -1, MaxPendingWriteBytes: 2 << 20})
+	wc, err := newEpollWorker(custom, "127.0.0.1:0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(wc.listenerFD)
+	defer unix.Close(wc.epfd)
+	defer unix.Close(wc.wakeFd)
+	if wc.maxPendingWrite != 2<<20 {
+		t.Fatalf("custom maxPendingWrite = %d, want %d", wc.maxPendingWrite, 2<<20)
+	}
+}

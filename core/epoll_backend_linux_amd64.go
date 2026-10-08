@@ -78,6 +78,10 @@ type epollConn struct {
 	h1BodyAccounted int64
 	chunkScanPos    int
 
+	h1AttacherFn     func(*Request) net.Conn
+	h1AttacherGen    uint32
+	h1AttacherInline bool
+
 	// proxyEx is the in-flight upstream exchange for this connection, and
 	// pausedBackend the backend socket whose reads were disarmed because this
 	// client fell behind while a response was being relayed.
@@ -273,6 +277,7 @@ type epollWorker struct {
 	handshakeTO     int64
 	writeTO         int64
 	idleTO          int64
+	maxPendingWrite int
 	lastSweep       int64
 	be              beLoop
 	beCfg           fpConfig
@@ -431,6 +436,10 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 	w.handshakeTO = int64(optionalDuration(s.config.HandshakeTimeout, 30*time.Second))
 	w.writeTO = int64(s.config.WriteTimeout)
 	w.idleTO = int64(s.config.IdleTimeout)
+	w.maxPendingWrite = epollMaxPendingWriteDefault
+	if s.config.MaxPendingWriteBytes > 0 {
+		w.maxPendingWrite = int(s.config.MaxPendingWriteBytes)
+	}
 	w.pool.prewarm(minPrealloc)
 	w.initBackendLoop()
 	s.addShutdownWaker(w)
@@ -1018,7 +1027,7 @@ func (c *epollConn) epollProcess(srv *Server) int {
 	return c.epollProcessH2Frames(srv)
 }
 
-const epollMaxPendingWrite = 8 << 20
+const epollMaxPendingWriteDefault = 8 << 20
 
 func (w *epollWorker) flush(c *epollConn) bool {
 	for c.writeSent < len(c.writeBuf) {
@@ -1031,7 +1040,7 @@ func (w *epollWorker) flush(c *epollConn) bool {
 			continue
 		}
 		if err == unix.EAGAIN {
-			if len(c.writeBuf)-c.writeSent > epollMaxPendingWrite {
+			if len(c.writeBuf)-c.writeSent > w.maxPendingWrite {
 				w.closeConn(c)
 				return false
 			}

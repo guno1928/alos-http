@@ -199,7 +199,7 @@ var clientHelloPool = sync.Pool{
 
 const (
 	epollIOBufCap        = 2048
-	epollIOBufPoolMaxCap = 32 << 10
+	epollIOBufPoolMaxCap = 128 << 10
 )
 
 var epollIOBufPool = sync.Pool{
