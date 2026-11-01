@@ -198,18 +198,21 @@ func SendCCS(conn net.Conn) error {
 	return WriteRecord(conn, 0x14, []byte{0x01})
 }
 
-// AppendRecord appends a TLS 1.2-framed record (version 0x0303) of content type ct
-// and payload to dst and returns the extended slice, truncating payload to
-// MaxRecordPayload bytes if it is larger.
+// AppendRecord appends TLS 1.2-framed records (version 0x0303) of content type ct
+// carrying payload to dst and returns the extended slice, fragmenting payload
+// into consecutive records of at most MaxRecordPayload bytes if it is larger.
 func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
-	pLen := len(payload)
-	if pLen > MaxRecordPayload {
-		pLen = MaxRecordPayload
-		payload = payload[:pLen]
+	for len(payload) > MaxRecordPayload {
+		dst = appendRecordFragment(dst, ct, payload[:MaxRecordPayload])
+		payload = payload[MaxRecordPayload:]
 	}
+	return appendRecordFragment(dst, ct, payload)
+}
+
+func appendRecordFragment(dst []byte, ct byte, payload []byte) []byte {
+	pLen := len(payload)
 	dst = append(dst, ct, 0x03, 0x03, byte(pLen>>8), byte(pLen))
-	dst = append(dst, payload...)
-	return dst
+	return append(dst, payload...)
 }
 
 // StripInnerPlaintext parses a TLS 1.3 decrypted inner plaintext (content followed

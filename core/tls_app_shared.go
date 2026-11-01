@@ -64,6 +64,24 @@ func appendTLSInnerRecord(dst []byte, writer *TrafficAEAD, innerPayload []byte) 
 	return sealTLSInnerInPlace(dst, writer, hdr)
 }
 
+func appendTLSInnerRecords(dst []byte, writer *TrafficAEAD, innerPayload []byte) []byte {
+	if len(innerPayload) <= MaxRecordPayload {
+		return appendTLSInnerRecord(dst, writer, innerPayload)
+	}
+	const maxContent = MaxRecordPayload - 1
+	content, innerType := innerPayload[:len(innerPayload)-1], innerPayload[len(innerPayload)-1]
+	for len(content) > 0 {
+		n := min(len(content), maxContent)
+		hdr := len(dst)
+		dst = ensureTailCap(dst, tlsRecordHeaderLen+n+1+writer.Overhead())
+		dst = append(dst[:hdr+tlsRecordHeaderLen], content[:n]...)
+		dst = append(dst, innerType)
+		dst = sealTLSInnerInPlace(dst, writer, hdr)
+		content = content[n:]
+	}
+	return dst
+}
+
 func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []byte {
 	return buildTLSAppDataRecordsParts(dst, writer, payload, nil)
 }

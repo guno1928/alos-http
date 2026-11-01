@@ -90,20 +90,43 @@ func fpResponseContentType(headers [][2]string) string {
 }
 
 func fpResponseContentLength(headers [][2]string) int64 {
+	length := int64(-1)
+	seen := false
 	for _, h := range headers {
-		if EqualFoldASCII(h[0], "content-length") {
-			var n int64
-			for i := 0; i < len(h[1]); i++ {
-				c := h[1][i]
-				if c < '0' || c > '9' {
-					return -1
-				}
-				n = n*10 + int64(c-'0')
+		switch len(h[0]) {
+		case len("transfer-encoding"):
+			if headerNameIs(h[0], "transfer-encoding") {
+				return -1
 			}
-			return n
+		case len("content-length"):
+			if !seen && headerNameIs(h[0], "content-length") {
+				seen = true
+				length = fpParseContentLength(h[1])
+			}
 		}
 	}
-	return -1
+	return length
+}
+
+const fpOverflowFreeDigits = 18
+
+func fpParseContentLength(value string) int64 {
+	if len(value) == 0 || len(value) > fpOverflowFreeDigits {
+		n, err := strconv.ParseUint(value, 10, 63)
+		if err != nil {
+			return -1
+		}
+		return int64(n)
+	}
+	var n int64
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return -1
+		}
+		n = n*10 + int64(c-'0')
+	}
+	return n
 }
 
 func fpAttemptError(err error, wroteRequest, gotResponse bool) *proxyAttemptError {
@@ -166,6 +189,9 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 		OnBody: func(chunk []byte) error {
 			if streaming {
 				return sw.WriteChunk(chunk)
+			}
+			if len(chunk) > client.cfg.MaxResponseBody-len(buffered) {
+				return errFPBodyTooLarge
 			}
 			buffered = append(buffered, chunk...)
 			return nil

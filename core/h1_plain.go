@@ -106,26 +106,45 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 	if maxHeaderBytes <= 0 {
 		maxHeaderBytes = 8192
 	}
-	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes)
+	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes, fast.maxHeaderCount)
 	if needRead {
 		return nil, 0, false, false
 	}
 	if !ok {
 		return nil, 0, false, false
 	}
+	if consumed-2 > maxHeaderBytes || consumed > fast.uncountedHeadLen && scalarRootFieldsExceed(data, consumed, fast.maxHeaderCount) {
+		return nil, 0, false, false
+	}
 	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true
 }
 
-const rootScalarScanMaxBytes = 96
+const (
+	defaultMaxHeaderCount     = 128
+	minH1FieldLineBytes       = len("x:\r\n")
+	maxH1FieldStartsPerChunk  = 64 / minH1FieldLineBytes
+	rootScalarScanMaxBytes    = 96
+	rootFastHeadTerminatorLen = len("\r\n")
+)
 
-func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+var newlineBytes = []byte{'\n'}
+
+func rootFastUncountedHeadLen(maxHeaderCount int) int {
+	return len(rootPrefixBytes) + maxHeaderCount*minH1FieldLineBytes + rootFastHeadTerminatorLen
+}
+
+func scalarRootFieldsExceed(data []byte, consumed, maxHeaderCount int) bool {
+	return consumed <= rootScalarScanMaxBytes && bytes.Count(data[len(rootPrefixBytes):consumed-rootFastHeadTerminatorLen], newlineBytes) > maxHeaderCount
+}
+
+func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes, maxHeaderCount int) (consumed int, keepAlive bool, ok bool, needRead bool) {
 	if len(buf) <= rootScalarScanMaxBytes {
 		st := rootFastState{keepAlive: true}
 		if headerEnd, ok := st.scanFields(buf, lineLen); ok && st.hosts == 1 {
 			return headerEnd, st.keepAlive, true, false
 		}
 	} else if endsWithHeaderTerminator(buf, lineLen) {
-		if keepAlive, ok := rootFastHeaders(buf[lineLen : len(buf)-2]); ok {
+		if keepAlive, ok := rootFastHeaders(buf[lineLen:len(buf)-2], maxHeaderCount); ok {
 			return len(buf), keepAlive, true, false
 		}
 	}
@@ -136,7 +155,7 @@ func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (con
 		}
 		return 0, false, false, true
 	}
-	keepAlive, ok = rootFastHeaders(buf[lineLen : headerEnd-2])
+	keepAlive, ok = rootFastHeaders(buf[lineLen:headerEnd-2], maxHeaderCount)
 	if !ok {
 		return 0, false, false, false
 	}
@@ -148,8 +167,8 @@ func endsWithHeaderTerminator(buf []byte, lineLen int) bool {
 	return n-2 >= lineLen && n >= 4 && string(buf[n-4:]) == "\r\n\r\n"
 }
 
-func rootFastHeaders(block []byte) (keepAlive, ok bool) {
-	st := rootFastState{keepAlive: true}
+func rootFastHeaders(block []byte, maxHeaderCount int) (keepAlive, ok bool) {
+	st := rootFastState{keepAlive: true, maxCount: maxHeaderCount}
 	if !st.fields(block) || st.hosts != 1 {
 		return false, false
 	}
@@ -158,6 +177,7 @@ func rootFastHeaders(block []byte) (keepAlive, ok bool) {
 
 type rootFastState struct {
 	hosts     int
+	maxCount  int
 	keepAlive bool
 }
 
@@ -203,10 +223,22 @@ func (st *rootFastState) indexedFields(block []byte) (ok, indexed bool) {
 			}
 		}
 	}
-	return true, true
+	return len(block) <= st.maxCount*minH1FieldLineBytes || h1BlockStartsWithin(&idx, chunks, st.maxCount), true
+}
+
+func h1BlockStartsWithin(idx *h1BlockIndexOut, chunks, maxCount int) bool {
+	count := 0
+	for ci := 0; ci < chunks; ci++ {
+		count += bits.OnesCount64(idx.starts[ci])
+		if count+(chunks-1-ci)*maxH1FieldStartsPerChunk <= maxCount {
+			return true
+		}
+	}
+	return count <= maxCount
 }
 
 func (st *rootFastState) lineFields(block []byte) bool {
+	count := 0
 	for i := 0; i < len(block); {
 		var name, value []byte
 		var hostSafe, ok bool
@@ -218,8 +250,9 @@ func (st *rootFastState) lineFields(block []byte) bool {
 		if !ok || !st.field(name, value, hostSafe) {
 			return false
 		}
+		count++
 	}
-	return true
+	return count <= st.maxCount
 }
 
 func (st *rootFastState) field(name, value []byte, hostSafe bool) bool {
@@ -370,7 +403,7 @@ func parseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 	}
 	maxCount := maxHeaderCount
 	if maxCount <= 0 {
-		maxCount = 128
+		maxCount = defaultMaxHeaderCount
 	}
 
 	idx, bad := classifyFirstSpecial(data, firstH1Special(data))

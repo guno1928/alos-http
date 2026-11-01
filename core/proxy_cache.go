@@ -9,8 +9,10 @@ import (
 	"io"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/andybalholm/brotli"
 	"github.com/guno1928/alosmap"
@@ -66,12 +68,14 @@ type CacheRule struct {
 //
 //	Example: DefaultMaxAge: 10 * time.Minute.
 //
-// MaxTotalBytes caps the cache's aggregate stored bytes; 0 defaults to 256 MiB.
+// MaxTotalBytes caps the cache's aggregate stored bytes, counting each entry's key,
+// headers, bodies and bookkeeping; 0 defaults to 256 MiB.
 // Exceeding it triggers eviction of the oldest entries down to 90% of the cap.
 //
 //	Example: MaxTotalBytes: 512 << 20.
 //
-// MaxEntries caps the number of stored entries; 0 disables the cap (DefaultProxyCacheConfig sets 10000).
+// MaxEntries caps the number of stored entries; 0 defaults to 10000 and a negative
+// value disables the cap.
 //
 //	Example: MaxEntries: 50000.
 //
@@ -106,6 +110,8 @@ type ProxyCacheConfig struct {
 	CompressMinLen int
 }
 
+const defaultProxyCacheMaxEntries = 10000
+
 // DefaultProxyCacheConfig returns a ProxyCacheConfig with sensible defaults:
 // 4 MB max entry, 5 minute TTL, 256 MB total, 10k entries, gzip compression
 // at level 2 for responses >= 512 bytes.
@@ -114,7 +120,7 @@ func DefaultProxyCacheConfig() ProxyCacheConfig {
 		MaxEntrySize:   4 << 20,
 		DefaultMaxAge:  5 * time.Minute,
 		MaxTotalBytes:  256 << 20,
-		MaxEntries:     10000,
+		MaxEntries:     defaultProxyCacheMaxEntries,
 		PreCompress:    true,
 		CompressLevel:  defaultCompressLevel,
 		CompressMinLen: 512,
@@ -134,7 +140,22 @@ type cacheEntry struct {
 	maxHits     uint64
 	bodyLen     int32
 	gzipLen     int32
+	cost        int64
 	deleted     atomic.Bool
+}
+
+const (
+	cacheEntryOverhead = int64(unsafe.Sizeof(cacheEntry{}) + unsafe.Sizeof(""))
+	cacheFieldOverhead = int64(unsafe.Sizeof([2]string{}))
+)
+
+func cacheEntryCost(key string, entry *cacheEntry) int64 {
+	cost := cacheEntryOverhead + int64(len(key)) + int64(len(entry.contentType)) +
+		int64(cap(entry.body)) + int64(cap(entry.gzipBody)) + int64(cap(entry.headers))*cacheFieldOverhead
+	for i := range entry.headers {
+		cost += int64(len(entry.headers[i][0]) + len(entry.headers[i][1]))
+	}
+	return cost
 }
 
 func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) {
@@ -148,7 +169,7 @@ func (pc *ProxyCache) retireEntry(entry *cacheEntry) bool {
 	if !entry.deleted.CompareAndSwap(false, true) {
 		return false
 	}
-	pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
+	pc.totalBytes.Add(-entry.cost)
 	pc.totalEntries.Add(-1)
 	return true
 }
@@ -167,6 +188,7 @@ type ProxyCache struct {
 	totalHits    atomic.Uint64
 	totalMisses  atomic.Uint64
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 	evicting     atomic.Bool
 	transforms   atomic.Int32
 	purges       atomic.Uint64
@@ -176,8 +198,9 @@ type ProxyCache struct {
 }
 
 // NewProxyCache creates a ProxyCache configured with cfg, normalizing zero-valued
-// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, and MaxTotalBytes to
-// their defaults, and starts a background goroutine that periodically evicts expired entries.
+// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, MaxTotalBytes, and
+// MaxEntries to their defaults, and starts a background goroutine that periodically
+// evicts expired entries.
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
 		cfg.CompressLevel = defaultCompressLevel
@@ -194,6 +217,9 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.MaxTotalBytes <= 0 {
 		cfg.MaxTotalBytes = 256 << 20
 	}
+	if cfg.MaxEntries == 0 {
+		cfg.MaxEntries = defaultProxyCacheMaxEntries
+	}
 
 	pc := &ProxyCache{
 		entries:   alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
@@ -207,7 +233,7 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 
 // UpdateConfig atomically replaces the cache's active configuration with cfg,
 // normalizing zero-valued CompressLevel, CompressMinLen, and DefaultMaxAge to their
-// defaults. Unlike NewProxyCache, MaxEntrySize and MaxTotalBytes are stored as given.
+// defaults. Unlike NewProxyCache, MaxEntrySize, MaxTotalBytes, and MaxEntries are stored as given.
 // Existing entries are left as-is.
 func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
@@ -225,11 +251,7 @@ func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 // Stop signals the cache's background eviction goroutine to exit. Safe to call
 // multiple times; only the first call takes effect.
 func (pc *ProxyCache) Stop() {
-	select {
-	case <-pc.stopCh:
-	default:
-		close(pc.stopCh)
-	}
+	pc.stopOnce.Do(func() { close(pc.stopCh) })
 }
 
 func (pc *ProxyCache) buildKey(method, host, path string) string {
@@ -574,8 +596,10 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 	}
 
 	if cfg.MaxEntries > 0 && pc.totalEntries.Load() >= cfg.MaxEntries {
-		go pc.evictOldest()
-		return
+		if _, replacing := pc.entries.Load(key); !replacing {
+			pc.requestEviction()
+			return
+		}
 	}
 
 	_, backendEncoding := detectBackendEncoding(headers)
@@ -628,16 +652,15 @@ func (pc *ProxyCache) transformAndStore(cfg *ProxyCacheConfig, key string, entry
 		return
 	}
 
-	bodyLen := int64(entry.bodyLen)
-	if compress && bodyLen >= int64(minLen) {
+	if compress && int(entry.bodyLen) >= minLen {
 		gz := pc.compressGzip(entry.body)
 		if len(gz) > 0 && len(gz) < len(entry.body) {
 			entry.gzipBody = gz
 			entry.gzipLen = int32(len(gz))
-			bodyLen += int64(len(gz))
 		}
 	}
-	pc.storeEntry(cfg, key, entry, bodyLen, generation)
+	entry.cost = cacheEntryCost(key, entry)
+	pc.storeEntry(cfg, key, entry, generation)
 }
 
 func inflateCacheEntry(entry *cacheEntry, encoding string, limit int64) error {
@@ -651,9 +674,9 @@ func inflateCacheEntry(entry *cacheEntry, encoding string, limit int64) error {
 	return nil
 }
 
-func (pc *ProxyCache) storeEntry(cfg *ProxyCacheConfig, key string, entry *cacheEntry, bodyLen int64, generation uint64) {
+func (pc *ProxyCache) storeEntry(cfg *ProxyCacheConfig, key string, entry *cacheEntry, generation uint64) {
 	pc.totalEntries.Add(1)
-	pc.totalBytes.Add(bodyLen)
+	pc.totalBytes.Add(entry.cost)
 	if prev, loaded := pc.entries.Swap(key, entry); loaded {
 		pc.retireEntry(prev)
 	}
@@ -662,7 +685,18 @@ func (pc *ProxyCache) storeEntry(cfg *ProxyCacheConfig, key string, entry *cache
 		return
 	}
 
-	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
+	if pc.overCapacity(cfg) {
+		pc.requestEviction()
+	}
+}
+
+func (pc *ProxyCache) overCapacity(cfg *ProxyCacheConfig) bool {
+	return cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes ||
+		cfg.MaxEntries > 0 && pc.totalEntries.Load() > cfg.MaxEntries
+}
+
+func (pc *ProxyCache) requestEviction() {
+	if pc.evicting.CompareAndSwap(false, true) {
 		go pc.evictOldest()
 	}
 }
@@ -778,10 +812,12 @@ func (pc *ProxyCache) evictExpired() {
 }
 
 func (pc *ProxyCache) evictOldest() {
-	if !pc.evicting.CompareAndSwap(false, true) {
-		return
-	}
-	defer pc.evicting.Store(false)
+	defer func() {
+		pc.evicting.Store(false)
+		if pc.overCapacity(pc.config.Load()) {
+			pc.requestEviction()
+		}
+	}()
 
 	cfg := pc.config.Load()
 	byteTarget := int64(-1)

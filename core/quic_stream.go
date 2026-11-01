@@ -98,9 +98,11 @@ func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 		maxRecv:     quicStreamRecvCap(conn, window),
 		recvWindow:  window,
 		recvGranted: window,
-		maxSend:     1 << 20,
+		maxSend:     quicDefaultStreamSendWindow,
 	}
 }
+
+const quicDefaultStreamSendWindow = 1 << 20
 
 func quicStreamRecvLimit(conn *QUICConn) uint64 {
 	limit := uint64(1 << 18)
@@ -171,10 +173,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s.sendOff = 0
 	s.sendFin = false
 	s.sendClosed = false
-	s.maxSend = 1 << 20
-	if conn.peerStreamWindow > 0 {
-		s.maxSend = conn.peerStreamWindow
-	}
+	s.maxSend = conn.peerStreamWindow
 	s.blockedSent = 0
 	s.stalledSend = 0
 	s.stallSince = 0
@@ -558,7 +557,7 @@ func (s *QUICStream) Write(data []byte) error {
 
 func (s *QUICStream) setSendBuf(data []byte) {
 	s.mu.Lock()
-	if !s.sendReset {
+	if !s.sendClosed {
 		s.sendBuf = data
 	}
 	s.sendFin = true
@@ -586,6 +585,8 @@ func (s *QUICStream) Close() {
 	s.mu.Lock()
 	s.recvClosed = true
 	s.sendClosed = true
+	s.sendBuf = nil
+	s.releaseStalledLocked(s.stalledSend)
 	if s.recvReady != nil {
 		select {
 		case s.recvReady <- struct{}{}:

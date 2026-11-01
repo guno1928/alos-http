@@ -73,7 +73,7 @@ func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
 	sw.gen, sw.streamID = stream.dispatchGen, stream.ID
 	sw.method = req.Method
 	sw.serverName = c.worker.server.config.ServerName
-	sw.altSvc = c.worker.server.altSvcFor(c.tls)
+	sw.altSvc = c.worker.server.altSvcFor(req.IsTLS)
 	sw.maxWrite = c.worker.server.config.MaxWriteSize
 	if req.h2WebSocket {
 		sw.maxWrite = 0
@@ -295,7 +295,7 @@ func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog in
 		if end {
 			flags |= H2FlagEndStream
 		}
-		dst = appendH2HeaderBlockFrame(dst, sw.streamID, flags, &st.encTable, sw.header)
+		dst = appendH2HeaderBlockFrame(dst, sw.streamID, flags, &st.encTable, sw.header, st.dataFrameLimit())
 		sw.headersOut = true
 		if end {
 			sw.finished = true

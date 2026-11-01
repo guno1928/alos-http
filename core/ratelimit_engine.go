@@ -81,15 +81,17 @@ type compiledRule struct {
 }
 
 type rlEntry struct {
-	state   atomic.Uint64
-	reset   atomic.Int64
-	blocked atomic.Int64
-	_       [CacheLineSize - 24]byte
+	rlCounter
+	_ [CacheLineSize - 16]byte
 }
 
-const rlEpochShift = 40
+const rlEpochShift = 39
 const rlCountMask uint64 = (1 << rlEpochShift) - 1
 const rlEpochMask uint64 = (1 << 24) - 1
+const rlBlockedFlag uint64 = 1 << 63
+const rlRetiredState = ^uint64(0)
+const rlMaxBlockDeadline = int64(rlRetiredState&^rlBlockedFlag) - 1
+const rlEngineIdleGrace = int64(60 * time.Second)
 
 func rlEpochOf(now, windowNanos int64) uint64 {
 	if windowNanos <= 0 {
@@ -98,24 +100,84 @@ func rlEpochOf(now, windowNanos int64) uint64 {
 	return (uint64(now/windowNanos) & rlEpochMask) << rlEpochShift
 }
 
-func rlBumpCount(state *atomic.Uint64, now, windowNanos int64) int64 {
+func rlBlockDeadline(now, blockNanos int64) int64 {
+	return now + min(max(blockNanos, 0), rlMaxBlockDeadline-now)
+}
+
+type rlOutcome uint8
+
+const (
+	rlAllowed rlOutcome = iota
+	rlLimited
+	rlRetired
+)
+
+type rlCounter struct {
+	state atomic.Uint64
+	reset atomic.Int64
+}
+
+func (c *rlCounter) admit(now, windowNanos, maxReqs, blockNanos int64) (rlOutcome, time.Duration) {
 	epoch := rlEpochOf(now, windowNanos)
 	for {
-		cur := state.Load()
-		var next uint64
-		if cur&^rlCountMask != epoch {
-			next = epoch | 1
-		} else {
-			c := cur & rlCountMask
-			if c >= rlCountMask {
-				return int64(c)
+		cur := c.state.Load()
+		count := uint64(1)
+		if cur&^rlCountMask == epoch {
+			count = cur&rlCountMask + 1
+		} else if cur&rlBlockedFlag != 0 {
+			if cur == rlRetiredState {
+				return rlRetired, 0
 			}
-			next = epoch | (c + 1)
+			if until := int64(cur &^ rlBlockedFlag); now < until {
+				return rlLimited, time.Duration(until - now)
+			}
 		}
-		if state.CompareAndSwap(cur, next) {
-			return int64(next & rlCountMask)
+		if int64(count) > maxReqs {
+			if blockNanos <= 0 {
+				blockNanos = windowNanos
+			}
+			if c.state.CompareAndSwap(cur, rlBlockedFlag|uint64(rlBlockDeadline(now, blockNanos))) {
+				return rlLimited, time.Duration(blockNanos)
+			}
+			continue
+		}
+		if count > rlCountMask {
+			return rlAllowed, 0
+		}
+		if count == 1 {
+			c.reset.Store(now + windowNanos)
+		}
+		if c.state.CompareAndSwap(cur, epoch|count) {
+			return rlAllowed, 0
 		}
 	}
+}
+
+func (c *rlCounter) retireIfIdle(now, idleGrace int64) bool {
+	cur := c.state.Load()
+	if cur == rlRetiredState {
+		return true
+	}
+	if cur&rlBlockedFlag != 0 && now <= int64(cur&^rlBlockedFlag) {
+		return false
+	}
+	if now <= c.reset.Load()+idleGrace {
+		return false
+	}
+	return c.state.CompareAndSwap(cur, rlRetiredState)
+}
+
+type rlRetirable interface {
+	retireIfIdle(now, idleGrace int64) bool
+}
+
+func retireIdleRateLimitEntries[E rlRetirable](entries *alosmap.TypedMap[string, E], now, idleGrace int64) {
+	entries.Range(func(key string, entry E) bool {
+		if entry.retireIfIdle(now, idleGrace) {
+			entries.CompareAndDelete(key, entry)
+		}
+		return true
+	})
 }
 
 // RateLimitEngine tracks per-client request counts against configured rules.
@@ -123,10 +185,11 @@ func rlBumpCount(state *atomic.Uint64, now, windowNanos int64) int64 {
 // The engine runs a background goroutine that cleans up stale entries every
 // 30 seconds.
 type RateLimitEngine struct {
-	rules   atomic.Pointer[[]compiledRule]
-	clients *alosmap.TypedMap[string, *rlEntry]
-	stopCh  chan struct{}
-	OnLimit RateLimitFunc
+	rules    atomic.Pointer[[]compiledRule]
+	clients  *alosmap.TypedMap[string, *rlEntry]
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	OnLimit  RateLimitFunc
 
 	liveOnLimit atomic.Pointer[RateLimitFunc]
 }
@@ -304,56 +367,42 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 		key = ip + "|" + cr.keyBase
 	}
 	now := CoarseNanotime()
+	windowNanos := cr.rule.Window.Nanoseconds()
+	blockNanos := cr.rule.BlockFor.Nanoseconds()
 
 	entry, ok := rle.clients.Load(key)
 	if !ok {
-		if keyBuf != nil {
-			key = strings.Clone(key)
-		}
-		newEntry := &rlEntry{}
-		newEntry.reset.Store(now + cr.rule.Window.Nanoseconds())
-		entry, _ = rle.clients.LoadOrStore(key, newEntry)
+		entry = rle.storeClient(key, keyBuf != nil, now+windowNanos)
+	}
+	outcome, retryAfter := entry.admit(now, windowNanos, cr.rule.MaxReqs, blockNanos)
+	for outcome == rlRetired {
+		rle.clients.CompareAndDelete(key, entry)
+		entry = rle.storeClient(key, keyBuf != nil, now+windowNanos)
+		outcome, retryAfter = entry.admit(now, windowNanos, cr.rule.MaxReqs, blockNanos)
 	}
 	if keyBuf != nil {
 		rateLimitKeyScratch.Put(keyBuf)
 	}
-
-	blockedUntil := entry.blocked.Load()
-	if blockedUntil > 0 && now < blockedUntil {
-		remaining := time.Duration(blockedUntil - now)
-		return false, cr, remaining
+	if outcome == rlLimited {
+		return false, cr, retryAfter
 	}
-	windowNanos := cr.rule.Window.Nanoseconds()
-	if blockedUntil > 0 && now >= blockedUntil {
-		entry.blocked.Store(0)
-		entry.state.Store(rlEpochOf(now, windowNanos))
-		entry.reset.Store(now + windowNanos)
-	}
-
-	count := rlBumpCount(&entry.state, now, windowNanos)
-	if count == 1 {
-		entry.reset.Store(now + windowNanos)
-	}
-	if count > cr.rule.MaxReqs {
-		blockDur := cr.rule.BlockFor
-		if blockDur <= 0 {
-			blockDur = cr.rule.Window
-		}
-		entry.blocked.Store(now + blockDur.Nanoseconds())
-		return false, cr, blockDur
-	}
-
 	return true, cr, 0
+}
+
+func (rle *RateLimitEngine) storeClient(key string, borrowedKey bool, resetAt int64) *rlEntry {
+	if borrowedKey {
+		key = strings.Clone(key)
+	}
+	newEntry := &rlEntry{}
+	newEntry.reset.Store(resetAt)
+	entry, _ := rle.clients.LoadOrStore(key, newEntry)
+	return entry
 }
 
 // Stop halts the engine's background cleanup goroutine. It is safe to call
 // multiple times.
 func (rle *RateLimitEngine) Stop() {
-	select {
-	case <-rle.stopCh:
-	default:
-		close(rle.stopCh)
-	}
+	rle.stopOnce.Do(func() { close(rle.stopCh) })
 }
 
 func (rle *RateLimitEngine) cleanupLoop() {
@@ -370,19 +419,7 @@ func (rle *RateLimitEngine) cleanupLoop() {
 						Dbg("[ratelimit cleanup] recovered panic: %v", r)
 					}
 				}()
-				now := CoarseNanotime()
-				var stale []string
-				rle.clients.Range(func(key string, entry *rlEntry) bool {
-					resetAt := entry.reset.Load()
-					blockedUntil := entry.blocked.Load()
-					if now > resetAt+int64(60*time.Second) && (blockedUntil == 0 || now > blockedUntil) {
-						stale = append(stale, key)
-					}
-					return true
-				})
-				for _, key := range stale {
-					rle.clients.Delete(key)
-				}
+				retireIdleRateLimitEntries(rle.clients, CoarseNanotime(), rlEngineIdleGrace)
 			}()
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -132,10 +134,12 @@ var timeNow = time.Now
 //
 // QUICMaxUDPPayload is the largest QUIC UDP payload the server will use after peer negotiation; 0 uses the safe protocol default.
 //
-// TLSCertFile and TLSKeyFile point to a PEM certificate/key pair used when Certs and ACME are unset.
+// TLSCertFile and TLSKeyFile point to a PEM certificate chain/key pair used when Certs and ACME are unset.
+// Both must be set together; a missing, invalid, or expired pair fails start-up and the files are never rewritten.
+// When both are empty, a self-signed localhost certificate is loaded from or generated into .alos-cert.pem/.alos-key.pem.
 //
 //	Example: TLSCertFile: "cert.pem", TLSKeyFile: "key.pem".
-//	Example: TLSCertFile: "" generates a self-signed localhost certificate.
+//	Example: TLSCertFile: "", TLSKeyFile: "" uses a self-signed localhost certificate.
 //
 // Certs lists per-domain certificate configs (manual, self-signed, or ACME).
 //
@@ -691,13 +695,15 @@ type ipReqCounter struct {
 }
 
 type plainRootFastResponse struct {
-	getKeepAlive    []byte
-	getClose        []byte
-	getKeepAliveTLS []byte
-	getCloseTLS     []byte
-	handlerAltSvc   bool
-	tlsKeepAlive    []byte
-	tlsClose        []byte
+	getKeepAlive     []byte
+	getClose         []byte
+	getKeepAliveTLS  []byte
+	getCloseTLS      []byte
+	handlerAltSvc    bool
+	tlsKeepAlive     []byte
+	tlsClose         []byte
+	maxHeaderCount   int
+	uncountedHeadLen int
 }
 
 type h2RootFastResponse struct {
@@ -931,22 +937,11 @@ func (s *Server) ListenAndServeTLS() error {
 		return err
 	}
 
-	numListeners := s.config.Listeners
-	if numListeners <= 0 {
-		numListeners = 1
-	}
-	numListeners = clampListenerCount(numListeners)
-
-	listeners, err := createListeners(s.config.Addr, numListeners)
+	listenerFDs, err := s.openEpollListeners(s.config.Addr, epollReserve)
 	if err != nil {
 		return err
 	}
 
-	protocols := "HTTP/1.1 + HTTP/2"
-	if !s.http2Enabled() {
-		protocols = "HTTP/1.1"
-	}
-	s.logger().Info("HTTPS listening", "addr", s.config.Addr, "listeners", len(listeners), "protocols", protocols)
 	certs := s.certStore.ListCerts()
 	for _, ci := range certs {
 		label := "self-signed"
@@ -961,10 +956,8 @@ func (s *Server) ListenAndServeTLS() error {
 	if len(certs) == 0 {
 		s.logger().Warn("no TLS certificates are loaded; HTTPS handshakes will fail until a certificate becomes available")
 	}
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
 	if err := s.startHTTPRedirect(); err != nil {
+		closeEpollListeners(listenerFDs)
 		return err
 	}
 	s.primeTLSCertificates()
@@ -973,8 +966,21 @@ func (s *Server) ListenAndServeTLS() error {
 		ai.Start()
 	}
 	s.ensureTLSRuntime()
+	if s.doneClosed() {
+		closeEpollListeners(listenerFDs)
+		return nil
+	}
+	errCh, err := s.startEpollWorkers(listenerFDs, true)
+	if err != nil {
+		return errors.Join(err, s.Shutdown(context.Background()))
+	}
+	protocols := "HTTP/1.1 + HTTP/2"
+	if !s.http2Enabled() {
+		protocols = "HTTP/1.1"
+	}
+	s.logger().Info("HTTPS listening", "addr", s.config.Addr, "listeners", len(listenerFDs), "protocols", protocols)
 	s.logger().Info("epoll TLS workers active", "listeners", s.config.Listeners)
-	return s.ListenAndServeEpollTLS(s.config.Addr)
+	return <-errCh
 }
 
 // Capabilities reports the runtime capabilities detected at startup, such as
@@ -1112,6 +1118,9 @@ func (s *Server) loadCerts() error {
 
 	if len(s.config.Certs) > 0 {
 		for _, cc := range s.config.Certs {
+			if cc.Source == CertSelfSigned && (cc.CertFile != "" || cc.KeyFile != "") {
+				cc.Source = CertManual
+			}
 			switch cc.Source {
 			case CertSelfSigned:
 				der, priv, err := GenerateSelfSignedForDomain(cc.Domain)
@@ -1120,6 +1129,9 @@ func (s *Server) loadCerts() error {
 				}
 				s.certStore.AddCert(NewCertEntryFromDER(cc.Domain, der, priv, CertSelfSigned))
 			case CertManual:
+				if cc.CertFile == "" || cc.KeyFile == "" {
+					return fmt.Errorf("certificate %q: %w", cc.Domain, errCertPairIncomplete)
+				}
 				certPEM, err := os.ReadFile(cc.CertFile)
 				if err != nil {
 					return err
@@ -1138,6 +1150,8 @@ func (s *Server) loadCerts() error {
 				s.certStore.AddCert(entry)
 			case CertACME:
 				acmeDomains = append(acmeDomains, cc.Domain)
+			default:
+				return fmt.Errorf("certificate %q: unsupported source %d", cc.Domain, cc.Source)
 			}
 		}
 	}
@@ -1173,11 +1187,15 @@ func (s *Server) loadCerts() error {
 		return nil
 	}
 
-	certDER, privKey, err := LoadOrGenerateCert(s.config.TLSCertFile, s.config.TLSKeyFile)
+	chainDER, privKey, err := loadOrGenerateCertChain(s.config.TLSCertFile, s.config.TLSKeyFile)
 	if err != nil {
 		return err
 	}
-	s.certStore.AddCert(NewCertEntryFromDER("localhost", certDER, privKey, CertSelfSigned))
+	source := CertSelfSigned
+	if s.config.TLSCertFile != "" || s.config.TLSKeyFile != "" {
+		source = CertManual
+	}
+	s.certStore.AddCert(newCertEntryFromChainDER("localhost", chainDER, privKey, source))
 	return nil
 }
 
@@ -1535,12 +1553,18 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	closeTLS := make([]byte, len(closeResp)+1)
 	copy(closeTLS, closeResp)
 	closeTLS[len(closeResp)] = 0x17
+	maxHeaderCount := s.config.MaxHeaderCount
+	if maxHeaderCount <= 0 {
+		maxHeaderCount = defaultMaxHeaderCount
+	}
 	return &plainRootFastResponse{
-		getKeepAlive:    keepAlive,
-		getClose:        closeResp,
-		getKeepAliveTLS: keepAliveTLS,
-		getCloseTLS:     closeTLS,
-		handlerAltSvc:   headersHaveFold(resp.Headers, altSvcHeaderName),
+		getKeepAlive:     keepAlive,
+		getClose:         closeResp,
+		getKeepAliveTLS:  keepAliveTLS,
+		getCloseTLS:      closeTLS,
+		handlerAltSvc:    headersHaveFold(resp.Headers, altSvcHeaderName),
+		maxHeaderCount:   maxHeaderCount,
+		uncountedHeadLen: rootFastUncountedHeadLen(maxHeaderCount),
 	}
 }
 
@@ -1587,7 +1611,7 @@ func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
 		headerPayload: headerPayload,
 		body:          body,
 	}
-	if len(body) <= int(H2DefaultMaxFrameSize) {
+	if len(headerPayload) <= H2DefaultMaxFrameSize && len(body) <= int(H2DefaultMaxFrameSize) {
 		framed := make([]byte, 0, len(fastResp.headerPayload)+len(body)+18)
 		if len(body) == 0 {
 			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 0, fastResp.headerPayload)

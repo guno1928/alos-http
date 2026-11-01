@@ -356,42 +356,64 @@ func parsePrivateKey(der []byte) (crypto.Signer, error) {
 	return nil, errors.New("unsupported private key format")
 }
 
-// LoadOrGenerateCert loads a certificate/key pair from certFile and keyFile
-// (defaulting to ".alos-cert.pem" / ".alos-key.pem" when empty), generating and
-// saving a new self-signed certificate via GenerateCert if none exists, is invalid,
-// or has expired.
+// LoadOrGenerateCert loads a certificate/key pair from certFile and keyFile and
+// returns the leaf certificate. When both paths are empty it uses
+// ".alos-cert.pem" / ".alos-key.pem", generating and saving a new self-signed
+// certificate via GenerateCert if that pair does not exist, is invalid, or has
+// expired. When either path is set, both are required and a missing, invalid,
+// or expired pair is returned as an error; configured files are never written.
 func LoadOrGenerateCert(certFile, keyFile string) ([]byte, crypto.Signer, error) {
-	if certFile == "" {
-		certFile = defaultCertFile
+	chainDER, privKey, err := loadOrGenerateCertChain(certFile, keyFile)
+	if err != nil {
+		return nil, nil, err
 	}
-	if keyFile == "" {
-		keyFile = defaultKeyFile
+	return chainDER[0], privKey, nil
+}
+
+func loadOrGenerateCertChain(certFile, keyFile string) ([][]byte, crypto.Signer, error) {
+	if certFile != "" || keyFile != "" {
+		return loadConfiguredCertFiles(certFile, keyFile)
 	}
 
-	certDER, privKey, err := loadCertFromDisk(certFile, keyFile)
+	chainDER, privKey, err := loadCertFromDisk(defaultCertFile, defaultKeyFile)
 	if err == nil {
-		logger().Info("TLS certificate loaded", "file", certFile)
-		return certDER, privKey, nil
+		logger().Info("TLS certificate loaded", "file", defaultCertFile)
+		return chainDER, privKey, nil
 	}
 	if errors.Is(err, errCertKeyMismatch) {
 		return nil, nil, err
 	}
 
-	certDER, privKey, err = GenerateCert()
+	certDER, privKey, err := GenerateCert()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if saveErr := saveCertToDisk(certFile, keyFile, certDER, privKey); saveErr != nil {
-		logger().Warn("generated TLS certificate not saved; a new one is generated at the next start", "file", certFile, "err", saveErr)
+	if saveErr := saveCertToDisk(defaultCertFile, defaultKeyFile, certDER, privKey); saveErr != nil {
+		logger().Warn("generated TLS certificate not saved; a new one is generated at the next start", "file", defaultCertFile, "err", saveErr)
 	} else {
-		logger().Info("TLS certificate generated", "file", certFile)
+		logger().Info("TLS certificate generated", "file", defaultCertFile)
 	}
 
-	return certDER, privKey, nil
+	return [][]byte{certDER}, privKey, nil
 }
 
-func loadCertFromDisk(certFile, keyFile string) ([]byte, crypto.Signer, error) {
+func loadConfiguredCertFiles(certFile, keyFile string) ([][]byte, crypto.Signer, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, nil, errCertPairIncomplete
+	}
+	chainDER, privKey, err := loadCertFromDisk(certFile, keyFile)
+	if err != nil {
+		if errors.Is(err, errCertKeyMismatch) {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("TLS certificate %s: %w", certFile, err)
+	}
+	logger().Info("TLS certificate loaded", "file", certFile)
+	return chainDER, privKey, nil
+}
+
+func loadCertFromDisk(certFile, keyFile string) ([][]byte, crypto.Signer, error) {
 	certPEM, err := os.ReadFile(certFile)
 	if err != nil {
 		return nil, nil, err
@@ -401,8 +423,8 @@ func loadCertFromDisk(certFile, keyFile string) ([]byte, crypto.Signer, error) {
 		return nil, nil, err
 	}
 
-	certBlock, _ := pem.Decode(certPEM)
-	if certBlock == nil || certBlock.Type != "CERTIFICATE" {
+	chainDER := pemCertificateChain(certPEM)
+	if len(chainDER) == 0 {
 		return nil, nil, &staticError{"invalid cert PEM"}
 	}
 
@@ -416,7 +438,7 @@ func loadCertFromDisk(certFile, keyFile string) ([]byte, crypto.Signer, error) {
 		return nil, nil, err
 	}
 
-	cert, err := x509.ParseCertificate(certBlock.Bytes)
+	cert, err := x509.ParseCertificate(chainDER[0])
 	if err != nil {
 		return nil, nil, err
 	}
@@ -427,10 +449,26 @@ func loadCertFromDisk(certFile, keyFile string) ([]byte, crypto.Signer, error) {
 		return nil, nil, fmt.Errorf("%s and %s: %w", certFile, keyFile, errCertKeyMismatch)
 	}
 
-	return certBlock.Bytes, privKey, nil
+	return chainDER, privKey, nil
 }
 
 var errCertKeyMismatch = errors.New("TLS private key does not match the certificate")
+
+var errCertPairIncomplete = errors.New("TLS certificate and key files must be configured together")
+
+func pemCertificateChain(certPEM []byte) [][]byte {
+	var chainDER [][]byte
+	for rest := certPEM; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return chainDER
+		}
+		if block.Type == "CERTIFICATE" {
+			chainDER = append(chainDER, block.Bytes)
+		}
+	}
+}
 
 func saveCertToDisk(certFile, keyFile string, certDER []byte, privKey crypto.Signer) error {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})

@@ -30,13 +30,7 @@ func startRetryOrigin(t *testing.T, kind string) retryOrigin {
 	t.Helper()
 	hits := &atomic.Int64{}
 	if kind == "refused" {
-		ln, err := net.Listen("tcp4", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		return retryOrigin{addr: addr, hits: hits}
+		return retryOrigin{addr: refusedLoopbackAddr(t), hits: hits}
 	}
 	o := newInloopOrigin(t, func(req *http.Request, conn net.Conn, br *bufio.Reader) {
 		_, _ = io.Copy(io.Discard, req.Body)

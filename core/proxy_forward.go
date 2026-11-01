@@ -319,9 +319,12 @@ func relayDeclinedUpgrade(conn net.Conn, p *h1Parser, chunked bool, contentLen i
 	}
 	if sw == nil {
 		_ = conn.SetReadDeadline(deadlineAfter(readTimeout))
-		buffered, err := io.ReadAll(body)
+		buffered, err := io.ReadAll(io.LimitReader(body, defaultMaxBody+1))
 		if err != nil {
 			return err
+		}
+		if len(buffered) > defaultMaxBody {
+			return errFPBodyTooLarge
 		}
 		resp.Status(p.status)
 		if contentType != "" {

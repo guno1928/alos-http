@@ -7,13 +7,12 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestRateLimitCounter_NoLostIncrements(t *testing.T) {
-	var state atomic.Uint64
+	var counter rlCounter
 	now := int64(1_000_000_000_000)
 	window := int64(time.Second)
 	const workers = 50
@@ -24,27 +23,31 @@ func TestRateLimitCounter_NoLostIncrements(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < each; i++ {
-				rlBumpCount(&state, now, window)
+				counter.admit(now, window, workers*each, window)
 			}
 		}()
 	}
 	wg.Wait()
-	final := int64(state.Load() & rlCountMask)
+	final := int64(counter.state.Load() & rlCountMask)
 	if final != workers*each {
 		t.Fatalf("lost increments: final count %d, want %d", final, workers*each)
 	}
 }
 
 func TestRateLimitCounter_WindowRoll(t *testing.T) {
-	var state atomic.Uint64
+	var counter rlCounter
 	window := int64(time.Second)
-	if c := rlBumpCount(&state, window*5, window); c != 1 {
+	bump := func(now int64) int64 {
+		counter.admit(now, window, 10, window)
+		return int64(counter.state.Load() & rlCountMask)
+	}
+	if c := bump(window * 5); c != 1 {
 		t.Fatalf("first request in window: got %d want 1", c)
 	}
-	if c := rlBumpCount(&state, window*5+1, window); c != 2 {
+	if c := bump(window*5 + 1); c != 2 {
 		t.Fatalf("second request same window: got %d want 2", c)
 	}
-	if c := rlBumpCount(&state, window*6, window); c != 1 {
+	if c := bump(window * 6); c != 1 {
 		t.Fatalf("request in next window should reset: got %d want 1", c)
 	}
 }

@@ -273,14 +273,14 @@ func (p *epollConnPool) recycle(c *epollConn) {
 	}
 }
 
-func (c *epollConn) reserveH1BodyBudget(srv *Server, n int) bool {
-	if n <= 0 || c.h1BodyAccounted > 0 {
+func (c *epollConn) reserveH1BodyBudget(srv *Server, received int) bool {
+	if int64(received) <= c.h1BodyAccounted {
 		return true
 	}
-	if !srv.tryReserveBodyBytes(n) {
+	if !srv.tryReserveBodyBytes(received - int(c.h1BodyAccounted)) {
 		return false
 	}
-	c.h1BodyAccounted = int64(n)
+	c.h1BodyAccounted = int64(received)
 	return true
 }
 
@@ -292,14 +292,6 @@ func (c *epollConn) releaseH1BodyBudget() {
 		c.worker.server.releaseBodyBytes(c.h1BodyAccounted)
 	}
 	c.h1BodyAccounted = 0
-}
-
-func h1ChunkedBodyReservation(srv *Server) int {
-	limit := srv.effectiveReadCap()
-	if maxBody := srv.limits.Load().MaxBodySize; maxBody > 0 && (limit == readCapUnlimited || maxBody < int64(limit)) {
-		limit = int(maxBody)
-	}
-	return limit
 }
 
 func (p *epollConnPool) shrinkOne() {
@@ -422,27 +414,70 @@ func (s *Server) epollListenerCount() int {
 }
 
 func (s *Server) serveEpoll(addr string, tlsMode bool) error {
+	listenerFDs, err := s.openEpollListeners(addr, epollListen)
+	if err != nil {
+		return err
+	}
+	errCh, err := s.startEpollWorkers(listenerFDs, tlsMode)
+	if err != nil {
+		return err
+	}
+	return <-errCh
+}
+
+func (s *Server) openEpollListeners(addr string, open func(string) (int, error)) ([]int, error) {
+	count := s.epollListenerCount()
+	listenerFDs := make([]int, 0, count)
+	for i := 0; i < count; i++ {
+		lfd, err := open(addr)
+		if err != nil {
+			closeEpollListeners(listenerFDs)
+			return nil, fmt.Errorf("epoll listen %s: %w", addr, err)
+		}
+		listenerFDs = append(listenerFDs, lfd)
+	}
+	return listenerFDs, nil
+}
+
+func closeEpollListeners(listenerFDs []int) {
+	for _, lfd := range listenerFDs {
+		_ = unix.Close(lfd)
+	}
+}
+
+func (s *Server) startEpollWorkers(listenerFDs []int, tlsMode bool) (<-chan error, error) {
 	s.adoptAssignedEngines()
 	s.Router.Build()
 	s.computeFastDispatch()
-	workers := s.epollListenerCount()
 	minPerWorker := 0
 	if s.config.MinPrealloc > 0 {
-		minPerWorker = (s.config.MinPrealloc + workers - 1) / workers
+		minPerWorker = (s.config.MinPrealloc + len(listenerFDs) - 1) / len(listenerFDs)
+	}
+	for _, lfd := range listenerFDs {
+		if err := activateEpollListener(lfd); err != nil {
+			closeEpollListeners(listenerFDs)
+			return nil, fmt.Errorf("epoll listen: %w", err)
+		}
+	}
+	workers := make([]*epollWorker, 0, len(listenerFDs))
+	for i, lfd := range listenerFDs {
+		w, err := newEpollWorkerOnListener(s, lfd, minPerWorker)
+		if err != nil {
+			for _, built := range workers {
+				built.closeUnstarted()
+			}
+			closeEpollListeners(listenerFDs[i+1:])
+			return nil, err
+		}
+		w.coreID = i % runtime.NumCPU()
+		w.tlsMode = tlsMode
+		workers = append(workers, w)
 	}
 	go s.epollScavenger()
-	errCh := make(chan error, workers)
-	for i := 0; i < workers; i++ {
-		coreID := i % runtime.NumCPU()
+	errCh := make(chan error, len(workers))
+	for _, w := range workers {
+		w.loopErr = errCh
 		go func() {
-			w, err := newEpollWorker(s, addr, minPerWorker)
-			if err != nil {
-				errCh <- err
-				return
-			}
-			w.coreID = coreID
-			w.tlsMode = tlsMode
-			w.loopErr = errCh
 			if w.inlineAll || s.Router.hasInlineRoutes() {
 				s.inlineWatch.add(w)
 			}
@@ -451,7 +486,15 @@ func (s *Server) serveEpoll(addr string, tlsMode bool) error {
 			}
 		}()
 	}
-	return <-errCh
+	return errCh, nil
+}
+
+func (w *epollWorker) closeUnstarted() {
+	w.server.removeShutdownWaker(w)
+	w.handlers.close()
+	_ = unix.Close(w.listenerFD)
+	_ = unix.Close(w.wakeFd)
+	_ = unix.Close(w.epfd)
 }
 
 func (s *Server) epollScavenger() {
@@ -544,6 +587,10 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 	if err != nil {
 		return nil, fmt.Errorf("epoll listen %s: %w", addr, err)
 	}
+	return newEpollWorkerOnListener(s, lfd, minPrealloc)
+}
+
+func newEpollWorkerOnListener(s *Server, lfd int, minPrealloc int) (*epollWorker, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		_ = unix.Close(lfd)
@@ -731,6 +778,22 @@ func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
 }
 
 func epollListen(addr string) (int, error) {
+	fd, err := epollBind(addr, true)
+	if err != nil {
+		return -1, err
+	}
+	if err := unix.Listen(fd, epollListenBacklog); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func epollReserve(addr string) (int, error) {
+	return epollBind(addr, false)
+}
+
+func epollBind(addr string, reuseAddr bool) (int, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", addr)
 	if err != nil {
 		return -1, err
@@ -739,7 +802,9 @@ func epollListen(addr string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	if reuseAddr {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	}
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	setConnSockopts(fd)
 	sa := &unix.SockaddrInet4{Port: tcpAddr.Port}
@@ -750,11 +815,12 @@ func epollListen(addr string) (int, error) {
 		_ = unix.Close(fd)
 		return -1, err
 	}
-	if err := unix.Listen(fd, epollListenBacklog); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
 	return fd, nil
+}
+
+func activateEpollListener(fd int) error {
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	return unix.Listen(fd, epollListenBacklog)
 }
 
 func (w *epollWorker) run() error {
@@ -1113,15 +1179,23 @@ func (w *epollWorker) flushPending() {
 			w.resumeConn(c)
 			continue
 		}
-		if c.deadline == 0 && !c.closeAfter && c.idleDrained() {
-			c.deadline = w.wsQuietDeadline(c)
+		if c.deadline == 0 && !c.closeAfter {
+			if c.idleDrained() {
+				c.deadline = w.wsQuietDeadline(c)
+			} else if c.speaksH2() && c.outputSettled() {
+				c.deadline = deadlineFrom(w.readTO)
+			}
 		}
 	}
 	w.flushList = w.flushList[:0]
 }
 
 func (c *epollConn) idleDrained() bool {
-	return c.inFlight == 0 && !c.dispatching && c.readN == 0 && !c.outArmed && c.writeSent == len(c.writeBuf) && len(c.bodyOut) == 0
+	return c.readN == 0 && c.outputSettled()
+}
+
+func (c *epollConn) outputSettled() bool {
+	return c.inFlight == 0 && !c.dispatching && !c.outArmed && c.writeSent == len(c.writeBuf) && len(c.bodyOut) == 0
 }
 
 func (c *epollConn) holdsIdleBuffers() bool {
@@ -1912,7 +1986,7 @@ func (c *epollConn) compactH2ReadBuffer(force bool) {
 	if st.appBufOff == 0 {
 		return
 	}
-	if !force && st.appBufOff <= cap(c.readBuf)/2 {
+	if !force && st.appBufOff <= cap(c.readBuf)/2 && st.appBufOff != c.readN {
 		return
 	}
 	remaining := c.readN - st.appBufOff

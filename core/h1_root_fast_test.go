@@ -24,7 +24,7 @@ type rootFastResult struct {
 }
 
 func rootFastBoth(raw []byte) (got, want rootFastResult) {
-	got.consumed, got.keepAlive, got.ok, got.needRead = parsePlainFastRootRequest(raw, len(rootPrefixBytes), rootFastMaxHeader)
+	got.consumed, got.keepAlive, got.ok, got.needRead = parsePlainFastRootRequest(raw, len(rootPrefixBytes), rootFastMaxHeader, defaultMaxHeaderCount)
 	want.consumed, want.keepAlive, want.ok, want.needRead = parsePlainFastRootRequestRef(raw, len(rootPrefixBytes), rootFastMaxHeader)
 	return got, want
 }

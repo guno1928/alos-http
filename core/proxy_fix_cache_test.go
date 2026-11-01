@@ -184,9 +184,9 @@ const (
 )
 
 func proxyFixCacheActual(pc *ProxyCache) (entries, bytes int64) {
-	pc.entries.Range(func(_ string, e *cacheEntry) bool {
+	pc.entries.Range(func(key string, e *cacheEntry) bool {
 		entries++
-		bytes += int64(e.bodyLen) + int64(e.gzipLen)
+		bytes += cacheEntryCost(key, e)
 		return true
 	})
 	return entries, bytes

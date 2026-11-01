@@ -298,6 +298,7 @@ func (l *beLoop) sweepH2(c *backendConn, now int64) {
 			l.finish(st.ex, errFPTimeout)
 		}
 	}
+	l.h2proto.closeIfExhausted(c)
 }
 
 // fpNoDeadline marks a connection that must not be reaped on a timer, such as

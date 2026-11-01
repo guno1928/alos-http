@@ -115,6 +115,9 @@ func (l *beLoop) newConn(ex *Exchange) {
 }
 
 func (l *beLoop) dialBackend(c *backendConn, ip netip.Addr, port uint16) error {
+	if l.cfg.AllowAddr != nil && !l.cfg.AllowAddr(ip) {
+		return errFPDialBlocked
+	}
 	fd, err := dialNonBlocking(ip, port)
 	if err != nil {
 		return errFPDialFailed

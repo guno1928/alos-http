@@ -299,7 +299,7 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 
 	path, pathOK := originFormTarget(path)
 	if !ValidateHost(host) || !pathOK {
-		_ = writeFull(conn, []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		writeHTTPRouteStatus(conn, 400)
 		return
 	}
 
@@ -343,7 +343,7 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 			}
 		}
 
-		_ = writeFull(conn, []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		writeHTTPRouteStatus(conn, 404)
 		return
 	}
 
@@ -421,12 +421,14 @@ func (s *Server) proxyHTTPRoute(conn net.Conn, raw []byte, ds *domainState) {
 }
 
 func writeHTTPRouteStatus(conn net.Conn, status int) {
-	out := make([]byte, 0, 96)
+	out := make([]byte, 0, 96+httpDateLineLen)
 	out = append(out, "HTTP/1.1 "...)
 	out = appendInt(out, status)
 	out = append(out, ' ')
 	out = append(out, statusText(status)...)
-	out = append(out, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"...)
+	out = append(out, "\r\n"...)
+	out = append(out, currentHTTPDateLine()[:]...)
+	out = append(out, "Content-Length: 0\r\nConnection: close\r\n\r\n"...)
 	_ = writeFull(conn, out)
 }
 
@@ -531,7 +533,9 @@ func buildACMEResponse(body []byte) []byte {
 
 	buf = append(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "...)
 	buf = appendInt(buf, len(body))
-	buf = append(buf, "\r\nConnection: close\r\n\r\n"...)
+	buf = append(buf, "\r\n"...)
+	buf = append(buf, currentHTTPDateLine()[:]...)
+	buf = append(buf, "Connection: close\r\n\r\n"...)
 	buf = append(buf, body...)
 
 	result := make([]byte, len(buf))
@@ -667,7 +671,9 @@ func buildRedirectResponse(location string) []byte {
 
 	buf = append(buf, "HTTP/1.1 301 Moved Permanently\r\nLocation: "...)
 	buf = append(buf, location...)
-	buf = append(buf, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"...)
+	buf = append(buf, "\r\n"...)
+	buf = append(buf, currentHTTPDateLine()[:]...)
+	buf = append(buf, "Content-Length: 0\r\nConnection: close\r\n\r\n"...)
 
 	result := make([]byte, len(buf))
 	copy(result, buf)

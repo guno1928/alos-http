@@ -141,7 +141,8 @@ type proxyFixFailureCase struct {
 }
 
 func proxyFixRefusedAddr(t *testing.T) string {
-	return proxyFixFreeAddr(t)
+	t.Helper()
+	return refusedLoopbackAddr(t)
 }
 
 func proxyFixFailureCases() []proxyFixFailureCase {

@@ -65,10 +65,10 @@ func h3AppendFrame(dst []byte, frameType uint64, payload []byte) []byte {
 	return dst
 }
 
-func h3AppendSettingsFrame(dst []byte) []byte {
+func h3AppendSettingsFrame(dst []byte, fieldSectionLimit int) []byte {
 	var payload []byte
 	payload = quicAppendVarint(payload, h3SettingMaxHeaderListSize)
-	payload = quicAppendVarint(payload, h3MaxFieldSectionSize)
+	payload = quicAppendVarint(payload, uint64(fieldSectionLimit))
 	payload = quicAppendVarint(payload, h3SettingQPACKMaxTableCap)
 	payload = quicAppendVarint(payload, 0)
 	payload = quicAppendVarint(payload, h3SettingQPACKBlockedStr)
@@ -93,21 +93,22 @@ func (r *h3FrameReader) next() (frameType uint64, payload []byte, ok bool) {
 	if r.off >= len(r.data) {
 		return 0, nil, false
 	}
-	ft, n := quicParseVarint(r.data[r.off:])
+	pos := r.off
+	ft, n := quicParseVarint(r.data[pos:])
 	if n == 0 {
 		return 0, nil, false
 	}
-	r.off += n
-	fLen, n := quicParseVarint(r.data[r.off:])
+	pos += n
+	fLen, n := quicParseVarint(r.data[pos:])
 	if n == 0 {
 		return 0, nil, false
 	}
-	r.off += n
-	if fLen > uint64(len(r.data)-r.off) {
+	pos += n
+	if fLen > uint64(len(r.data)-pos) {
 		return 0, nil, false
 	}
-	payload = r.data[r.off : r.off+int(fLen)]
-	r.off += int(fLen)
+	payload = r.data[pos : pos+int(fLen)]
+	r.off = pos + int(fLen)
 	return ft, payload, true
 }
 

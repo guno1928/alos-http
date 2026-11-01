@@ -237,7 +237,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	if c.tlsRetry == nil {
 		flight = AppendRecord(flight, 0x14, tlsCompatCCS[:])
 	}
-	flight = appendTLSInnerRecord(flight, serverHSWriter, inner)
+	flight = appendTLSInnerRecords(flight, serverHSWriter, inner)
 
 	var derivedFromHSBuf [64]byte
 	derivedFromHS := cs.DeriveSecretTo(&cs.labelDerived, handshakeSecret, cs.emptyTranscriptHash, derivedFromHSBuf[:0])

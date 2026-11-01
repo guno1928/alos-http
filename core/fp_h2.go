@@ -6,6 +6,8 @@ import "strconv"
 
 const fpH2MaxWindow = 1<<31 - 1
 
+const fpH2MaxStreamID = 1<<31 - 1
+
 func h2WindowFits(window, delta int32) bool {
 	sum := int64(window) + int64(delta)
 	return sum <= fpH2MaxWindow && sum >= -fpH2MaxWindow-1
@@ -111,13 +113,40 @@ func (h *h2Proto) attach(c *backendConn) error {
 
 func (h *h2Proto) flushPending(c *backendConn) {
 	hc := c.h2
-	for len(hc.pending) > 0 {
-		if uint32(len(hc.streams)) >= hc.maxConcurrent || hc.goAway {
+	for c.state != connClosed {
+		if hc.nextID > fpH2MaxStreamID {
+			h.retireExhausted(c)
+			return
+		}
+		if len(hc.pending) == 0 || uint32(len(hc.streams)) >= hc.maxConcurrent || hc.goAway {
 			return
 		}
 		ex := hc.pending[0]
+		hc.pending[0] = nil
 		hc.pending = hc.pending[1:]
 		h.openStream(c, ex)
+	}
+}
+
+func (h *h2Proto) retireExhausted(c *backendConn) {
+	pending := c.h2.pending
+	c.h2.pending = nil
+	if c.be.h2conns[c.key] == c {
+		delete(c.be.h2conns, c.key)
+	}
+	h.closeIfExhausted(c)
+	for i, ex := range pending {
+		pending[i] = nil
+		if !ex.finished {
+			c.be.startExchange(ex)
+		}
+	}
+}
+
+func (h *h2Proto) closeIfExhausted(c *backendConn) {
+	hc := c.h2
+	if hc.nextID > fpH2MaxStreamID && len(hc.streams) == 0 && len(hc.pending) == 0 && c.be.h2conns[c.key] != c {
+		c.be.closeConn(c, nil)
 	}
 }
 
@@ -386,8 +415,15 @@ func (h *h2Proto) resumeBodies(c *backendConn) {
 	}
 }
 
+func (hc *h2Conn) unopenedStream(streamID uint32) bool {
+	return streamID&1 == 0 || streamID >= hc.nextID && hc.streams[streamID] == nil
+}
+
 func (h *h2Proto) onHeaders(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
+	if hc.unopenedStream(streamID) {
+		return errFPBadResponse
+	}
 	if flags&h2FlagPadded != 0 {
 		if len(payload) < 1 {
 			return errFPBadResponse
@@ -421,7 +457,7 @@ const (
 
 func (h *h2Proto) onContinuation(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
-	if hc.continuation != streamID {
+	if hc.continuation == 0 || hc.continuation != streamID {
 		return errFPBadResponse
 	}
 	if len(hc.headerAssembly)+len(payload) > fpMaxHeaderAssembly {
@@ -465,6 +501,9 @@ func (h *h2Proto) completeHeaders(c *backendConn, streamID uint32, endStream boo
 
 func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
+	if hc.unopenedStream(streamID) {
+		return errFPBadResponse
+	}
 	consumed := len(payload)
 	if flags&h2FlagPadded != 0 {
 		if len(payload) < 1 {
@@ -538,6 +577,7 @@ func (h *h2Proto) closeStream(c *backendConn, streamID uint32, err error) {
 		st.ended = true
 		c.be.failOrRetry(st.ex, err, c)
 	}
+	h.closeIfExhausted(c)
 }
 
 func (h *h2Proto) onPeerClose(c *backendConn) {

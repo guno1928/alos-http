@@ -189,10 +189,11 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 	if len(fast.body) == 0 {
 		dst = appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, fast.headerPayload)
 		refreshH2DateField(dst[off+9 : headerEnd])
-		return dst
+		return finishH2HeadersFrame(dst, off, maxFrame)
 	}
 	dst = appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders, streamID, fast.headerPayload)
 	refreshH2DateField(dst[off+9 : headerEnd])
+	dst = finishH2HeadersFrame(dst, off, maxFrame)
 	remaining := fast.body
 	for len(remaining) > 0 {
 		chunk := remaining
@@ -210,46 +211,72 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 }
 
 func appendH2StatusOnlyResponse(dst []byte, streamID uint32, status int, serverName string) []byte {
-	return appendH2StatusOnlyResponseIndexed(dst, streamID, status, serverName, nil)
+	return appendH2StatusOnlyResponseIndexed(dst, streamID, status, serverName, nil, H2DefaultMaxFrameSize)
 }
 
-func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable) []byte {
+func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable, maxFrame int) []byte {
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
-	payloadStart := len(enc.Buf)
 	encodeH2ResponseHeadersIndexed(&enc, tbl, status, "", 0, nil, serverName)
-	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
-	return enc.Buf
+	return finishH2HeadersFrame(enc.Buf, off, maxFrame)
 }
 
-func appendH2HeaderBlockFrame(dst []byte, streamID uint32, flags byte, tbl *hpackEncTable, block []byte) []byte {
-	if !tbl.pendingUpdate {
-		return appendH2Frame(dst, H2FrameHeaders, flags, streamID, block)
-	}
+func appendH2HeaderBlockFrame(dst []byte, streamID uint32, flags byte, tbl *hpackEncTable, block []byte, maxFrame int) []byte {
 	off := len(dst)
+	if !tbl.pendingUpdate {
+		return finishH2HeadersFrame(appendH2Frame(dst, H2FrameHeaders, flags, streamID, block), off, maxFrame)
+	}
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
-	payloadStart := len(enc.Buf)
 	tbl.beginBlock(&enc)
 	enc.Buf = append(enc.Buf, block...)
-	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
-	return enc.Buf
+	return finishH2HeadersFrame(enc.Buf, off, maxFrame)
 }
 
 func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool) []byte {
-	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, endStream, nil, respServerName(resp))
+	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, endStream, nil, respServerName(resp), H2DefaultMaxFrameSize)
 }
 
-func appendH2ResponseHeadersFrameIndexed(dst []byte, streamID uint32, resp *Response, endStream bool, tbl *hpackEncTable, serverName string) []byte {
+func appendH2ResponseHeadersFrameIndexed(dst []byte, streamID uint32, resp *Response, endStream bool, tbl *hpackEncTable, serverName string, maxFrame int) []byte {
 	flags := byte(H2FlagEndHeaders)
 	if endStream {
 		flags |= H2FlagEndStream
 	}
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
-	payloadStart := len(enc.Buf)
 	encodeH2ResponseHeadersIndexed(&enc, tbl, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, serverName)
-	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
-	return enc.Buf
+	return finishH2HeadersFrame(enc.Buf, off, maxFrame)
+}
+
+func finishH2HeadersFrame(dst []byte, off, maxFrame int) []byte {
+	n := len(dst) - off - h2FrameHeaderLen
+	if n > maxFrame {
+		return fragmentH2HeadersFrame(dst, off, maxFrame)
+	}
+	putH2FrameLength(dst[off:], n)
+	return dst
+}
+
+func fragmentH2HeadersFrame(dst []byte, off, maxFrame int) []byte {
+	blockStart := off + h2FrameHeaderLen
+	blockLen := len(dst) - blockStart
+	streamID := uint32(dst[off+5])<<24 | uint32(dst[off+6])<<16 | uint32(dst[off+7])<<8 | uint32(dst[off+8])
+	flags := dst[off+4]
+	frames := (blockLen + maxFrame - 1) / maxFrame
+	end := len(dst)
+	dst = slices.Grow(dst, (frames-1)*h2FrameHeaderLen)[:end+(frames-1)*h2FrameHeaderLen]
+	for i := frames - 1; i > 0; i-- {
+		chunkStart := blockStart + i*maxFrame
+		chunkLen := min(maxFrame, end-chunkStart)
+		frameOff := off + i*(h2FrameHeaderLen+maxFrame)
+		copy(dst[frameOff+h2FrameHeaderLen:], dst[chunkStart:chunkStart+chunkLen])
+		continuationFlags := byte(0)
+		if i == frames-1 {
+			continuationFlags = H2FlagEndHeaders
+		}
+		putH2FrameHeader(dst[frameOff:], H2FrameContinuation, continuationFlags, streamID, chunkLen)
+	}
+	putH2FrameHeader(dst[off:], H2FrameHeaders, flags&^H2FlagEndHeaders, streamID, maxFrame)
+	return dst
 }
 
 func putH2FrameLength(frame []byte, n int) {

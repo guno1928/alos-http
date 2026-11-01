@@ -182,9 +182,9 @@ func TestSeparateOriginsDoNotShareConnections(t *testing.T) {
 
 const poolWaveSize = 4
 
-func gatedOrigin(t *testing.T) (*httptest.Server, *atomic.Int64, chan struct{}, chan struct{}) {
+func gatedOrigin(t *testing.T) (*httptest.Server, *atomic.Int64, *atomic.Int64, chan struct{}, chan struct{}) {
 	t.Helper()
-	var accepted atomic.Int64
+	var accepted, closed atomic.Int64
 	arrived := make(chan struct{}, poolWaveSize)
 	release := make(chan struct{}, poolWaveSize)
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,17 +193,20 @@ func gatedOrigin(t *testing.T) (*httptest.Server, *atomic.Int64, chan struct{}, 
 		_, _ = w.Write([]byte("ok"))
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
+		switch state {
+		case http.StateNew:
 			accepted.Add(1)
+		case http.StateClosed:
+			closed.Add(1)
 		}
 	}
 	srv.Start()
 	t.Cleanup(srv.Close)
-	return srv, &accepted, arrived, release
+	return srv, &accepted, &closed, arrived, release
 }
 
 func TestSetMaxIdlePerBackendAppliesToTheLivePool(t *testing.T) {
-	srv, accepted, arrived, release := gatedOrigin(t)
+	srv, accepted, closed, arrived, release := gatedOrigin(t)
 	client, err := NewUpstreamClient(UpstreamConfig{Loops: 1, LoopsPerOrigin: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -238,6 +241,9 @@ func TestSetMaxIdlePerBackendAppliesToTheLivePool(t *testing.T) {
 		t.Fatalf("with one idle slot two waves opened %d connections, want %d", got, want)
 	}
 
+	waitFor(t, harnessIOTimeout, func() bool {
+		return accepted.Load()-closed.Load() == 1
+	})
 	client.SetMaxIdlePerBackend(poolWaveSize)
 	wave()
 	wave()

@@ -21,6 +21,7 @@ var (
 	errFPBadAuthority   = errors.New("outbound: bad authority")
 	errFPDNSFailed      = errors.New("outbound: dns lookup failed")
 	errFPTooManyConns   = errors.New("outbound: backend connection limit reached")
+	errFPDialBlocked    = errors.New("outbound: destination address not allowed")
 )
 
 type fpRequest struct {
@@ -119,6 +120,7 @@ type fpConfig struct {
 	IdleTimeout       time.Duration
 	MaxResponseBody   int
 	MaxHeaderBytes    int
+	AllowAddr         func(netip.Addr) bool
 }
 
 const (

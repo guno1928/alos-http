@@ -577,12 +577,7 @@ func TestInLoopProxyPreservesRawPath(t *testing.T) {
 
 // A backend that refuses the connection must be retried against a healthy one.
 func TestInLoopProxyRetriesFailedBackend(t *testing.T) {
-	dead, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	deadAddr := dead.Addr().String()
-	dead.Close() // nothing is listening now, so connects are refused
+	deadAddr := refusedLoopbackAddr(t)
 
 	o := newInloopOrigin(t, echoBodyOrigin("from healthy"))
 	var errCount atomic.Int64

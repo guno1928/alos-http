@@ -89,7 +89,7 @@ func (c *epollConn) newH1StreamWriter(req *Request) StreamWriter {
 	sw.c, sw.w, sw.gen = c, c.worker, c.h1DispatchGen
 	sw.method = req.Method
 	sw.serverName = srv.config.ServerName
-	sw.altSvc = srv.altSvcFor(c.tls)
+	sw.altSvc = srv.altSvcFor(req.IsTLS)
 	sw.reqClose = c.h1DispatchClose
 	sw.limiter, sw.global = c.connLimiter, srv.globalLimiter
 	sw.maxWrite = srv.config.MaxWriteSize

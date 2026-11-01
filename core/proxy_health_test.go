@@ -29,13 +29,7 @@ const (
 // refused rather than hanging.
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	return refusedLoopbackAddr(t)
 }
 
 // statusOrigin answers every request with the given status line.

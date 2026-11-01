@@ -189,7 +189,7 @@ func TestParsePlainFastRootRequestDefersAnythingUnusual(t *testing.T) {
 		"GET / HTTP/1.1\r\nUser-Agent: x\r\nhost:a\r\nAccept: */*\r\n\r\n",
 	}
 	for _, raw := range accept {
-		if _, _, ok, needRead := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192); !ok || needRead {
+		if _, _, ok, needRead := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192, defaultMaxHeaderCount); !ok || needRead {
 			t.Errorf("fast path refused a clean request %q", raw)
 		}
 	}
@@ -208,7 +208,7 @@ func TestParsePlainFastRootRequestDefersAnythingUnusual(t *testing.T) {
 		"GET / HTTP/1.1\r\nHost: a\r\nexpect: foo\r\n\r\n",
 	}
 	for _, raw := range deferred {
-		if _, _, ok, _ := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192); ok {
+		if _, _, ok, _ := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192, defaultMaxHeaderCount); ok {
 			t.Errorf("fast path accepted %q instead of deferring to the strict parser", raw)
 		}
 	}

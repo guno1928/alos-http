@@ -582,6 +582,9 @@ func appendProxyStreamHead(dst []byte, status int, headers respHeaders, contentL
 		dst = headers.appendPair(dst, i)
 		dst = append(dst, "\r\n"...)
 	}
+	if !headers.hasDate() {
+		dst = append(dst, currentHTTPDateLine()[:]...)
+	}
 	if contentLen >= 0 {
 		dst = append(dst, "Content-Length: "...)
 		dst = strconv.AppendInt(dst, contentLen, 10)
@@ -595,6 +598,23 @@ func appendProxyStreamHead(dst []byte, status int, headers respHeaders, contentL
 		dst = append(dst, "Connection: close\r\n"...)
 	}
 	return append(dst, "\r\n"...)
+}
+
+func (h respHeaders) hasDate() bool {
+	if h.raw != nil {
+		for i := range h.raw {
+			if headerNameIsBytes(h.raw[i][0], "date") {
+				return true
+			}
+		}
+		return false
+	}
+	for i := range h.str {
+		if name := h.str[i][0]; name == "date" || headerNameIs(name, "date") {
+			return true
+		}
+	}
+	return false
 }
 
 func appendChunkFrame(dst []byte, data []byte) []byte {
@@ -802,6 +822,9 @@ func appendProxyResponseHead(dst []byte, status int, headers respHeaders, bodyLe
 		}
 		dst = headers.appendPair(dst, i)
 		dst = append(dst, "\r\n"...)
+	}
+	if !headers.hasDate() {
+		dst = append(dst, currentHTTPDateLine()[:]...)
 	}
 	if contentType != "" {
 		dst = append(dst, "Content-Type: "...)

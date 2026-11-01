@@ -224,6 +224,7 @@ type QUICConn struct {
 	coalesceStart    int
 	pktBudget        int
 	peerStreamWindow uint64
+	peerUniWindow    uint64
 	streamWriters    atomic.Int32
 	workShard        uint8
 	loss             *quicLossState
@@ -358,6 +359,8 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	}
 	qc.handshakeDeadline = quicHandshakeDeadline(server)
 	qc.peerAckDelayExponent = quicDefaultAckDelayExponent
+	qc.peerStreamWindow = quicDefaultStreamSendWindow
+	qc.peerUniWindow = quicDefaultStreamSendWindow
 	qc.recvFlowLimit.Store(maxData)
 	qc.stallSoftCap = quicStalledSendSoftCap(server)
 	qc.stallHardCap = qc.stallSoftCap * quicStalledSendHardFactor
@@ -895,6 +898,10 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 		return
 	}
 	qc.streamsMu.Lock()
+	if qc.closed.Load() {
+		qc.streamsMu.Unlock()
+		return
+	}
 	s, ok := qc.streams[f.streamID]
 	if !ok {
 		switch qc.openPeerStreamLocked(f.streamID) {
@@ -954,7 +961,7 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 			qc.activeReqStreams.Add(-1)
 			if s.dispatched.CompareAndSwap(false, true) {
 				qc.resetStreamSend(s, h3ErrRequestRejected)
-				qc.retireStream(s, 1)
+				qc.retireStream(s)
 			}
 		} else if !s.dispatched.CompareAndSwap(false, true) {
 			qc.activeReqStreams.Add(-1)
@@ -1049,7 +1056,7 @@ func (qc *QUICConn) rejectStreamBody(s *QUICStream) {
 	}
 	qc.stopSending(s.id, h3ErrRequestRejected)
 	qc.resetStreamSend(s, h3ErrRequestRejected)
-	qc.retireStream(s, 1)
+	qc.retireStream(s)
 }
 
 func (qc *QUICConn) consumeRecvFlowCredit(n uint64) bool {
@@ -1117,7 +1124,7 @@ func (qc *QUICConn) handleResetStream(f quicResetStreamFrame) {
 		if quicStreamIsBidi(f.streamID) {
 			qc.resetStreamSend(s, h3ErrRequestIncomplete)
 		}
-		qc.retireStream(s, 1)
+		qc.retireStream(s)
 	}
 }
 
@@ -1197,6 +1204,7 @@ func (qc *QUICConn) closeWithError(errorCode uint64, reason string) {
 
 func (qc *QUICConn) serveRequestStream(s *QUICStream) {
 	defer qc.activeReqStreams.Add(-1)
+	defer qc.releaseStream(s)
 	qc.h3.handleRequestStream(s)
 	s.mu.Lock()
 	s.handlerFinishedLocked()
@@ -1209,19 +1217,25 @@ func (qc *QUICConn) serveRequestStream(s *QUICStream) {
 }
 
 func (qc *QUICConn) finishRequestStream(s *QUICStream) {
-	qc.retireStream(s, 2)
+	qc.retireStream(s)
 }
 
-func (qc *QUICConn) retireStream(s *QUICStream, refs int) {
+func (qc *QUICConn) retireStream(s *QUICStream) {
 	if !s.cleanupDone.CompareAndSwap(false, true) {
 		return
 	}
 	id := s.id
 	qc.streamsMu.Lock()
-	delete(qc.streams, id)
+	ownsMapRef := qc.streams[id] == s
+	if ownsMapRef {
+		delete(qc.streams, id)
+	}
 	qc.streamsMu.Unlock()
-	for i := 0; i < refs; i++ {
+	if ownsMapRef {
 		qc.releaseStream(s)
+	}
+	if qc.closed.Load() {
+		return
 	}
 	if !quicStreamIsBidi(id) {
 		if !quicStreamIsLocal(id, true) {
@@ -1266,9 +1280,15 @@ func (qc *QUICConn) maybeFinishStream(s *QUICStream) {
 
 func (qc *QUICConn) openLocalUniStream() *QUICStream {
 	qc.streamsMu.Lock()
+	if qc.closed.Load() {
+		qc.streamsMu.Unlock()
+		return nil
+	}
 	id := qc.nextUniLocal
 	qc.nextUniLocal += 4
 	s := newQUICStream(id, qc)
+	s.maxSend = qc.peerUniWindow
+	s.refCount.Store(2)
 	qc.streams[id] = s
 	qc.streamsMu.Unlock()
 	return s
@@ -1490,12 +1510,9 @@ func (qc *QUICConn) applyPeerTransportParams(ch *ParsedClientHello) {
 		qc.peerAckDelayExponent = ch.quicTP.ackDelayExponent
 		qc.loss.setPeerMaxAckDelay(time.Duration(ch.quicTP.maxAckDelayMs) * time.Millisecond)
 	}
-	if ch.InitialMaxData > 0 {
-		qc.maxDataRemote = ch.InitialMaxData
-	}
-	if ch.InitialMaxStreamDataBidiLocal > 0 {
-		qc.peerStreamWindow = ch.InitialMaxStreamDataBidiLocal
-	}
+	qc.maxDataRemote = ch.InitialMaxData
+	qc.peerStreamWindow = ch.InitialMaxStreamDataBidiLocal
+	qc.peerUniWindow = ch.InitialMaxStreamDataUni
 	qc.cidMu.Lock()
 	qc.peerCIDLimit = ch.ActiveConnIDLimit
 	qc.cidMu.Unlock()
@@ -1755,11 +1772,15 @@ func (qc *QUICConn) close() {
 	}
 
 	qc.streamsMu.Lock()
-	for _, s := range qc.streams {
+	streams := qc.streams
+	qc.streams = nil
+	qc.streamsMu.Unlock()
+	for _, s := range streams {
 		s.abortHandler(ErrClientGone)
 		s.Close()
+		qc.maybeFinishStream(s)
+		qc.releaseStream(s)
 	}
-	qc.streamsMu.Unlock()
 }
 
 func (qc *QUICConn) sendConnectionClose(errorCode uint64, reason string) {

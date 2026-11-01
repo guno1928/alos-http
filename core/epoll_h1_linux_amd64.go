@@ -212,9 +212,6 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 		streamBody := c.worker.streamsH1Body(chunked, hasContentLength, contentLength)
 		if chunked && !streamBody {
-			if !c.reserveH1BodyBudget(srv, h1ChunkedBodyReservation(srv)) {
-				return c.h1Reject(out, 503, "Request Body Capacity Exhausted"), h1StepClose
-			}
 			scanFrom := headerEnd
 			if c.chunkScanPos > headerEnd && c.chunkScanPos <= len(data) {
 				scanFrom = c.chunkScanPos
@@ -223,6 +220,13 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			if status == -1 {
 				c.chunkScanPos = 0
 				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
+			}
+			received := len(data) - headerEnd
+			if status != 0 {
+				received = bodyEnd - headerEnd
+			}
+			if !c.reserveH1BodyBudget(srv, received) {
+				return c.h1Reject(out, 503, "Request Body Capacity Exhausted"), h1StepClose
 			}
 			if status == 0 {
 				c.chunkScanPos = resume
@@ -265,15 +269,12 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			if bodyEnd > maxRead {
 				return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
 			}
-			if !c.reserveH1BodyBudget(srv, contentLength) {
+			if !c.reserveH1BodyBudget(srv, min(len(data), bodyEnd)-headerEnd) {
 				return c.h1Reject(out, 503, "Request Body Capacity Exhausted"), h1StepClose
 			}
 			if bodyEnd > len(data) {
 				if !c.tls && c.h1Off+bodyEnd > cap(c.readBuf) {
 					c.compactH1ReadBuffer()
-					if bodyEnd > cap(c.readBuf) && !c.growReadBuf(bodyEnd, maxRead) {
-						return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
-					}
 				}
 				c.deadline = c.h1BodyReadDeadline()
 				return c.h1Continue(out), h1StepNeedInput
@@ -509,15 +510,6 @@ func (c *epollConn) compactH1ReadBuffer() {
 	}
 	c.readN = remaining
 	c.h1Off = 0
-}
-
-func (c *epollConn) growReadBuf(minCap, maxRead int) bool {
-	grown, ok := growPlainReadBuffer(c.readBuf[:c.readN], minCap-c.readN, maxRead)
-	if !ok {
-		return false
-	}
-	c.readBuf, c.readScratch = grown[:cap(grown)], false
-	return true
 }
 
 const chunkedFramingSlack = 1 << 16

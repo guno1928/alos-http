@@ -41,10 +41,14 @@ func (h3 *H3Conn) start() {
 
 func (h3 *H3Conn) sendControlStream() {
 	s := h3.qconn.openLocalUniStream()
+	if s == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(s)
 	h3.controlID = s.id
 	var buf []byte
 	buf = h3AppendStreamType(buf, h3StreamControl)
-	buf = h3AppendSettingsFrame(buf)
+	buf = h3AppendSettingsFrame(buf, h3.server.h3FieldSectionLimit())
 	s.Write(buf)
 	h3.qconn.sendStreamData(s)
 }
@@ -62,12 +66,20 @@ func (h3 *H3Conn) sendGoAway(id uint64) {
 
 func (h3 *H3Conn) sendQPACKStreams() {
 	enc := h3.qconn.openLocalUniStream()
+	if enc == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(enc)
 	var encBuf []byte
 	encBuf = h3AppendStreamType(encBuf, h3StreamQPACKEnc)
 	enc.Write(encBuf)
 	h3.qconn.sendStreamData(enc)
 
 	dec := h3.qconn.openLocalUniStream()
+	if dec == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(dec)
 	var decBuf []byte
 	decBuf = h3AppendStreamType(decBuf, h3StreamQPACKDec)
 	dec.Write(decBuf)
@@ -113,6 +125,11 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	for {
 		frameType, payload, ok := reader.next()
 		if !ok {
+			if reader.off != len(data) {
+				releaseRequestToPool(req)
+				h3.qconn.closeWithAppError(h3ErrFrame, "truncated request frame")
+				return
+			}
 			break
 		}
 		switch frameType {

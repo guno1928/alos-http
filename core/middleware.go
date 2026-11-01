@@ -816,10 +816,8 @@ func BasicAuth(cfg BasicAuthConfig) MiddlewareFunc {
 			pass := decoded[colon+1:]
 			passHash := sha256.Sum256([]byte(pass))
 			expectedHash, ok := userHashes[user]
-			if !ok {
-				expectedHash = passHash
-			}
-			if !ok || subtle.ConstantTimeCompare(expectedHash[:], passHash[:]) != 1 {
+			passwordMatches := subtle.ConstantTimeCompare(expectedHash[:], passHash[:])
+			if !ok || passwordMatches != 1 {
 				resp.Status(401).
 					SetHeader("WWW-Authenticate", challenge).
 					String("Unauthorized")

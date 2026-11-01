@@ -434,6 +434,7 @@ type ParsedClientHello struct {
 	MaxUDPPayload                 uint64
 	InitialMaxData                uint64
 	InitialMaxStreamDataBidiLocal uint64
+	InitialMaxStreamDataUni       uint64
 	ActiveConnIDLimit             uint64
 	quicTP                        quicPeerTransportParams
 
@@ -496,6 +497,7 @@ func (ch *ParsedClientHello) Reset() {
 	ch.MaxUDPPayload = 0
 	ch.InitialMaxData = 0
 	ch.InitialMaxStreamDataBidiLocal = 0
+	ch.InitialMaxStreamDataUni = 0
 	ch.ActiveConnIDLimit = 0
 	ch.quicTP = quicPeerTransportParams{}
 	ch.hasUncompressedPoint = false
@@ -813,6 +815,8 @@ func applyQUICTransportParam(result *ParsedClientHello, id uint64, value []byte)
 		result.InitialMaxData = v
 	case quicTPInitialMaxStreamBidiL:
 		result.InitialMaxStreamDataBidiLocal = v
+	case quicTPInitialMaxStreamUni:
+		result.InitialMaxStreamDataUni = v
 	case quicTPActiveConnIDLimit:
 		result.ActiveConnIDLimit = v
 		return v >= quicMinActiveConnIDLimit

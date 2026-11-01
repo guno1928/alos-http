@@ -5,6 +5,9 @@ package core
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	"github.com/guno1928/turbo"
 )
 
 const (
@@ -15,8 +18,9 @@ const (
 )
 
 type qpackCachedSection struct {
-	regular [][2]string
-	meta    hpackRequestMeta
+	regular          [][2]string
+	meta             hpackRequestMeta
+	fieldSectionSize int
 }
 
 type qpackBlockCache struct {
@@ -53,11 +57,11 @@ func (c *qpackBlockCache) put(block []byte, headers [][2]string) {
 		cp[i] = [2]string{n, v}
 		total += len(n) + len(v)
 	}
-	meta, err := h3ValidateRequestSection(cp)
+	meta, err := h3ValidateRequestSection(cp, h3MaxFieldSectionSize)
 	if err != nil {
 		return
 	}
-	section := &qpackCachedSection{regular: cp[h3PseudoFieldCount(&meta):], meta: meta}
+	section := &qpackCachedSection{regular: cp[h3PseudoFieldCount(&meta):], meta: meta, fieldSectionSize: h3FieldSectionSize(cp)}
 	c.mu.Lock()
 	if c.hasRoomLocked(total) {
 		if _, exists := c.m[string(block)]; !exists {
@@ -553,6 +557,7 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 	}
 	wroteContentType := contentType != ""
 	wroteContentLength := contentLength >= 0
+	wroteDate := false
 	for i := range headers {
 		name := headers[i][0]
 		if name == "" || name[0] == ':' || isConnectionSpecificResponseField(name) {
@@ -571,6 +576,8 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			wroteContentLength = true
 		case headerNameIs(name, "server"):
 			continue
+		case headerNameIs(name, "date"):
+			wroteDate = true
 		}
 		if low, ok := commonLowerHeader(name); ok {
 			enc.EncodeHeader(low, headers[i][1])
@@ -578,6 +585,31 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			enc.EncodeHeader(ToLowerASCII(name), headers[i][1])
 		}
 	}
+	if !wroteDate {
+		enc.buf = append(enc.buf, loadQPACKDateField()...)
+	}
 	*bp = enc.buf
 	return bp
+}
+
+type qpackDateField struct {
+	unix int64
+	enc  []byte
+}
+
+var currentQPACKDate atomic.Pointer[qpackDateField]
+
+func loadQPACKDateField() []byte {
+	f := currentQPACKDate.Load()
+	if f == nil || f.unix != turbo.Unix() {
+		f = newQPACKDateField(loadH2DateField())
+		currentQPACKDate.Store(f)
+	}
+	return f.enc
+}
+
+func newQPACKDateField(date *h2DateField) *qpackDateField {
+	enc := QPACKEncoder{}
+	enc.EncodeHeader("date", UnsafeString(date.enc[len(h2DateFieldPrefix):]))
+	return &qpackDateField{unix: date.unix, enc: enc.buf}
 }

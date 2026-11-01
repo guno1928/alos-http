@@ -15,20 +15,21 @@ var (
 	errQPACKDecompression     = &staticError{"qpack decompression failed"}
 )
 
-func h3FieldSectionWithinLimit(fields [][2]string) bool {
+func h3FieldSectionSize(fields [][2]string) int {
 	size := 0
 	for i := range fields {
 		size += len(fields[i][0]) + len(fields[i][1]) + h3FieldLineOverhead
-		if size > h3MaxFieldSectionSize {
-			return false
-		}
 	}
-	return true
+	return size
 }
 
-func h3ValidateRequestSection(fields [][2]string) (hpackRequestMeta, error) {
+func (s *Server) h3FieldSectionLimit() int {
+	return min(h3MaxFieldSectionSize, s.h2HeaderListLimit())
+}
+
+func h3ValidateRequestSection(fields [][2]string, limit int) (hpackRequestMeta, error) {
 	var meta hpackRequestMeta
-	if !h3FieldSectionWithinLimit(fields) {
+	if h3FieldSectionSize(fields) > limit {
 		return meta, errH3FieldSectionTooLarge
 	}
 	for i := range fields {
@@ -75,7 +76,11 @@ func h3RequestErrorStatus(err error) int {
 }
 
 func (h3 *H3Conn) decodeRequestSection(block []byte, req *Request) (hpackRequestMeta, *[]byte, int) {
+	limit := h3.server.h3FieldSectionLimit()
 	if cached, hit := qpackDecodedBlocks.get(block); hit {
+		if cached.fieldSectionSize > limit {
+			return hpackRequestMeta{}, nil, h3RequestErrorStatus(errH3FieldSectionTooLarge)
+		}
 		req.Headers = append(req.Headers, cached.regular...)
 		return cached.meta, nil, 0
 	}
@@ -86,7 +91,7 @@ func (h3 *H3Conn) decodeRequestSection(block []byte, req *Request) (hpackRequest
 		}
 		return hpackRequestMeta{}, arena, h3RequestErrorStatus(err)
 	}
-	meta, err := h3ValidateRequestSection(fields)
+	meta, err := h3ValidateRequestSection(fields, limit)
 	if err != nil {
 		return meta, arena, h3RequestErrorStatus(err)
 	}
@@ -100,7 +105,7 @@ func (h3 *H3Conn) decodeTrailerSection(block []byte, req *Request) (*[]byte, int
 	if err != nil {
 		return arena, h3RequestErrorStatus(err)
 	}
-	if !h3FieldSectionWithinLimit(fields) {
+	if h3FieldSectionSize(fields) > h3.server.h3FieldSectionLimit() {
 		return arena, h3RequestErrorStatus(errH3FieldSectionTooLarge)
 	}
 	trailers, ok := h2TrailerFields(fields)

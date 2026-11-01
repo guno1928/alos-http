@@ -29,6 +29,7 @@ var (
 	ErrUpstreamDNSFailed      = errFPDNSFailed
 	ErrUpstreamTooManyConns   = errFPTooManyConns
 	ErrUpstreamBodySource     = errFPBodySource
+	ErrUpstreamDialBlocked    = errFPDialBlocked
 )
 
 // NewUpstreamClient starts the event loops and returns a client ready to use.

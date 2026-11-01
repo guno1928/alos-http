@@ -24,7 +24,26 @@ func startLimitsServer(t *testing.T, cfg Config) (*Server, string) {
 	srv.Router.POST("/ok", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() { stopServer(srv) })
-	waitForProxy(t, addr)
+	var probe net.Conn
+	proxyFixEventually(t, "limits server accepts connections", func() bool {
+		conn, err := net.DialTimeout("tcp4", addr, proxyFixStep)
+		if err != nil {
+			return false
+		}
+		probe = conn
+		return true
+	})
+	defer probe.Close()
+	client := &rawConn{Conn: probe, r: bufio.NewReader(probe)}
+	status, err := client.roundTrip("GET /ok HTTP/1.1\r\nHost: limits.test\r\nConnection: close\r\n\r\n")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("readiness request: status=%d err=%v, want 200", status, err)
+	}
+	_ = probe.Close()
+	proxyFixEventually(t, "readiness connection released", func() bool {
+		limiter := srv.perIPConnLimiter.Load()
+		return srv.activeConns.Load() == 0 && (limiter == nil || liveCount(limiter, "127.0.0.1") == 0)
+	})
 	return srv, addr
 }
 

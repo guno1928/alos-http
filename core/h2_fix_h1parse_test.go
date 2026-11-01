@@ -71,7 +71,7 @@ func TestH2FixH1RootFastPathConnectionCloseTokenList(t *testing.T) {
 		{"none", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", true},
 		{"long-close-list", "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: " + strings.Repeat("u", 120) + "\r\nConnection: close, te\r\nAccept: */*\r\n\r\n", false},
 	} {
-		_, keepAlive, ok, _ := parsePlainFastRootRequest([]byte(tc.head), len(rootPrefixBytes), 8192)
+		_, keepAlive, ok, _ := parsePlainFastRootRequest([]byte(tc.head), len(rootPrefixBytes), 8192, defaultMaxHeaderCount)
 		if !ok || keepAlive != tc.wantKeepAlive {
 			t.Errorf("%s: root fast path keepAlive=%v ok=%v, want keepAlive=%v", tc.name, keepAlive, ok, tc.wantKeepAlive)
 		}

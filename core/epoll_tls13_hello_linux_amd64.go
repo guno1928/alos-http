@@ -125,6 +125,11 @@ func (c *epollConn) sendSessionTicket(srv *Server) {
 		return
 	}
 	out = append(out, tlsRecHandshake)
+	if len(out)-hdr-tlsRecordHeaderLen > MaxRecordPayload {
+		inner := append([]byte(nil), out[hdr+tlsRecordHeaderLen:]...)
+		c.writeBuf = appendTLSInnerRecords(out[:hdr], c.appWriter, inner)
+		return
+	}
 	out = ensureTailCap(out, c.appWriter.Overhead())
 	c.writeBuf = sealTLSInnerInPlace(out, c.appWriter, hdr)
 }

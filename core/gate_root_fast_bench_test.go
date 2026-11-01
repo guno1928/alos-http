@@ -18,7 +18,7 @@ func BenchmarkGatePlainRootFast(b *testing.B) {
 		b.Run(req.name, func(b *testing.B) {
 			b.SetBytes(int64(len(req.raw)))
 			for b.Loop() {
-				if _, _, ok, _ := parsePlainFastRootRequest(req.raw, len(rootPrefixBytes), 8192); !ok {
+				if _, _, ok, _ := parsePlainFastRootRequest(req.raw, len(rootPrefixBytes), 8192, defaultMaxHeaderCount); !ok {
 					b.Fatal("fast path refused the request")
 				}
 			}

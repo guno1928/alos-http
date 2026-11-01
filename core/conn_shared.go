@@ -58,13 +58,6 @@ func (deadlineExceededError) Temporary() bool { return true }
 
 var errNetDeadlineExceeded error = deadlineExceededError{}
 
-func clampListenerCount(configured int) int {
-	if configured < 1 {
-		return 1
-	}
-	return configured
-}
-
 func (s *Server) doneClosed() bool {
 	select {
 	case <-s.done:

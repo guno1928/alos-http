@@ -239,6 +239,9 @@ func (c *epollConn) epollH2Headers(srv *Server, streamID uint32, frameFlags byte
 
 func (c *epollConn) epollH2Continuation(srv *Server, streamID uint32, frameFlags byte, payload []byte) bool {
 	st := &c.h2
+	if len(payload) == 0 && c.h2ChargeLimiter(st.countCtrl()) {
+		return true
+	}
 	st.headerAccum = append(st.headerAccum, payload...)
 	if len(st.headerAccum) > st.decoder.maxHeaderListSize*4 {
 		st.expectContinuation = 0
@@ -385,7 +388,7 @@ func (c *epollConn) h2ChargeLimiter(tripped bool) bool {
 }
 
 func (c *epollConn) answerH2HeaderListTooLarge(srv *Server, streamID uint32, endStream bool) bool {
-	c.writeBuf = appendH2StatusOnlyResponseIndexed(c.writeBuf, streamID, h2StatusHeaderListTooLarge, srv.config.ServerName, &c.h2.encTable)
+	c.writeBuf = appendH2StatusOnlyResponseIndexed(c.writeBuf, streamID, h2StatusHeaderListTooLarge, srv.config.ServerName, &c.h2.encTable, c.h2.dataFrameLimit())
 	if !endStream {
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrNoError)
 	}
@@ -1112,7 +1115,7 @@ func (c *epollConn) h2AppendResponseHead(dst []byte, stream *H2Stream, streamID 
 		addAltSvcHeader(resp, c.worker.server)
 	}
 	stream.respHeadersSent = true
-	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, bodyLen == 0, &c.h2.encTable, c.worker.server.config.ServerName)
+	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, bodyLen == 0, &c.h2.encTable, c.worker.server.config.ServerName, c.h2.dataFrameLimit())
 }
 
 func (st *tlsWorkerH2State) dataFrameLimit() int {

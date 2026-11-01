@@ -5,7 +5,6 @@ package core
 import (
 	"net/netip"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/alosmap"
@@ -65,9 +64,7 @@ func rateLimitKeyForIP(ip string) string {
 }
 
 type rateLimitMWEntry struct {
-	state        atomic.Uint64
-	resetAt      atomic.Int64
-	blockedUntil atomic.Int64
+	rlCounter
 }
 
 func extractClientIP(remoteAddr string) string {
@@ -126,7 +123,6 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 
 	windowNanos := cfg.Window.Nanoseconds()
 	blockNanos := rateLimitBlockFor.Nanoseconds()
-	blockSecs := int64(rateLimitBlockFor / time.Second)
 	entries := alosmap.NewTypedSized[string, *rateLimitMWEntry](1024, 0).Prealloc(256)
 
 	stopCh := cfg.StopCh
@@ -145,13 +141,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 						Dbg("[ratelimit cleanup] recovered panic: %v", r)
 					}
 				}()
-				now := CoarseNanotime()
-				entries.Range(func(key string, entry *rateLimitMWEntry) bool {
-					if entry.resetAt.Load() < now && entry.blockedUntil.Load() < now {
-						entries.Delete(key)
-					}
-					return true
-				})
+				retireIdleRateLimitEntries(entries, CoarseNanotime(), 0)
 			}()
 		}
 	}()
@@ -188,29 +178,14 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 				entry, _ = entries.LoadOrStore(key, &rateLimitMWEntry{})
 			}
 
-			blockedUntil := entry.blockedUntil.Load()
-			if blockedUntil != 0 {
-				if now < blockedUntil {
-					retryAfterSecs := (blockedUntil - now) / 1_000_000_000
-					if retryAfterSecs < 1 {
-						retryAfterSecs = 1
-					}
-					reject(req, resp, retryAfterSecs)
-					return
-				}
-				if entry.blockedUntil.CompareAndSwap(blockedUntil, 0) {
-					entry.state.Store(rlEpochOf(now, windowNanos))
-					entry.resetAt.Store(now + windowNanos)
-				}
+			outcome, retryAfter := entry.admit(now, windowNanos, cfg.MaxRequests, blockNanos)
+			for outcome == rlRetired {
+				entries.CompareAndDelete(key, entry)
+				entry, _ = entries.LoadOrStore(key, &rateLimitMWEntry{})
+				outcome, retryAfter = entry.admit(now, windowNanos, cfg.MaxRequests, blockNanos)
 			}
-
-			count := rlBumpCount(&entry.state, now, windowNanos)
-			if count == 1 {
-				entry.resetAt.Store(now + windowNanos)
-			}
-			if count > cfg.MaxRequests {
-				entry.blockedUntil.Store(now + blockNanos)
-				reject(req, resp, blockSecs)
+			if outcome == rlLimited {
+				reject(req, resp, max(int64(retryAfter/time.Second), 1))
 				return
 			}
 

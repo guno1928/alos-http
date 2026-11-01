@@ -60,7 +60,7 @@ func (h3 *H3Conn) peerStreamEnded(s *QUICStream, st *h3PeerStream) {
 	}
 	delete(h3.peerStreams, s.id)
 	if s.dispatched.CompareAndSwap(false, true) {
-		h3.qconn.retireStream(s, 1)
+		h3.qconn.retireStream(s)
 	}
 }
 

@@ -32,13 +32,7 @@ func newOutlierOrigin(t *testing.T, status int, body string) *outlierOrigin {
 
 func closedBackendAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	return refusedLoopbackAddr(t)
 }
 
 func startOutlierProxy(t *testing.T, backends ...string) (string, *domainState, *fakeClock) {

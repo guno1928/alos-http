@@ -27,10 +27,20 @@ const (
 	h2SpecWindow      = 65535
 )
 
+var streamPatternData = func() [1 << 19]byte {
+	var pattern [1 << 19]byte
+	for position := range pattern {
+		pattern[position] = byte(position*31 + position>>11)
+	}
+	return pattern
+}()
+
 func fillStreamPattern(dst []byte, offset int) {
-	for i := range dst {
-		p := offset + i
-		dst[i] = byte(p*31 + p>>11)
+	offset &= len(streamPatternData) - 1
+	for len(dst) > 0 {
+		copied := copy(dst, streamPatternData[offset:])
+		dst = dst[copied:]
+		offset = 0
 	}
 }
 

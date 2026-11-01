@@ -61,7 +61,7 @@ func BenchmarkPerfCoreStaticHitPath(b *testing.B) {
 	b.Run("h2_head_build", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			head = appendH2ResponseHeadersFrameIndexed(head[:0], 1, rig.resp, false, &tbl, respServerName(rig.resp))
+			head = appendH2ResponseHeadersFrameIndexed(head[:0], 1, rig.resp, false, &tbl, respServerName(rig.resp), H2DefaultMaxFrameSize)
 		}
 	})
 }
