@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -243,5 +244,66 @@ func TestShutdownDuringTLSStartupIsRaceFree(t *testing.T) {
 		case <-time.After(3 * startupProbeTimeout):
 			t.Fatalf("delay %v: ListenAndServeTLS did not return after Shutdown", delay)
 		}
+	}
+}
+
+func startupLeaveTimeWait(t *testing.T, listener net.Listener) {
+	t.Helper()
+	client, err := net.Dial("tcp4", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accepted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("client did not read the server FIN: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTLSReservationToleratesForeignTimeWait(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	startupLeaveTimeWait(t, listener)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := epollReserve(addr)
+	if err != nil {
+		t.Fatalf("TLS reservation failed on TIME_WAIT sockets of a replaced listener: %v", err)
+	}
+	defer unix.Close(fd)
+	if contender, err := net.Listen("tcp4", addr); err == nil {
+		_ = contender.Close()
+		t.Fatal("retried TLS reservation let a contender take the port")
+	}
+	if err := activateEpollListener(fd); err != nil {
+		t.Fatalf("retried TLS reservation did not activate: %v", err)
+	}
+}
+
+func TestTLSReservationRefusesLiveListener(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	fd, err := epollReserve(listener.Addr().String())
+	if err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("TLS reservation shared the port of a live listener")
+	}
+	if !errors.Is(err, unix.EADDRINUSE) {
+		t.Fatalf("reservation error=%v, want EADDRINUSE", err)
 	}
 }
