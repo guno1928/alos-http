@@ -4,6 +4,7 @@ package core
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -790,7 +791,20 @@ func epollListen(addr string) (int, error) {
 }
 
 func epollReserve(addr string) (int, error) {
-	return epollBind(addr, false)
+	fd, err := epollBind(addr, false)
+	if !errors.Is(err, unix.EADDRINUSE) {
+		return fd, err
+	}
+	// TIME_WAIT or bound sockets with SO_REUSEADDR block the first bind; a live listener also blocks this retry.
+	fd, err = epollBind(addr, true)
+	if err != nil {
+		return -1, err
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 0); err != nil {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("epoll reserve %s: %w", addr, err)
+	}
+	return fd, nil
 }
 
 func epollBind(addr string, reuseAddr bool) (int, error) {
