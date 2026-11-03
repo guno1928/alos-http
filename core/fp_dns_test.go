@@ -156,3 +156,18 @@ func TestResolveIPLiterals(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDNSResponseUnmapsIPv4MappedAAAA(t *testing.T) {
+	for _, mapped := range []string{"::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:0.0.0.0"} {
+		want := netip.MustParseAddr(mapped)
+		data := want.As16()
+		msg := dnsAnswerFor(7, dnsTypeAAAA, dnsRecord(dnsTypeAAAA, 90, data[:]))
+		addr, _, err := fpParseDNSResponse(msg, 7, dnsTypeAAAA, "origin.test")
+		if err != nil {
+			t.Fatalf("%s: %v", mapped, err)
+		}
+		if !addr.Is4() || addr != want.Unmap() {
+			t.Errorf("%s: parsed %v, want the unmapped %v", mapped, addr, want.Unmap())
+		}
+	}
+}

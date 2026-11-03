@@ -417,7 +417,7 @@ func fpParseDNSResponse(b []byte, wantID, qtype uint16, host string) (netip.Addr
 		}
 		if rtype == qtype {
 			if addr, ok := netip.AddrFromSlice(b[rdata:pos]); ok && (rtype == dnsTypeA) == addr.Is4() {
-				return addr, ttl, nil
+				return addr.Unmap(), ttl, nil
 			}
 		}
 	}
