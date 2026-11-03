@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ericlagergren/aegis"
@@ -428,7 +429,7 @@ func loadCertFromDisk(certFile, keyFile string) ([][]byte, crypto.Signer, error)
 		return nil, nil, &staticError{"invalid cert PEM"}
 	}
 
-	keyBlock, _ := pem.Decode(keyPEM)
+	keyBlock := pemPrivateKeyBlock(keyPEM)
 	if keyBlock == nil {
 		return nil, nil, &staticError{"invalid key PEM"}
 	}
@@ -455,6 +456,19 @@ func loadCertFromDisk(certFile, keyFile string) ([][]byte, crypto.Signer, error)
 var errCertKeyMismatch = errors.New("TLS private key does not match the certificate")
 
 var errCertPairIncomplete = errors.New("TLS certificate and key files must be configured together")
+
+func pemPrivateKeyBlock(keyPEM []byte) *pem.Block {
+	for rest := keyPEM; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return nil
+		}
+		if block.Type == "PRIVATE KEY" || strings.HasSuffix(block.Type, " PRIVATE KEY") {
+			return block
+		}
+	}
+}
 
 func pemCertificateChain(certPEM []byte) [][]byte {
 	var chainDER [][]byte

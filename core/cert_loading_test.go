@@ -5,9 +5,14 @@ package core
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,5 +298,83 @@ func requireConfiguredChain(t *testing.T, chain [][]byte, fixture *ocspFixture) 
 	}
 	if !bytes.Equal(chain[0], fixture.leafCert.Raw) || !bytes.Equal(chain[1], fixture.ca.cert.Raw) {
 		t.Fatal("configured certificate chain identity or order changed")
+	}
+}
+
+func TestLegacyCertificateKeyFileFormsMatchConfiguredCertificates(t *testing.T) {
+	fixture := newOCSPFixture(t, false)
+	parameters := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}})
+	for name, keyPEM := range map[string][]byte{
+		"parameters before key":  append(bytes.Clone(parameters), fixture.keyPEM...),
+		"certificate before key": append(bytes.Clone(fixture.chainPEM), fixture.keyPEM...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			certFile, keyFile := fixture.writeFiles(t)
+			if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{certStore: NewCertStore()}
+			server.config.TLSCertFile, server.config.TLSKeyFile = certFile, keyFile
+			if err := server.loadCerts(); err != nil {
+				t.Fatalf("legacy certificate files rejected: %v", err)
+			}
+			if entry := server.certStore.Lookup("localhost"); entry == nil || entry.Source != CertManual {
+				t.Fatal("legacy certificate files did not install a manual certificate")
+			}
+		})
+	}
+	t.Run("no key block", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		certFile, keyFile := fixture.writeFiles(t)
+		if err := os.WriteFile(keyFile, append(bytes.Clone(parameters), fixture.chainPEM...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadOrGenerateCert(certFile, keyFile); err == nil {
+			t.Fatal("key file without a private key block was accepted")
+		}
+	})
+}
+
+func TestLegacyCertificateKeyFilesAcceptTypedPrivateKeyBlocks(t *testing.T) {
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}})
+	for _, tc := range []struct {
+		name   string
+		signer crypto.Signer
+		keyPEM []byte
+	}{
+		{"sec1 after parameters", ecKey, append(parameters, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDER})...)},
+		{"pkcs1", rsaKey, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+			certDER, err := x509.CreateCertificate(rand.Reader, template, template, tc.signer.Public(), tc.signer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+			if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(keyFile, tc.keyPEM, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := LoadOrGenerateCert(certFile, keyFile); err != nil {
+				t.Fatalf("typed private key block rejected: %v", err)
+			}
+		})
 	}
 }
